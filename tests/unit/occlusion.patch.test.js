@@ -267,10 +267,16 @@ test('controller: update() does not allocate', () => {
   xr.camera.near = 0.1; xr.camera.far = Infinity;
   const occ = new DepthOcclusion().enable(/** @type {any} */ ({ xr }));
   for (let i = 0; i < 1000; i++) occ.update();
-  globalThis.gc?.();
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 200000; i++) occ.update();
-  const grew = process.memoryUsage().heapUsed - before;
+  // least growth over 3 windows: one window can catch JIT tiering or GC timing under parallel test
+  // load (seen: ~1.1 MB once in a few runs); a real allocation per update (≥ 16 B × 200k = 3.2 MB)
+  // shows in every window
+  let grew = Infinity;
+  for (let k = 0; k < 3 && grew >= 1_000_000; k++) {
+    globalThis.gc?.();
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 200000; i++) occ.update();
+    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
+  }
   assert.ok(grew < 1_000_000, `heap grew ${grew} bytes over 200k updates`);
   occ.disable();
 });
