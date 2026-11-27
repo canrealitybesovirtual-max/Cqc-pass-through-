@@ -1,0 +1,5 @@
+three.js r187 add-ons (three@0.187.0 examples/jsm), unmodified, relative paths kept:
+loaders/GLTFLoader.js, loaders/KTX2Loader.js, utils/BufferGeometryUtils.js, utils/SkeletonUtils.js,
+utils/WorkerPool.js, libs/meshopt_decoder.module.js, libs/ktx-parse.module.js, libs/zstddec.module.js,
+math/ColorSpaces.js, libs/basis/ (Basis Universal transcoder, Apache-2.0). MIT, see ../LICENSE.
+Imported through the import map entry "three/addons/": "./vendor/three/addons/".
