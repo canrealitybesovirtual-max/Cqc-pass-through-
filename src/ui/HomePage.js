@@ -122,8 +122,13 @@ export class HomePage {
   /** @param {string} mode */
   entering(mode) { this.note(`Starting ${mode}…`); this.setButtons(false); }
 
-  /** @param {string} mode */
-  inXR(mode) { this.note(`In ${mode}. Hold both grips for 1 s to exit.`); }
+  /**
+   * @param {string} mode
+   * @param {boolean} [game] the session runs the game (exit with Y, not the grips)
+   */
+  inXR(mode, game = false) {
+    this.note(game ? `In ${mode}. Hold Y for 2 s (or X for 1 s while looking at your left wrist) to exit.` : `In ${mode}. Hold both grips for 1 s to exit.`);
+  }
 
   /**
    * @param {string} mode
@@ -167,6 +172,10 @@ export class HomePage {
       if (P.anchor) bits.push(`anchor ${P.anchor.state}`);
       if (P.hitTest && P.hitTest.buckets) { const b = P.hitTest.buckets; bits.push(`hit in ${b.inside.hits}/${b.inside.samples} out ${b.outside.hits}/${b.outside.samples}`); }
       if (P.bounds) bits.push(`bounds ${P.bounds.maxPoints ?? P.bounds.space} pts`);
+      const D = P.liveDepth;
+      if (D && D.granted) bits.push(D.active ? `depth ${D.valid ? `${D.width}×${D.height}, ${D.textureChanges ? 'new texture per frame' : 'one texture'}` : 'no valid frames'}` : `depth off (${D.why})`);
+      const G = r.play;
+      if (G && G.world) bits.push(`${G.world.describe}; wave ${G.wave ?? 0}, ${G.kills ?? 0} kills`);
       for (const run of r.perfRuns || []) bits.push(run.incomplete ? `run ${run.label} incomplete` : `run ${run.label} ${run.pass ? 'PASS' : 'FAIL'} (CPU p99 ${run.cpu.p99} ms, missed ${run.missedPct}%)`);
       return `<li><b>${esc(r.mode)}</b> ${esc((r.startedAt || '').slice(11, 19))} — ${esc(bits.join(' · '))}</li>`;
     });

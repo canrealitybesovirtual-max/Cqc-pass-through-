@@ -268,6 +268,37 @@ export class PerfMonitor {
     return { frames: n, intervalAvg: n ? round2(si / n) : 0, cpuAvg: n ? round2(sc / n) : 0, intervalMax: round2(mx), fps: si > 0 ? round2((1000 * n) / si) : 0 };
   }
 
+  /**
+   * Average and max CPU ms per system, and draw calls, over the last `frames`
+   * frames (called outside the frame loop).
+   * @param {number} [frames]
+   * @returns {Record<string, number>}
+   */
+  systemAverages(frames = 72) {
+    const n = Math.min(frames, this.count);
+    /** @type {Record<string, number>} */
+    const out = {};
+    for (let i = 0; i < this.nSys; i++) {
+      let sum = 0, max = 0;
+      for (let k = 1; k <= n; k++) {
+        const v = this.ringSys[((this.head - k + this.capacity) % this.capacity) * this.nSys + i];
+        sum += v;
+        if (v > max) max = v;
+      }
+      out[this.systems[i]] = n ? round2(sum / n) : 0;
+      out[`${this.systems[i]}Max`] = round2(max);
+    }
+    let calls = 0, callsMax = 0;
+    for (let k = 1; k <= n; k++) {
+      const c = this.ringCalls[(this.head - k + this.capacity) % this.capacity];
+      calls += c;
+      if (c > callsMax) callsMax = c;
+    }
+    out.drawCalls = n ? round2(calls / n) : 0;
+    out.drawCallsMax = callsMax;
+    return out;
+  }
+
   /** Plain-object export of the hitch log (called outside the frame loop). */
   exportHitches() {
     const n = Math.min(this.hitchCount, this.hitchCapacity);

@@ -20,7 +20,13 @@
  * carved door gap, not a wall, not a furniture footprint + 0.25 m, not the
  * player zone (r + 1.2 m), and clearance ≥ the agent clearance (0.28 m:
  * radius 0.25 + 0.03, PLAN §9). So a walkable cell is a valid CENTRE position
- * for an enemy: its body never overlaps a wall or furniture.
+ * for an enemy: its body never overlaps a wall or furniture. Inside a carved
+ * door gap the clearance needed is `doorClear` (finalize's 4th argument; the
+ * world passes 0.24 m, so a 0.6 m door frame lets an enemy through, PLAN §6.2's
+ * 0.62 m warning): the body may brush a jamb by 1 cm, which the occluder's 2 cm
+ * jamb shrink never cuts.
+ *
+ * Flags are 16-bit (NAV_POCKET is bit 8).
  */
 
 import { pointInPolygon } from '../util/geom2d.js';
@@ -35,6 +41,7 @@ export const NAV_DOOR = 16; // carved door gap
 export const NAV_OBST = 32; // raw furniture footprint + 2 cm (distance-transform obstacle)
 export const NAV_WALK = 64; // walkable for an enemy centre
 export const NAV_VIRTUAL = 128; // virtual floor (no Space Setup data there)
+export const NAV_POCKET = 256; // virtual spawn pocket behind a door into unmapped space (also NAV_VIRTUAL)
 
 const SQRT2 = Math.SQRT2;
 const BIG = 1e12;
@@ -57,7 +64,7 @@ export class NavGrid {
     /** World x/z of the min corner of cell (0, 0). */
     this.ox = 0;
     this.oz = 0;
-    this.flags = new Uint8Array(capacity);
+    this.flags = new Uint16Array(capacity);
     this.clr = new Float32Array(capacity);
     this.region = new Uint16Array(capacity);
     this.pathDist = new Float32Array(capacity);
@@ -66,6 +73,7 @@ export class NavGrid {
     /** Reachable-from-the-player flag per region id. */
     this.reach = new Uint8Array(65536);
     this.agentClear = 0.28;
+    this.doorClear = 0.28;
     this.walkableCount = 0;
     this.regionCount = 0;
     /** Bumped on every rebuild; planners drop stale searches when it changes. */
@@ -252,7 +260,7 @@ export class NavGrid {
     const rx = Math.abs(c) * ex + Math.abs(s) * ez, rz = Math.abs(s) * ex + Math.abs(c) * ez;
     const ix0 = Math.max(0, Math.floor((cx - rx - this.ox) * this.inv)), ix1 = Math.min(this.w - 1, Math.floor((cx + rx - this.ox) * this.inv));
     const iz0 = Math.max(0, Math.floor((cz - rz - this.oz) * this.inv)), iz1 = Math.min(this.h - 1, Math.floor((cz + rz - this.oz) * this.inv));
-    const keep = ~clearBits & 0xff;
+    const keep = ~clearBits & 0xffff;
     for (let iz = iz0; iz <= iz1; iz++) {
       const dz = this.oz + (iz + 0.5) * this.cell - cz;
       for (let ix = ix0; ix <= ix1; ix++) {
@@ -279,6 +287,36 @@ export class NavGrid {
         if (dx * dx + dz * dz <= r2) this.flags[iz * this.w + ix] |= bits;
       }
     }
+  }
+
+  /**
+   * Count the cells whose centre lies in an oriented box and whose flags hold
+   * every bit of `mask` (build-time diagnostics, e.g. walkable door cells).
+   * With `reachable`, only walkable cells in a region connected to the player.
+   * @param {number} cx @param {number} cz @param {number} c @param {number} s
+   * @param {number} hx @param {number} hz
+   * @param {number} mask
+   * @param {boolean} [reachable]
+   * @returns {number}
+   */
+  countInBox(cx, cz, c, s, hx, hz, mask, reachable = false) {
+    const rx = Math.abs(c) * hx + Math.abs(s) * hz, rz = Math.abs(s) * hx + Math.abs(c) * hz;
+    const ix0 = Math.max(0, Math.floor((cx - rx - this.ox) * this.inv)), ix1 = Math.min(this.w - 1, Math.floor((cx + rx - this.ox) * this.inv));
+    const iz0 = Math.max(0, Math.floor((cz - rz - this.oz) * this.inv)), iz1 = Math.min(this.h - 1, Math.floor((cz + rz - this.oz) * this.inv));
+    let n = 0;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      const dz = this.oz + (iz + 0.5) * this.cell - cz;
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const dx = this.ox + (ix + 0.5) * this.cell - cx;
+        const lx = dx * c + dz * s, lz = dz * c - dx * s;
+        if (lx < -hx || lx > hx || lz < -hz || lz > hz) continue;
+        const i = iz * this.w + ix;
+        if ((this.flags[i] & mask) !== mask) continue;
+        if (reachable && ((this.flags[i] & NAV_WALK) === 0 || this.reach[this.region[i]] !== 1)) continue;
+        n++;
+      }
+    }
+    return n;
   }
 
   /**
@@ -320,14 +358,17 @@ export class NavGrid {
    * player zone, regions, reachability and the floor index of every cell.
    * @param {number} agentClear metres
    * @param {number} sx @param {number} sz player start
+   * @param {number} [doorClear] metres needed inside carved door gaps (default agentClear)
    */
-  finalize(agentClear, sx, sz) {
+  finalize(agentClear, sx, sz, doorClear = agentClear) {
     const n = this.count, fl = this.flags, clr = this.clr;
     this.agentClear = agentClear;
+    this.doorClear = doorClear;
     // 1) Walkable ignoring the player zone (the path field runs through it).
     for (let i = 0; i < n; i++) {
       const b = fl[i];
-      const ok = (b & (NAV_INSIDE | NAV_DOOR)) !== 0 && (b & (NAV_WALL | NAV_FURN | NAV_OBST)) === 0 && clr[i] >= agentClear;
+      const need = (b & NAV_DOOR) !== 0 ? doorClear : agentClear;
+      const ok = (b & (NAV_INSIDE | NAV_DOOR)) !== 0 && (b & (NAV_WALL | NAV_FURN | NAV_OBST)) === 0 && clr[i] >= need;
       fl[i] = ok ? b | NAV_WALK : b & ~NAV_WALK;
     }
     this.pathField(sx, sz);

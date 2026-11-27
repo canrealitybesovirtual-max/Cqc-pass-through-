@@ -23,7 +23,8 @@ import { WristHud } from '../ui/WristHud.js';
  *      opaque "Get ready" panel);
  *   3. warm: next frame, one draw of every pool into the XR framebuffer
  *      (`warmXR`, before that frame's own render), re-baselining the counts;
- *   4. play: `game.start(world.zone)`; GameSession takes over the messages.
+ *   4. start: the frame after that (so the long warm frame is not seen as a
+ *      tracking gap), `game.start(world.zone)`; GameSession takes over the messages.
  *
  * Systems, in the contract order (PerfMonitor names = PLAY_SYSTEMS):
  * input → world → player → weapons → enemies → game → audio → ui → render.
@@ -33,8 +34,8 @@ import { WristHud } from '../ui/WristHud.js';
 export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons', 'enemies', 'game', 'audio', 'ui', 'render']);
 
 /** Session steps. */
-export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, PLAY: 3 });
-const STEP_NAME = ['idle', 'capture', 'warm', 'play'];
+export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4 });
+const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play'];
 
 /** Enemy pool size (GameSession keeps at most 4 alive; 2 more for bodies still lying there). */
 export const MAX_ENEMIES = 6;
@@ -43,19 +44,32 @@ export const RUN_MS = 60000;
 
 /** @typedef {import('../world/Layout.js').SpaceSnapshot} SpaceSnapshot */
 
+/**
+ * The world's own JSON-safe build report (walls, doors, spawn tiers…), when it has one.
+ * @param {any} w
+ */
+function worldReport(w) {
+  if (typeof w.report !== 'function') return undefined;
+  try { return w.report(); } catch (e) { return { error: String(e) }; }
+}
+
 export class PlayKit {
   /**
    * At load, after `assets.load()` and the audio decode, BEFORE the warm-up.
-   * @param {{ gfx: { renderer: any, scene: import('three').Scene, flashLights: import('three').PointLight[] },
+   * @param {{ gfx: { renderer: any, scene: import('three').Scene, camera: import('three').Camera, flashLights: import('three').PointLight[] },
    *   assets: any, audio: any, input: import('../xr/Input.js').Input, fixture?: SpaceSnapshot|null }} o
    *   fixture: a snapshot to use instead of the live capture (?emulate: IWER has no scene data)
    */
   constructor({ gfx, assets, audio, input, fixture = null }) {
     const renderer = gfx.renderer, scene = gfx.scene;
+    /** The scene camera the Loop renders with (three substitutes the XR camera). */
+    this.sceneCamera = gfx.camera;
     this.events = new Events();
     this.world = new World();
     this.world.warmUp(); // the session's real build then runs on optimised code
-    scene.add(this.world.occluder);
+    /** The world's meshes (the depth-only occluder, and the dev overlay when the world has one). */
+    this.worldMeshes = typeof this.world.warmMeshes === 'function' ? this.world.warmMeshes() : [this.world.occluder];
+    for (const m of this.worldMeshes) scene.add(m);
     this.planner = this.world.createPlanner({ maxRequests: 16 });
     this.player = new Player();
     this.fixture = fixture;
@@ -119,7 +133,7 @@ export class PlayKit {
 
   /** Everything the warm-up must draw (all already in the scene). */
   warmObjects() {
-    return [this.world.occluder, ...this.weapons.warmMeshes(), ...this.enemies.warmMeshes(), ...this.game.warmMeshes(), ...this.hud.warmMeshes()];
+    return [...this.worldMeshes, ...this.weapons.warmMeshes(), ...this.enemies.warmMeshes(), ...this.game.warmMeshes(), ...this.hud.warmMeshes()];
   }
 
   /**
@@ -164,7 +178,8 @@ export class PlayKit {
   worldUpdate(dt, t, frame, ctx) {
     if (this.t0 < 0) this.t0 = t;
     if (this.step === STEP.CAPTURE) this.capture(t, frame);
-    else if (this.step === STEP.WARM) this.warmInXR(t);
+    else if (this.step === STEP.WARM) this.warmInXR();
+    else if (this.step === STEP.START) this.startRound(t);
     this.world.update(dt, t, frame, ctx);
   }
 
@@ -202,7 +217,8 @@ export class PlayKit {
       this.rec.play = {
         step: 'warm', source, capture: { ...S, atMs: this.buildAtMs, planesInSnapshot: snap ? snap.planes.length : 0, meshesInSnapshot: snap ? snap.meshes.length : 0 },
         world: { describe: W.describe(), buildMs: Math.round(buildMs * 10) / 10, virtual: W.virtual, partialVirtual: W.partialVirtual,
-          zone: { ...W.zone }, occluderBoxes: W.occluderBoxes, stats: { ...W.stats, notes: W.stats.notes.slice(0, 20) } },
+          zone: { ...W.zone }, occluderBoxes: W.occluderBoxes, stats: { ...W.stats, notes: W.stats.notes.slice(0, 20) },
+          report: worldReport(W) },
       };
     }
     this.step = STEP.WARM;
@@ -210,20 +226,24 @@ export class PlayKit {
 
   /**
    * One draw of every pool inside this XR frame, before its own render (which
-   * clears and draws over it), then the round starts.
-   * @param {number} t
+   * clears and draws over it).
    */
-  warmInXR(t) {
+  warmInXR() {
     this.setWarm(true);
     let rep = null;
     try {
-      rep = warmXR(this.ctx.renderer, this.ctx.scene, this.ctx.renderer.xr.getCamera(), this.warmed);
+      rep = warmXR(this.ctx.renderer, this.ctx.scene, this.sceneCamera, this.warmed);
     } finally {
       this.setWarm(false);
     }
     this.warmReport = rep;
     if (this.rec) this.rec.warmXR = rep ? { skipped: rep.skipped || undefined, ms: Math.round(rep.ms * 10) / 10, drawables: rep.drawables, calls: rep.calls, grew: rep.grew, programs: rep.programs } : null;
     if (this.perf) this.perf.mark('warmXR');
+    this.step = STEP.START;
+  }
+
+  /** @param {number} t */
+  startRound(t) {
     this.game.start(this.world.zone);
     this.startedAtMs = Math.round(t - this.t0);
     if (this.rec && this.rec.play) { this.rec.play.step = 'play'; this.rec.play.startedAtMs = this.startedAtMs; }
@@ -253,6 +273,8 @@ export class PlayKit {
     const rec = this.rec;
     if (rec) {
       const g = this.game, w = this.weapons, e = this.enemies;
+      const world = rec.play && rec.play.world;
+      if (world && this.world.built) world.report = worldReport(this.world); // again: with the spawn tiers used
       rec.play = {
         ...(rec.play || {}), step: this.stepName, phase: g.phaseName, wave: g.wave, kills: g.kills, health: g.health,
         game: { ...g.stats }, weapons: { ...w.stats }, enemies: { ...e.stats }, hudDraws: this.hud.draws, messageUploads: g.panel.uploads,
@@ -276,7 +298,7 @@ export class PlayKit {
   /** Lines for App's opaque panel before the round starts (null = hide it). */
   panelLines() {
     if (this.step === STEP.CAPTURE) return ['Get ready', 'Reading your room…', 'Stand where you want to fight'];
-    if (this.step === STEP.WARM) return ['Get ready', this.world.describe()];
+    if (this.step === STEP.WARM || this.step === STEP.START) return ['Get ready', this.world.describe()];
     return null;
   }
 

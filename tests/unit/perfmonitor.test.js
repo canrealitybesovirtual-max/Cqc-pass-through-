@@ -154,3 +154,17 @@ test('a measured 13.9 ms frame at 72 Hz is not a miss, but at a wrong 120 Hz gue
   drive(pm, clock, new Array(100).fill(1000 / 72));
   assert.equal(pm.hitchCount, before, 'no false misses once measured');
 });
+
+test('systemAverages: per-system mean and max, and draw calls, over the last frames', () => {
+  const { pm, clock } = make();
+  drive(pm, clock, [13.9, 13.9, 13.9, 13.9], 2, [0.5, 1.5]);
+  drive(pm, clock, [13.9], 4, [1.0, 2.5]);
+  const s = pm.systemAverages(4);
+  assert.equal(s.a, 0.63); // (0.5 · 3 + 1.0) / 4
+  assert.equal(s.aMax, 1);
+  assert.equal(s.render, 1.75);
+  assert.equal(s.renderMax, 2.5);
+  assert.equal(s.drawCalls, 10);
+  assert.equal(s.drawCallsMax, 10);
+  assert.deepEqual(new PerfMonitor({ systems: ['x'] }).systemAverages(10), { x: 0, xMax: 0, drawCalls: 0, drawCallsMax: 0 });
+});

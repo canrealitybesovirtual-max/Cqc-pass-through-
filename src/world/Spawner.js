@@ -9,18 +9,32 @@
  * at least 4 m of path beyond the safe-zone edge. One candidate per 0.5 m block
  * (the most open cell), the far-side-of-a-door ones first.
  *
+ * Virtual floor (no Space Setup data: real unmapped space, where an enemy
+ * could stand inside a real wall or sofa) is never a candidate, except: door
+ * pockets (NAV_POCKET, the small virtual floor behind a door into unmapped
+ * space, made for spawning); the whole room is virtual (no Space Setup floor);
+ * or no mapped cell qualifies at all (`virtualFallback`, noted in the report).
+ *
  * Query (`find`, allocation-free): ≥ minDist (and ≥ 2.5 m) from the player,
  * not near a recent spawn, then in preference order:
- *   3. on the far side of a door and hidden from the player's eyes;
+ *   3. on the far side of a door (pockets included) and hidden from the player's eyes;
  *   2. hidden behind walls or furniture in the player's room;
- *   1. visible but outside ±60° of the view direction and ≥ 3 m away.
+ *   1. visible, but outside ±100° of the view direction (behind the player:
+ *      the Quest 3 sees about ±55°, and the head turns) and ≥ 3 m away.
  * "Hidden" = every sight line from the eye (floor + 1.6 m) to the enemy's
  * shins, chest, head and both shoulders is blocked. Within a tier the choice is
  * random (seeded), mildly favouring 5–12 m of path. At most `evalCap`
  * candidates get sight tests per call, so the cost is bounded.
+ *
+ * Every find() is counted by the tier it returned (`finds[0..3]`, 0 = none
+ * found) and the last 16 spawns are kept in a ring (x, z, tier, time) for the
+ * session record (`report`).
  */
 
-import { NAV_DOOR, NAV_INSIDE, NAV_WALK } from './NavGrid.js';
+import { NAV_DOOR, NAV_INSIDE, NAV_POCKET, NAV_VIRTUAL, NAV_WALK } from './NavGrid.js';
+
+/** Spawn log ring size (x, z, tier, time per entry). */
+export const SPAWN_LOG = 16;
 
 const DIRX = new Float32Array(8), DIRZ = new Float32Array(8);
 for (let k = 0; k < 8; k++) { DIRX[k] = Math.cos((k * Math.PI) / 4); DIRZ[k] = Math.sin((k * Math.PI) / 4); }
@@ -39,9 +53,16 @@ export class SpawnFinder {
     this.z = new Float32Array(maxCandidates);
     this.path = new Float32Array(maxCandidates);
     this.door = new Uint8Array(maxCandidates);
+    /** 1 = the candidate is in a door pocket. */
+    this.pocket = new Uint8Array(maxCandidates);
     this.count = 0;
     /** Candidates [0, doorCount) are on the far side of a door. */
     this.doorCount = 0;
+    this.pocketCount = 0;
+    /** The last build found no mapped candidate and used virtual floor. */
+    this.virtualFallback = false;
+    /** Cells the last build skipped because they are virtual floor. */
+    this.skippedVirtual = 0;
     this.seed = seed >>> 0 || 1;
     this.rng = this.seed;
     /** Ring of recent spawns: x, z, time (s). */
@@ -50,7 +71,8 @@ export class SpawnFinder {
     this.spawnClear = 0.35;
     this.minPathBeyondZone = 4.0;
     this.eyeHeight = 1.6;
-    this.fovCos = Math.cos((60 * Math.PI) / 180);
+    /** Fallback tier: only outside ±100° of the view direction. */
+    this.fovCos = Math.cos((100 * Math.PI) / 180);
     this.nearVisible = 3.0;
     this.hardMin = 2.5;
     this.evalCap = 128;
@@ -59,32 +81,61 @@ export class SpawnFinder {
     /** Diagnostics of the last find(): tier 0 = nothing found. */
     this.lastTier = 0;
     this.lastEvals = 0;
+    /** find() results by tier since the last build (0 = nothing found). */
+    this.finds = new Uint32Array(4);
+    /** Last SPAWN_LOG spawns: x, z, tier, time (s). */
+    this.log = new Float32Array(SPAWN_LOG * 4);
+    this.logHead = 0;
+    this.logCount = 0;
   }
 
   /**
    * @param {import('./NavGrid.js').NavGrid} nav finalized grid
    * @param {number} zoneR safe-zone radius (m)
+   * @param {{ allowVirtual?: boolean }} [o] allowVirtual: the whole room is virtual (no Space Setup floor)
    */
-  build(nav, zoneR) {
+  build(nav, zoneR, { allowVirtual = false } = {}) {
     this.rng = this.seed;
     this.recent.fill(-1e9);
-    this.count = this.doorCount = 0;
+    this.count = this.doorCount = this.pocketCount = 0;
+    this.finds.fill(0);
+    this.log.fill(0);
+    this.logHead = this.logCount = 0;
+    this.lastTier = 0;
+    this.virtualFallback = false;
+    this.skippedVirtual = 0;
     const w = nav.w, h = nav.h, B = 5; // 0.5 m blocks
     const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
-    const best = new Int32Array(bw * bh).fill(-1);
+    const best = new Int32Array(bw * bh);
     const minPath = zoneR + this.minPathBeyondZone;
-    for (let i = 0; i < nav.count; i++) {
-      const fl = nav.flags[i];
-      if ((fl & NAV_WALK) === 0 || (fl & NAV_INSIDE) === 0 || (fl & NAV_DOOR) !== 0) continue;
-      if (nav.clr[i] < this.spawnClear) continue;
-      const pd = nav.pathDist[i];
-      if (!(pd >= minPath && pd < Infinity) || nav.reach[nav.region[i]] !== 1) continue;
-      const x = nav.centerX(i), z = nav.centerZ(i);
-      if (!open(nav, x, z)) continue;
-      const ix = i % w, iz = (i - ix) / w;
-      const b = Math.floor(iz / B) * bw + Math.floor(ix / B);
-      if (best[b] < 0 || nav.clr[i] > nav.clr[best[b]]) best[b] = i;
+    let found = 0;
+    for (let pass = 0; pass < 2 && found === 0; pass++) {
+      // Pass 1 (only if pass 0 found nothing on mapped floor): any virtual floor.
+      const virtualOk = allowVirtual || pass === 1;
+      if (pass === 1) {
+        if (allowVirtual || this.skippedVirtual === 0) break;
+        this.virtualFallback = true;
+      }
+      best.fill(-1);
+      for (let i = 0; i < nav.count; i++) {
+        const fl = nav.flags[i];
+        if ((fl & NAV_WALK) === 0 || (fl & NAV_INSIDE) === 0 || (fl & NAV_DOOR) !== 0) continue;
+        if (nav.clr[i] < this.spawnClear) continue;
+        const pd = nav.pathDist[i];
+        if (!(pd >= minPath && pd < Infinity) || nav.reach[nav.region[i]] !== 1) continue;
+        if ((fl & NAV_VIRTUAL) !== 0 && (fl & NAV_POCKET) === 0 && !virtualOk) {
+          this.skippedVirtual++;
+          continue;
+        }
+        const x = nav.centerX(i), z = nav.centerZ(i);
+        if (!open(nav, x, z)) continue;
+        const ix = i % w, iz = (i - ix) / w;
+        const b = Math.floor(iz / B) * bw + Math.floor(ix / B);
+        if (best[b] < 0) found++;
+        if (best[b] < 0 || nav.clr[i] > nav.clr[best[b]]) best[b] = i;
+      }
     }
+    if (found === 0) this.virtualFallback = false;
     /** @type {number[]} */ const doorSide = [], room = [];
     for (let b = 0; b < best.length; b++) {
       const i = best[b];
@@ -98,7 +149,9 @@ export class SpawnFinder {
       this.z[k] = nav.centerZ(i);
       this.path[k] = nav.pathDist[i];
       this.door[k] = nav.doors[i] > 0 ? 1 : 0;
+      this.pocket[k] = (nav.flags[i] & NAV_POCKET) !== 0 ? 1 : 0;
       if (this.door[k]) this.doorCount = k + 1;
+      if (this.pocket[k]) this.pocketCount++;
       this.count = k + 1;
     }
   }
@@ -162,6 +215,7 @@ export class SpawnFinder {
       }
     }
     this.lastEvals = evals;
+    this.finds[bestTier]++;
     if (bestTier === 0) return false;
     out.x = bx;
     out.z = bz;
@@ -169,7 +223,53 @@ export class SpawnFinder {
     const o = this.recentHead * 3;
     this.recent[o] = bx; this.recent[o + 1] = bz; this.recent[o + 2] = time;
     this.recentHead = (this.recentHead + 1) & 3;
+    const g = this.logHead * 4;
+    this.log[g] = bx; this.log[g + 1] = bz; this.log[g + 2] = bestTier; this.log[g + 3] = time;
+    this.logHead = (this.logHead + 1) % SPAWN_LOG;
+    if (this.logCount < SPAWN_LOG) this.logCount++;
     return true;
+  }
+
+  /**
+   * Session-record summary (allocates; build time or session end only):
+   * candidate counts by kind; by tier as seen from (sx, sz) at build (eye at
+   * floor + 1.6 m; 'visible' ones can only be used by the ±100° fallback);
+   * per floor; the find() results by tier; and the last spawns, oldest first.
+   * @param {{ floorY(x: number, z: number): number, segmentClear(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean,
+   *   nav: import('./NavGrid.js').NavGrid }} world
+   * @param {number} sx @param {number} sz player start
+   */
+  report(world, sx, sz) {
+    const eyeY = world.floorY(sx, sz) + this.eyeHeight;
+    let hiddenDoor = 0, hiddenRoom = 0, visible = 0, tooNear = 0;
+    /** @type {number[]} */ const byFloor = [];
+    for (let c = 0; c < this.count; c++) {
+      const x = this.x[c], z = this.z[c];
+      const i = world.nav.index(x, z);
+      const f = i >= 0 ? world.nav.floorIdx[i] : -1;
+      if (f >= 0) { while (byFloor.length <= f) byFloor.push(0); byFloor[f]++; }
+      const d = Math.hypot(x - sx, z - sz);
+      if (d < this.hardMin) { tooNear++; continue; }
+      if (this.visible(world, eyeY, sx, sz, x, z, d)) visible++;
+      else if (this.door[c]) hiddenDoor++;
+      else hiddenRoom++;
+    }
+    /** @type {{ x: number, z: number, tier: number, t: number }[]} */ const recent = [];
+    for (let k = 0; k < this.logCount; k++) {
+      const g = ((this.logHead - this.logCount + k + SPAWN_LOG) % SPAWN_LOG) * 4;
+      recent.push({
+        x: Math.round(this.log[g] * 100) / 100, z: Math.round(this.log[g + 1] * 100) / 100,
+        tier: this.log[g + 2], t: Math.round(this.log[g + 3] * 10) / 10,
+      });
+    }
+    return {
+      candidates: this.count, doorSide: this.doorCount, pocket: this.pocketCount, room: this.count - this.doorCount,
+      virtualFallback: this.virtualFallback,
+      fromStart: { tier3: hiddenDoor, tier2: hiddenRoom, visible, tooNear },
+      byFloor,
+      finds: { none: this.finds[0], tier1: this.finds[1], tier2: this.finds[2], tier3: this.finds[3] },
+      recent,
+    };
   }
 
   /** @param {number} x @param {number} z @param {number} time */

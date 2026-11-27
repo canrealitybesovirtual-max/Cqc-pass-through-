@@ -3,17 +3,22 @@
  * The game world built from the user's Space Setup (CONTRACTS.md "World").
  *
  * WorldCore (pure) holds the layout, shapes, nav grid and spawn finder; this
- * class adds the ONE merged depth-only occluder mesh. The mesh, its material
- * and fixed-capacity buffers exist from construction (at load), so the warm-up
- * draw compiles its program and uploads its buffers; build() only rewrites the
- * buffer contents and the draw range.
+ * class adds the ONE merged depth-only occluder mesh and a dev overlay (ONE
+ * LineSegments of the occluder's box edges, door frames and spawn pockets,
+ * hidden by default). Both meshes, their materials and fixed-capacity buffers
+ * exist from construction (at load), so the warm-up draw compiles their
+ * programs and uploads their buffers; build() only rewrites the buffer
+ * contents and the draw ranges (uploaded by the next draw: warmXR after build).
  *
- * Integration: `scene.add(world.occluder)` at load, before the warm-up.
+ * Integration: `scene.add(...world.warmMeshes())` at load, before the warm-up,
+ * and include `world.warmMeshes()` in the warm-up and warmXR object lists.
+ * `world.setOverlay(true)` shows the overlay (a visibility flag only: no
+ * compile, no upload).
  */
 
 import * as THREE from 'three';
 import { WorldCore } from './WorldCore.js';
-import { OCC_INDICES_PER_BOX, OCC_VERTS_PER_BOX, writeOccluderBoxes } from './Occluder.js';
+import { EDGE_VERTS_PER_BOX, OCC_INDICES_PER_BOX, OCC_VERTS_PER_BOX, writeOccluderBoxes, writeOverlayEdges } from './Occluder.js';
 
 export { captureSnapshot, loadFixture, normalizeSnapshot, CaptureGate } from './Snapshot.js';
 export { NavGrid } from './NavGrid.js';
@@ -42,7 +47,41 @@ export class World extends WorldCore {
     this.occluder.frustumCulled = false; // spans the house; also keeps the pre-build warm-up draw
     this.occluder.matrixAutoUpdate = false;
     this.occluderBoxes = 0;
+
+    // Dev overlay: occluder edges (cyan walls, magenta inferred walls, yellow furniture),
+    // door frames (green open, red closed), spawn pockets (orange). Hidden by default.
+    this.maxOverlayVerts = this.maxOccluderBoxes * EDGE_VERTS_PER_BOX + 64 * 8;
+    const ovGeo = new THREE.BufferGeometry();
+    this.ovPos = new THREE.BufferAttribute(new Float32Array(this.maxOverlayVerts * 3), 3);
+    this.ovCol = new THREE.BufferAttribute(new Float32Array(this.maxOverlayVerts * 3), 3);
+    ovGeo.setAttribute('position', this.ovPos);
+    ovGeo.setAttribute('color', this.ovCol);
+    const ovMat = new THREE.LineBasicMaterial({ vertexColors: true, depthTest: true, depthWrite: false, toneMapped: false });
+    ovMat.name = 'world-overlay';
+    /** Dev overlay of the occluder (one LineSegments, hidden unless setOverlay(true)). */
+    this.overlay = new THREE.LineSegments(ovGeo, ovMat);
+    this.overlay.name = 'world-overlay';
+    this.overlay.renderOrder = 1; // after the occluder (−10): lines behind a real wall are hidden like enemies
+    this.overlay.frustumCulled = false;
+    this.overlay.matrixAutoUpdate = false;
+    this.overlay.visible = false;
+    this.overlayOn = false;
+    this.overlayVerts = 0;
     this.placeholder();
+  }
+
+  /** Every mesh the world draws, for the warm-up (load) and warmXR (after build). */
+  warmMeshes() {
+    return [this.occluder, this.overlay];
+  }
+
+  /**
+   * Show or hide the dev overlay. Only a visibility flag: nothing compiles or uploads.
+   * @param {boolean} on
+   */
+  setOverlay(on) {
+    this.overlayOn = !!on;
+    this.overlay.visible = this.overlayOn && this.overlayVerts > 0;
   }
 
   /**
@@ -58,6 +97,13 @@ export class World extends WorldCore {
     this.occIdx.needsUpdate = true;
     this.occluder.visible = true;
     this.occluderBoxes = 0;
+    const op = /** @type {Float32Array} */ (this.ovPos.array);
+    op[0] = 0; op[1] = -100; op[2] = 0; op[3] = 0.01; op[4] = -100; op[5] = 0;
+    this.overlay.geometry.setDrawRange(0, 2);
+    this.ovPos.needsUpdate = true;
+    this.ovCol.needsUpdate = true;
+    this.overlayVerts = 0;
+    this.overlay.visible = false;
   }
 
   /** WorldCore.warmUp, then back to the drawable placeholder. */
@@ -69,9 +115,10 @@ export class World extends WorldCore {
   /**
    * @param {import('./Layout.js').SpaceSnapshot|null} snapshot
    * @param {{ x: number, z: number, r?: number }} playerStart
+   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null }} [opts] see WorldCore.build
    */
-  build(snapshot, playerStart) {
-    super.build(snapshot, playerStart);
+  build(snapshot, playerStart, opts) {
+    super.build(snapshot, playerStart, opts);
     const boxes = this.layout ? this.layout.boxes : [];
     const pos = /** @type {Float32Array} */ (this.occPos.array), idx = /** @type {Uint16Array} */ (this.occIdx.array);
     const n = writeOccluderBoxes(boxes, pos, idx, this.maxOccluderBoxes);
@@ -91,5 +138,18 @@ export class World extends WorldCore {
       const sphere = geo.boundingSphere || (geo.boundingSphere = new THREE.Sphere());
       box.getBoundingSphere(sphere);
     }
+    // Dev overlay (same boxes), uploaded by the next draw of it (warmXR after build).
+    const nv = writeOverlayEdges(this.layout, /** @type {Float32Array} */ (this.ovPos.array), /** @type {Float32Array} */ (this.ovCol.array),
+      this.maxOccluderBoxes, this.maxOverlayVerts);
+    this.overlayVerts = nv;
+    this.overlay.geometry.setDrawRange(0, nv);
+    this.ovPos.needsUpdate = true;
+    this.ovCol.needsUpdate = true;
+    this.overlay.visible = this.overlayOn && nv > 0;
+  }
+
+  /** WorldCore.report plus the meshes' fill. */
+  report() {
+    return { ...super.report(), occluderBoxes: this.occluderBoxes, overlaySegments: this.overlayVerts / 2 };
   }
 }

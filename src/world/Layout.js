@@ -10,16 +10,34 @@
  * - ceilings: polygons + one fallback height;
  * - walls: face segments with an inward normal, a height and door openings.
  *   Each wall is a 0.10 m slab placed BEHIND its face (PLAN §6.3), so the
- *   collision face matches the real wall. Which side is "behind" comes from the
- *   floor polygons (a wall on a floor edge faces that floor's interior), then
- *   from sampling which side has floor. Walls inside a floor polygon (one Quest
- *   floor can span several rooms) use the plane normal, corrected by the
- *   convention the edge walls show (if most edge-wall normals pointed out of
- *   the room, these are flipped too);
+ *   collision face matches the real wall. Which side is "behind" comes from, in
+ *   order: the floor polygons (a wall on a floor edge faces that floor's
+ *   interior: side 'edge'); sampling which side has floor ('sampled'); for a
+ *   wall inside a floor polygon (one Quest floor can span several rooms, and
+ *   both sides are floor), the player: if the player can see the wall from
+ *   where they stand (2D sight line through other walls, door openings count),
+ *   its face points at the player and the slab goes behind it ('player'), so
+ *   a slab never sits in front of the surface the player sees (no floating
+ *   decals, no enemy cut early). Walls the player cannot see keep the plane
+ *   normal ('normal'), corrected by the convention the edge walls show
+ *   ('learned': if most edge-wall normals pointed out of the room);
+ * - inferred walls (PLAN §6.1 step 5): floor edges that no wall plane covers
+ *   (within 12° and 0.3 m) get a wall marked `inferred`, floor to ceiling,
+ *   except where the floor continues into another mapped floor (an open
+ *   boundary between two Space Setup rooms) or an 'invisible wall face' plane
+ *   says the side is open;
  * - doors: vertical door planes matched to every wall they overlap (angle ≤ 20°,
- *   ≤ 0.35 m off the wall, ≥ 50 % of their width on it). Each match cuts an
- *   opening; the wall becomes left/right pieces plus a lintel (and a sill if
- *   the door starts above the floor);
+ *   ≤ 0.35 m off the wall, ≥ 50 % of their width on it), inferred walls
+ *   included. Each door keeps its record (matched walls and offsets, width,
+ *   bottom, walkable, which side has floor, where it leads) and an open flag
+ *   (`opts.doorOpen[id]`, default open). An OPEN door cuts an opening in each
+ *   matched wall (left/right pieces plus a lintel, and a sill if the door starts
+ *   above the floor); a CLOSED door cuts nothing (the wall stays solid for
+ *   bullets, sight and the occluder, and the nav grid is not carved);
+ * - door pockets: an open walkable door that leads into unmapped space (mapped
+ *   floor on one side only) gets a small virtual floor behind it (about
+ *   1.8 × 2 m, floor `pocket`), so enemies can spawn out of sight and walk in
+ *   through the real doorway;
  * - furniture: yaw-oriented boxes from labelled meshes (Space Setup volumes) and
  *   labelled horizontal planes (tops, extruded down to the floor). A plane that
  *   overlaps a mesh box by > 50 % is merged into it (PLAN §6.1).
@@ -38,29 +56,48 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
 /** @typedef {{ label: string|null, orientation: 'horizontal'|'vertical', pose: number[], polygon: number[][] }} SnapPlane */
 /** @typedef {{ label: string|null, pose: number[], min: number[], max: number[], vertexCount: number }} SnapMesh */
 
-/** @typedef {{ pts: Float64Array, n: number, y: number, area: number, x0: number, x1: number, z0: number, z1: number, virtual: boolean }} Floor */
+/**
+ * @typedef {{ id: number, pts: Float64Array, n: number, y: number, area: number, x0: number, x1: number, z0: number, z1: number,
+ *   virtual: boolean, pocket: boolean, door: number }} Floor
+ *   virtual: no Space Setup data there (the virtual room, the patch around a player off the map, or a door pocket);
+ *   pocket: a door pocket (door = its door id, else -1).
+ */
 /** @typedef {{ pts: Float64Array, n: number, y: number, x0: number, x1: number, z0: number, z1: number }} Ceiling */
 /** @typedef {{ u0: number, u1: number, y0: number, y1: number }} Opening */
+/** @typedef {'edge'|'sampled'|'player'|'learned'|'normal'} WallSide */
 /**
- * @typedef {{ ax: number, az: number, bx: number, bz: number, tx: number, tz: number, nx: number, nz: number,
- *   len: number, y0: number, y1: number, openings: Opening[], side: 'edge'|'sampled'|'learned'|'normal', flipped: boolean }} Wall
- *   (a→b is the face; n points into the room; the slab lies on the −n side)
+ * @typedef {{ id: number, ax: number, az: number, bx: number, bz: number, tx: number, tz: number, nx: number, nz: number,
+ *   len: number, y0: number, y1: number, openings: Opening[], side: WallSide, flipped: boolean, inferred: boolean }} Wall
+ *   (a→b is the face; n points into the room; the slab lies on the −n side; flipped: n is the reverse of the plane normal)
  */
 /**
- * @typedef {{ cx: number, cz: number, tx: number, tz: number, nx: number, nz: number, width: number,
- *   y0: number, y1: number, walls: number, walkable: boolean }} Door
+ * @typedef {{ id: number, cx: number, cz: number, tx: number, tz: number, nx: number, nz: number, width: number,
+ *   y0: number, y1: number, walls: number, wallIds: number[], offsets: number[], walkable: boolean, open: boolean,
+ *   side: 'both'|'front'|'back'|'none', leadsTo: 'mapped'|'unmapped'|'virtual'|'none', pocket: number, passable: boolean }} Door
+ *   n: the door plane's normal (front = +n); walls/wallIds: matched walls; offsets: door centre to each matched
+ *   wall face along that wall's n (m, + = room side); walkable: the frame could pass a person (bottom near the
+ *   floor, ≥ 1.5 m tall, ≥ 0.4 m wide); side: which sides of the plane have mapped floor; pocket: the pocket's floor
+ *   index (-1 none); passable: set by WorldCore after the nav bake (an enemy fits through and it is reachable).
  */
 /**
  * @typedef {{ cx: number, cz: number, c: number, s: number, hx: number, hz: number, y0: number, y1: number,
  *   label: string, kind: 'wall'|'furniture', face: number, jamb0: boolean, jamb1: boolean,
- *   lintel: boolean, sill: boolean, navBlock: boolean, source: string }} Box
+ *   lintel: boolean, sill: boolean, navBlock: boolean, source: string, wall: number }} Box
  *   face: for wall pieces, the local-z side (−1/+1) of the real wall face; 0 for furniture.
  *   jamb0/jamb1: the −x / +x end of a wall piece borders a door opening.
+ *   source: 'wall' | 'inferred' for wall pieces; 'mesh' | 'plane' | 'mesh+plane' for furniture.
+ *   wall: the wall id of a wall piece (-1 for furniture).
  */
 /**
  * @typedef {{ floors: Floor[], ceilings: Ceiling[], walls: Wall[], doors: Door[], boxes: Box[], furniture: Box[],
  *   floorRef: number, floorY0: number, ceilingY: number, virtual: boolean, partialVirtual: boolean,
- *   bounds: { x0: number, x1: number, z0: number, z1: number }, notes: string[] }} Layout
+ *   bounds: { x0: number, x1: number, z0: number, z1: number }, notes: string[],
+ *   mappedFloors: number, inferredWalls: number, pockets: number }} Layout
+ */
+/**
+ * @typedef {{ doorOpen?: ArrayLike<boolean|undefined|null>|null, defaultDoorOpen?: boolean }} LayoutOptions
+ *   doorOpen[id]: false = that door is closed (ids = layout.doors order, the snapshot's door planes in order);
+ *   missing/undefined = defaultDoorOpen (true: every door open, the first-test default).
  */
 
 /** Wall slab thickness behind the face (PLAN §6.3). */
@@ -77,6 +114,19 @@ export const VIRTUAL_PATCH = 8;
 const MAX_FURN_AREA = 15;
 /** Boxes starting lower than this above the floor block walking (an enemy is ~1.8 m tall). */
 const NAV_BLOCK_BELOW = 1.9;
+/** A wall plane covers a floor edge when within 12° of it and both its ends ≤ 0.3 m off the edge line. */
+const COVER_SIN = Math.sin((12 * Math.PI) / 180);
+const COVER_DIST = 0.3;
+/** Uncovered floor-edge runs shorter than this get no inferred wall (corner slivers). */
+export const MIN_INFERRED = 0.15;
+/** Probes beyond a floor edge: another mapped floor there = an open boundary, no inferred wall. */
+const OPEN_PROBE_1 = 0.15, OPEN_PROBE_2 = 0.3;
+/** Probes either side of a door plane for mapped floor. */
+const SIDE_PROBE_1 = 0.45, SIDE_PROBE_2 = 0.9;
+/** Door pocket: depth behind the door, half-width = max(door/2 + pad, min); a smaller try if it overlaps mapped floor. */
+export const POCKET_DEPTH = 2.0;
+const POCKET_PAD = 0.45, POCKET_MIN_HALF = 0.9;
+const POCKET_DEPTH_SMALL = 1.4, POCKET_PAD_SMALL = 0.2, POCKET_MIN_HALF_SMALL = 0.7;
 
 /**
  * Label → class. Unknown non-empty labels are treated as objects (furniture),
@@ -180,7 +230,31 @@ function makeFloor(flat, y, virtual) {
     if (z < z0) z0 = z;
     if (z > z1) z1 = z;
   }
-  return { pts: Float64Array.from(flat), n, y, area: signedArea(flat), x0, x1, z0, z1, virtual };
+  return { id: -1, pts: Float64Array.from(flat), n, y, area: signedArea(flat), x0, x1, z0, z1, virtual, pocket: false, door: -1 };
+}
+
+/**
+ * Inside any of the floors that pass `filter` (0 = all, 1 = mapped only, 2 = virtual only)?
+ * @param {Floor[]} floors @param {number} x @param {number} z @param {number} filter
+ * @param {Floor|null} [skip]
+ */
+function insideKind(floors, x, z, filter, skip = null) {
+  for (const f of floors) {
+    if (f === skip || (filter === 1 && f.virtual) || (filter === 2 && !f.virtual)) continue;
+    if (x >= f.x0 && x <= f.x1 && z >= f.z0 && z <= f.z1 && pointInPolygon(f.pts, f.n, x, z)) return true;
+  }
+  return false;
+}
+
+/**
+ * Ceiling height over (x, z), NaN when no ceiling polygon covers it.
+ * @param {Ceiling[]} ceilings @param {number} x @param {number} z
+ */
+function ceilingAt(ceilings, x, z) {
+  for (const c of ceilings) {
+    if (x >= c.x0 && x <= c.x1 && z >= c.z0 && z <= c.z1 && pointInPolygon(c.pts, c.n, x, z)) return c.y;
+  }
+  return NaN;
 }
 
 /**
@@ -194,11 +268,14 @@ function squareFloor(cx, cz, side, y) {
 /**
  * @param {SpaceSnapshot|null} snapshot already normalized (see normalizeSnapshot)
  * @param {{ x: number, z: number }} start player start (reference space)
+ * @param {LayoutOptions} [opts]
  * @returns {Layout}
  */
-export function buildLayout(snapshot, start) {
+export function buildLayout(snapshot, start, opts = {}) {
   /** @type {string[]} */ const notes = [];
   const planes = snapshot ? snapshot.planes.map(worldPlane) : [];
+  const doorOpen = opts.doorOpen || null;
+  const defaultOpen = opts.defaultDoorOpen !== false;
 
   // ---- Floors
   /** @type {WPlane[]} */ let floorPlanes = planes.filter((p) => p.horizontal && p.cls === 'floor');
@@ -219,13 +296,14 @@ export function buildLayout(snapshot, start) {
   for (const p of floorPlanes) {
     const flat = cleanPolygon(p.flat);
     if (flat.length < 6 || signedArea(flat) < 0.5) continue;
-    floors.push(makeFloor(flat, p.y, false));
+    addFloor(floors, makeFloor(flat, p.y, false));
   }
 
   if (!floors.length) {
     if (snapshot) notes.push(snapshot.planes.length ? 'no floor in Space Setup: virtual room' : 'no Space Setup data: virtual room');
     return virtualLayout(start, notes);
   }
+  const mappedFloors = floors.length;
 
   const floorRef = Math.min(...floors.map((f) => f.y));
   let main = floors[0];
@@ -249,17 +327,24 @@ export function buildLayout(snapshot, start) {
   const ceilingY = ceilings.length ? Math.max(...ceilings.map((c) => c.y)) : floorRef + DEFAULT_CEILING;
   if (!ceilings.length) notes.push(`no ceiling: ${DEFAULT_CEILING} m assumed`);
 
-  // ---- Walls
+  // ---- Walls (wall planes)
   /** @type {Wall[]} */ const walls = [];
+  /** @type {{ ax: number, az: number, bx: number, bz: number }[]} */ const openSides = [];
   for (const p of planes) {
     if (p.horizontal || used.has(p)) continue;
+    if (surfaceName(p.label) === 'invisible wall face') {
+      // Space Setup's marker for an open side of a room: never infer a wall along it.
+      const sp = planeSpan(p);
+      if (sp) openSides.push(sp);
+      continue;
+    }
     let isWall = p.cls === 'wall';
     if (p.cls === null) {
       const y0 = Math.min(...p.ys), y1 = Math.max(...p.ys);
       isWall = y1 - y0 >= 1.5 && y0 < floorRef + 0.4;
     }
     if (!isWall) continue;
-    const w = makeWall(p, floors, fy);
+    const w = makeWall(p, floors, fy, walls.length);
     if (w) { walls.push(w); used.add(p); }
   }
   // Walls we could not resolve from the floors follow the normal convention the resolved ones show.
@@ -269,13 +354,18 @@ export function buildLayout(snapshot, start) {
     notes.push('wall normals point out of the rooms: interior walls flipped to match');
   }
 
-  // ---- Doors (vertical door planes overlapping walls)
+  // ---- Inferred walls on floor edges no wall plane covers (PLAN §6.1 step 5)
+  const inferredWalls = inferWalls(floors, walls, openSides, ceilings, ceilingY, notes);
+
+  // ---- Doors (vertical door planes overlapping walls); open ones cut openings
   /** @type {Door[]} */ const doors = [];
   for (const p of planes) {
     if (p.horizontal || used.has(p) || p.cls !== 'door') continue;
     used.add(p);
-    const d = makeDoor(p, fy);
+    const d = makeDoor(p, fy, doors.length);
     if (!d) continue;
+    const flag = doorOpen && d.id < doorOpen.length ? doorOpen[d.id] : undefined;
+    d.open = flag === undefined || flag === null ? defaultOpen : !!flag;
     for (const w of walls) {
       if (Math.abs(d.nx * w.nx + d.nz * w.nz) < DOOR_COS) continue;
       if (Math.abs((d.cx - w.ax) * w.nx + (d.cz - w.az) * w.nz) > DOOR_DIST) continue;
@@ -284,12 +374,25 @@ export function buildLayout(snapshot, start) {
       const p1 = (d.cx + d.tx * h - w.ax) * w.tx + (d.cz + d.tz * h - w.az) * w.tz;
       const lo = Math.max(0, Math.min(p0, p1)), hi = Math.min(w.len, Math.max(p0, p1));
       if (hi - lo < 0.5 * d.width) continue;
-      w.openings.push({ u0: lo, u1: hi, y0: d.y0, y1: d.y1 });
+      if (d.open) w.openings.push({ u0: lo, u1: hi, y0: d.y0, y1: d.y1 });
       d.walls++;
+      d.wallIds.push(w.id);
     }
     doors.push(d);
   }
+  const closed = doors.filter((d) => !d.open).length;
+  if (closed) notes.push(`${closed} door(s) closed: not carved, wall solid`);
+
+  // ---- Interior walls (no floor edge, floor on both sides): the face the player sees is the face
+  const byPlayer = resolveFromPlayer(walls, start.x, start.z);
+  if (byPlayer) notes.push(`${byPlayer} interior wall(s) faced to the player`);
   for (const w of walls) mergeOpenings(w);
+  for (const d of doors) {
+    for (const id of d.wallIds) {
+      const w = walls[id];
+      d.offsets.push((d.cx - w.ax) * w.nx + (d.cz - w.az) * w.nz);
+    }
+  }
 
   // ---- Solid boxes: wall pieces
   /** @type {Box[]} */ const boxes = [];
@@ -303,12 +406,24 @@ export function buildLayout(snapshot, start) {
   let partialVirtual = false;
   const sx = start.x, sz = start.z;
   if (!insideFloors(floors, sx, sz) && Math.min(...floors.map((f) => distSqToPolygon(f.pts, f.n, sx, sz))) > 0.3 * 0.3) {
-    floors.push(squareFloor(sx, sz, VIRTUAL_PATCH, fy(sx, sz)));
+    addFloor(floors, squareFloor(sx, sz, VIRTUAL_PATCH, fy(sx, sz)));
     partialVirtual = true;
     notes.push('player outside the mapped floor: virtual floor patch added');
   }
 
-  // ---- Bounds (floors, plus door pockets that reach past them)
+  // ---- Where each door leads; pockets behind open doors into unmapped space
+  for (const d of doors) doorSides(d, floors);
+  let pockets = 0;
+  for (const d of doors) {
+    if (d.leadsTo !== 'unmapped' || !d.open || !d.walkable || d.walls === 0) continue;
+    const pf = makePocket(d, walls, floors, fy(d.cx, d.cz));
+    if (!pf) { notes.push(`door ${d.id}: no room for a spawn pocket behind it`); continue; }
+    d.pocket = addFloor(floors, pf);
+    pockets++;
+  }
+  if (pockets) notes.push(`${pockets} spawn pocket(s) behind doors into unmapped space`);
+
+  // ---- Bounds (floors and pockets, plus door surroundings that reach past them)
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (const f of floors) {
     x0 = Math.min(x0, f.x0); x1 = Math.max(x1, f.x1); z0 = Math.min(z0, f.z0); z1 = Math.max(z1, f.z1);
@@ -321,6 +436,7 @@ export function buildLayout(snapshot, start) {
   return {
     floors, ceilings, walls, doors, boxes, furniture, floorRef, floorY0, ceilingY,
     virtual: false, partialVirtual, bounds: { x0, x1, z0, z1 }, notes,
+    mappedFloors, inferredWalls, pockets,
   };
 }
 
@@ -331,20 +447,264 @@ export function buildLayout(snapshot, start) {
  */
 function virtualLayout(start, notes) {
   const f = squareFloor(start.x, start.z, VIRTUAL_ROOM, 0);
+  f.id = 0;
   return {
     floors: [f], ceilings: [], walls: [], doors: [], boxes: [], furniture: [],
     floorRef: 0, floorY0: 0, ceilingY: NaN, virtual: true, partialVirtual: false,
     bounds: { x0: f.x0, x1: f.x1, z0: f.z0, z1: f.z1 }, notes,
+    mappedFloors: 0, inferredWalls: 0, pockets: 0,
   };
+}
+
+/** @param {Floor[]} floors @param {Floor} f @returns {number} its id */
+function addFloor(floors, f) {
+  f.id = floors.length;
+  floors.push(f);
+  return f.id;
+}
+
+/**
+ * Horizontal extent of a vertical plane as a segment.
+ * @param {WPlane} p
+ * @returns {{ ax: number, az: number, bx: number, bz: number }|null}
+ */
+function planeSpan(p) {
+  const hl = Math.hypot(p.nx, p.nz);
+  if (hl < 0.7) return null;
+  const tx = -p.nz / hl, tz = p.nx / hl;
+  const ox = p.pose[12], oz = p.pose[14];
+  let u0 = Infinity, u1 = -Infinity;
+  for (let i = 0; i < p.n; i++) {
+    const u = (p.xs[i] - ox) * tx + (p.zs[i] - oz) * tz;
+    if (u < u0) u0 = u;
+    if (u > u1) u1 = u;
+  }
+  if (!(u1 - u0 > 0.05)) return null;
+  return { ax: ox + tx * u0, az: oz + tz * u0, bx: ox + tx * u1, bz: oz + tz * u1 };
+}
+
+/**
+ * PLAN §6.1 step 5: every mapped floor edge (or part of one) that no wall plane
+ * covers becomes a wall marked `inferred`: its face on the edge, facing the
+ * floor, floor to ceiling. Parts where the floor continues into another mapped
+ * floor (an open boundary between two Space Setup rooms) or that an 'invisible
+ * wall face' plane covers stay open.
+ * @param {Floor[]} floors mapped floors only (called before any virtual floor is added)
+ * @param {Wall[]} walls wall-plane walls; inferred ones are appended
+ * @param {{ ax: number, az: number, bx: number, bz: number }[]} openSides
+ * @param {Ceiling[]} ceilings
+ * @param {number} ceilingY
+ * @param {string[]} notes
+ * @returns {number} walls added
+ */
+function inferWalls(floors, walls, openSides, ceilings, ceilingY, notes) {
+  /** @type {number[]} */ const cover = [];
+  for (const w of walls) cover.push(w.ax, w.az, w.bx, w.bz);
+  for (const o of openSides) cover.push(o.ax, o.az, o.bx, o.bz);
+  let added = 0, open = 0;
+  for (const f of floors) {
+    for (let i = 0, j = f.n - 1; i < f.n; j = i++) {
+      const x0 = f.pts[2 * j], z0 = f.pts[2 * j + 1], x1 = f.pts[2 * i], z1 = f.pts[2 * i + 1];
+      const el = Math.hypot(x1 - x0, z1 - z0);
+      if (el < MIN_INFERRED) continue;
+      const ex = (x1 - x0) / el, ez = (z1 - z0) / el;
+      /** @type {number[]} */ const cov = [];
+      for (let k = 0; k < cover.length; k += 4) {
+        const ax = cover[k], az = cover[k + 1], bx = cover[k + 2], bz = cover[k + 3];
+        const sl = Math.hypot(bx - ax, bz - az);
+        if (sl < 1e-6 || Math.abs(ex * (bz - az) - ez * (bx - ax)) / sl > COVER_SIN) continue;
+        if (Math.abs((ax - x0) * -ez + (az - z0) * ex) > COVER_DIST || Math.abs((bx - x0) * -ez + (bz - z0) * ex) > COVER_DIST) continue;
+        const ua = (ax - x0) * ex + (az - z0) * ez, ub = (bx - x0) * ex + (bz - z0) * ez;
+        const lo = Math.max(0, Math.min(ua, ub)), hi = Math.min(el, Math.max(ua, ub));
+        if (hi > lo) cov.push(lo, hi);
+      }
+      // Uncovered gaps along the edge.
+      /** @type {number[][]} */ const ivs = [];
+      for (let k = 0; k < cov.length; k += 2) ivs.push([cov[k], cov[k + 1]]);
+      ivs.sort((a, b) => a[0] - b[0]);
+      /** @type {number[]} */ const gaps = [];
+      let cur = 0;
+      for (const [lo, hi] of ivs) {
+        if (lo > cur) gaps.push(cur, lo);
+        if (hi > cur) cur = hi;
+      }
+      if (cur < el) gaps.push(cur, el);
+      for (let k = 0; k < gaps.length; k += 2) {
+        const g0 = gaps[k], g1 = gaps[k + 1];
+        if (g1 - g0 < MIN_INFERRED) continue;
+        // Split the gap into closed runs (no other mapped floor just beyond the edge).
+        const ns = Math.max(1, Math.ceil((g1 - g0) / 0.1));
+        let run0 = -1;
+        for (let s = 0; s <= ns; s++) {
+          let closedHere = false;
+          if (s < ns) {
+            const u = g0 + ((s + 0.5) / ns) * (g1 - g0);
+            const px = x0 + ex * u, pz = z0 + ez * u;
+            const ox = ez, oz = -ex; // outward (CCW floor: interior on the left)
+            closedHere = !insideKind(floors, px + ox * OPEN_PROBE_1, pz + oz * OPEN_PROBE_1, 1, f)
+              && !insideKind(floors, px + ox * OPEN_PROBE_2, pz + oz * OPEN_PROBE_2, 1, f);
+          }
+          if (closedHere && run0 < 0) run0 = s;
+          if (!closedHere && run0 >= 0) {
+            const r0 = g0 + (run0 / ns) * (g1 - g0), r1 = g0 + (s / ns) * (g1 - g0);
+            if (r1 - r0 >= MIN_INFERRED) {
+              const ax = x0 + ex * r0, az = z0 + ez * r0, bx = x0 + ex * r1, bz = z0 + ez * r1;
+              const nx = -ez, nz = ex;
+              let y1 = ceilingAt(ceilings, (ax + bx) / 2 + nx * 0.3, (az + bz) / 2 + nz * 0.3);
+              if (!(y1 === y1)) y1 = ceilings.length ? ceilingY : f.y + DEFAULT_CEILING;
+              walls.push({
+                id: walls.length, ax, az, bx, bz, tx: ex, tz: ez, nx, nz, len: r1 - r0, y0: f.y, y1,
+                openings: [], side: 'edge', flipped: false, inferred: true,
+              });
+              added++;
+            }
+            run0 = -1;
+          }
+          if (!closedHere && s < ns) open++;
+        }
+      }
+    }
+  }
+  if (added) notes.push(`${added} inferred wall(s) on floor edges without a wall plane`);
+  if (open) notes.push(`floor edges left open where another floor continues (${(open * 0.1).toFixed(1)} m approx.)`);
+  return added;
+}
+
+/**
+ * A wall the floors could not place (side 'normal' or 'learned': floor on both
+ * sides) that the player can see from the start: its face is turned to the
+ * player, so the slab goes BEHIND the surface the player looks at.
+ * @param {Wall[]} walls
+ * @param {number} sx @param {number} sz player start
+ * @returns {number} walls set to side 'player'
+ */
+function resolveFromPlayer(walls, sx, sz) {
+  let n = 0;
+  for (const w of walls) {
+    if (w.inferred || (w.side !== 'normal' && w.side !== 'learned')) continue;
+    const dp = (sx - w.ax) * w.nx + (sz - w.az) * w.nz;
+    if (Math.abs(dp) < 0.05 || !seenFrom(walls, w, sx, sz)) continue;
+    if (dp < 0) flipWall(w);
+    w.side = 'player';
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Is any of 9 points along `w` in 2D sight of (sx, sz)? Other walls block,
+ * except inside their (open) door openings.
+ * @param {Wall[]} walls @param {Wall} w @param {number} sx @param {number} sz
+ */
+function seenFrom(walls, w, sx, sz) {
+  for (let k = 0; k < 9; k++) {
+    const t = (k + 0.5) / 9;
+    let px = w.ax + (w.bx - w.ax) * t, pz = w.az + (w.bz - w.az) * t;
+    const dx = sx - px, dz = sz - pz, dl = Math.hypot(dx, dz);
+    if (dl < 0.05) continue;
+    px += (dx / dl) * 0.03;
+    pz += (dz / dl) * 0.03;
+    let blocked = false;
+    for (const v of walls) {
+      if (v !== w && crossesSolid(v, sx, sz, px, pz)) { blocked = true; break; }
+    }
+    if (!blocked) return true;
+  }
+  return false;
+}
+
+/**
+ * Does segment a→b cross wall v's face line outside its openings?
+ * @param {Wall} v @param {number} ax @param {number} az @param {number} bx @param {number} bz
+ */
+function crossesSolid(v, ax, az, bx, bz) {
+  const rx = bx - ax, rz = bz - az, qx = v.bx - v.ax, qz = v.bz - v.az;
+  const den = rx * qz - rz * qx;
+  if (den > -1e-12 && den < 1e-12) return false;
+  const wx = v.ax - ax, wz = v.az - az;
+  const t = (wx * qz - wz * qx) / den, u = (wx * rz - wz * rx) / den;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return false;
+  const uu = u * v.len;
+  for (const o of v.openings) if (uu > o.u0 && uu < o.u1) return false;
+  return true;
+}
+
+/**
+ * Which sides of a door plane have floor, and where the door leads.
+ * @param {Door} d @param {Floor[]} floors
+ */
+function doorSides(d, floors) {
+  /** @param {number} sg 2 = mapped floor, 1 = virtual floor, 0 = none */
+  const probe = (sg) => {
+    let v = 0;
+    for (const r of [SIDE_PROBE_1, SIDE_PROBE_2]) {
+      const x = d.cx + d.nx * r * sg, z = d.cz + d.nz * r * sg;
+      if (insideKind(floors, x, z, 1)) return 2;
+      if (insideKind(floors, x, z, 2)) v = 1;
+    }
+    return v;
+  };
+  const f = probe(1), b = probe(-1);
+  d.side = f === 2 && b === 2 ? 'both' : f === 2 ? 'front' : b === 2 ? 'back' : 'none';
+  d.leadsTo = f === 2 && b === 2 ? 'mapped' : f + b === 3 ? 'virtual' : f === 2 || b === 2 ? 'unmapped' : 'none';
+}
+
+/**
+ * A small virtual floor behind a door into unmapped space (the side without
+ * mapped floor), starting at the far face of the wall it is cut into. Tries a
+ * smaller pocket if the first one would overlap mapped floor; null if both do.
+ * @param {Door} d @param {Wall[]} walls @param {Floor[]} floors @param {number} y
+ * @returns {Floor|null}
+ */
+function makePocket(d, walls, floors, y) {
+  const sg = d.side === 'front' ? -1 : 1; // toward the side without floor
+  const ox = d.nx * sg, oz = d.nz * sg;
+  // Start at the door plane, or at a matched wall face that lies farther out.
+  let near = 0.03;
+  for (let k = 0; k < d.wallIds.length; k++) {
+    const w = walls[d.wallIds[k]];
+    const faceOut = -d.offsets[k] * (w.nx * ox + w.nz * oz);
+    if (faceOut > near) near = faceOut;
+  }
+  near = Math.min(near, 0.4);
+  for (const [depth, pad, minHalf] of [[POCKET_DEPTH, POCKET_PAD, POCKET_MIN_HALF], [POCKET_DEPTH_SMALL, POCKET_PAD_SMALL, POCKET_MIN_HALF_SMALL]]) {
+    const hw = Math.max(d.width / 2 + pad, minHalf);
+    let hitsMapped = false;
+    for (let a = 0; a <= 4 && !hitsMapped; a++) {
+      for (let b = 0; b <= 4; b++) {
+        const u = -hw + (2 * hw * a) / 4, v = near + 0.05 + ((depth - 0.05) * b) / 4;
+        if (insideKind(floors, d.cx + d.tx * u + ox * v, d.cz + d.tz * u + oz * v, 1)) { hitsMapped = true; break; }
+      }
+    }
+    if (hitsMapped) continue;
+    /** @type {number[]} */ const flat = [];
+    for (const [u, v] of [[-hw, near], [hw, near], [hw, near + depth], [-hw, near + depth]]) {
+      flat.push(d.cx + d.tx * u + ox * v, d.cz + d.tz * u + oz * v);
+    }
+    if (signedArea(flat) < 0) {
+      for (let i = 0; i < 2; i++) {
+        const j = 3 - i;
+        const tx = flat[2 * i], tz = flat[2 * i + 1];
+        flat[2 * i] = flat[2 * j]; flat[2 * i + 1] = flat[2 * j + 1];
+        flat[2 * j] = tx; flat[2 * j + 1] = tz;
+      }
+    }
+    const f = makeFloor(flat, y, true);
+    f.pocket = true;
+    f.door = d.id;
+    return f;
+  }
+  return null;
 }
 
 /**
  * @param {WPlane} p
  * @param {Floor[]} floors
  * @param {(x: number, z: number) => number} fy
+ * @param {number} id
  * @returns {Wall|null}
  */
-function makeWall(p, floors, fy) {
+function makeWall(p, floors, fy, id) {
   let nx = p.nx, nz = p.nz;
   const hl = Math.hypot(nx, nz);
   if (hl < 0.7) return null; // tilted, not a wall
@@ -364,7 +724,7 @@ function makeWall(p, floors, fy) {
   let ax = ox + tx * u0, az = oz + tz * u0, bx = ox + tx * u1, bz = oz + tz * u1;
 
   // Which side is the room? 1) a floor edge under this wall, 2) floor coverage, 3) the normal.
-  /** @type {'edge'|'sampled'|'normal'} */ let side = 'normal';
+  /** @type {WallSide} */ let side = 'normal';
   let flip = false;
   const mx = (ax + bx) / 2, mz = (az + bz) / 2;
   let bestD = 0.15;
@@ -406,15 +766,16 @@ function makeWall(p, floors, fy) {
   tx = (bx - ax) / len; tz = (bz - az) / len;
   const f0 = fy(mx + nx * 0.25, mz + nz * 0.25);
   if (y0 < f0 + 0.3) y0 = Math.min(y0, f0);
-  return { ax, az, bx, bz, tx, tz, nx, nz, len, y0, y1, openings: [], side, flipped: flip };
+  return { id, ax, az, bx, bz, tx, tz, nx, nz, len, y0, y1, openings: [], side, flipped: flip, inferred: false };
 }
 
 /**
  * @param {WPlane} p
  * @param {(x: number, z: number) => number} fy
+ * @param {number} id
  * @returns {Door|null}
  */
-function makeDoor(p, fy) {
+function makeDoor(p, fy, id) {
   let nx = p.nx, nz = p.nz;
   const hl = Math.hypot(nx, nz);
   if (hl < 0.7) return null;
@@ -438,15 +799,27 @@ function makeDoor(p, fy) {
   const f = fy(cx, cz);
   if (y0 < f + 0.3) y0 = Math.min(y0, f);
   const walkable = y0 < f + 0.25 && y1 - y0 >= 1.5 && width >= 0.4;
-  return { cx, cz, tx, tz, nx, nz, width, y0, y1, walls: 0, walkable };
+  return {
+    id, cx, cz, tx, tz, nx, nz, width, y0, y1, walls: 0, wallIds: [], offsets: [], walkable, open: true,
+    side: 'none', leadsTo: 'none', pocket: -1, passable: false,
+  };
 }
 
-/** Swap a wall's face direction (the slab moves to the other side of the face). @param {Wall} w */
+/**
+ * Swap a wall's face direction (the slab moves to the other side of the face).
+ * Openings are mirrored (they are measured from a).
+ * @param {Wall} w
+ */
 function flipWall(w) {
   const ax = w.ax, az = w.az;
   w.ax = w.bx; w.az = w.bz; w.bx = ax; w.bz = az;
   w.nx = -w.nx; w.nz = -w.nz; w.tx = -w.tx; w.tz = -w.tz;
   w.flipped = !w.flipped;
+  for (const o of w.openings) {
+    const u0 = o.u0;
+    o.u0 = w.len - o.u1;
+    o.u1 = w.len - u0;
+  }
 }
 
 /** @param {Wall} w */
@@ -482,7 +855,7 @@ function wallPieces(w, out) {
     out.push({
       cx: w.ax + c * um - w.nx * hz, cz: w.az + s * um - w.nz * hz, c, s,
       hx: (ub - ua) / 2, hz, y0, y1, label: 'wall', kind: 'wall', face: -1,
-      jamb0: j0, jamb1: j1, lintel, sill, navBlock: false, source: 'wall',
+      jamb0: j0, jamb1: j1, lintel, sill, navBlock: false, source: w.inferred ? 'inferred' : 'wall', wall: w.id,
     });
   };
   let cur = 0, prevJamb = false;
@@ -586,6 +959,6 @@ function furnBox(r, y0, y1, label, source, fy, area) {
   if (y0 < f + 0.25) y0 = f; // resting on the floor (or a small gap): extend down to it
   return {
     cx: r.cx, cz: r.cz, c: r.c, s: r.s, hx: r.hx, hz: r.hz, y0, y1, label: surfaceName(label), kind: /** @type {'furniture'} */ ('furniture'),
-    face: 0, jamb0: false, jamb1: false, lintel: false, sill: false, navBlock: true, source, area, corners: rectCorners(r),
+    face: 0, jamb0: false, jamb1: false, lintel: false, sill: false, navBlock: true, source, wall: -1, area, corners: rectCorners(r),
   };
 }
