@@ -35,6 +35,15 @@ import { linearParams } from './occlusionMath.js';
  * - Mode, tap count, band, bias and on/off are uniforms: switching any of them
  *   never compiles a program. The program key gains one constant suffix.
  *
+ * Unverified on device (all LIKELY, none device-verified):
+ * - that the Quest compositor treats the layer's alpha as premultiplied
+ *   (fade mode on opaque materials relies on it; if faded edges look dark or
+ *   haloed, switch to `dither: true`, which writes only alpha 1 or nothing);
+ * - that the depth texture handle stays the same all session (three wraps it
+ *   once; its own pass would break too if it changed);
+ * - what raw value the sensor gives where it sees nothing (raw 0 hides
+ *   everything, as in three's pass; `noDataRaw: 0` treats it as far instead).
+ *
  * ## Which materials to patch (call `applySoftOcclusion` once, at load)
  *
  * | Object | Patch? | Bias (`OCCLUSION_BIAS`) |

@@ -1,7 +1,8 @@
 // @ts-check
 /**
- * The 2D page shown before and after XR: enter buttons, the reduced-features
- * retry, and the diagnostics summary with copy / download / share.
+ * The 2D page shown before and after XR: the preload bar ("Loading 63%"), enter
+ * buttons (gated on the preload), the reduced-features retry, and the
+ * diagnostics summary with copy / download / share.
  */
 
 /** @param {string} id */

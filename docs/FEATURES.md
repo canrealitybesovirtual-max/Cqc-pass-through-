@@ -45,6 +45,13 @@ Each item moves through four statuses: **planned → implemented → desktop-tes
 | `assertStable` dev check (programs, textures, geometries after the baseline) | desktop-tested | Node tests; IWER e2e: flat in probe and after warmXR. Device check pending |
 | Pools in the warm-up (`buildPools` hook in `main.js`) | planned | Integration wires the weapon views, FX and enemy pools |
 
+## Soft live-depth occlusion (PLAN §5 mode C, opt-in, not wired)
+
+| Item | Status | Notes |
+|---|---|---|
+| `src/xr/DepthOcclusion.js`: `applySoftOcclusion(material)` patch (MeshBasic, MeshStandard/Physical, ShaderMaterial via `softocc_*` chunks), 5–10 cm fade or Bayer dither, 1-tap or 4-tap PCF, per-material bias | implemented, device test pending | Desktop: `npm test` (maths, patch, controller, no allocation) and `NODE_PATH=$(npm root -g) node tests/e2e/depth-occlusion.mjs` (compile + GPU output vs the maths with fake R32F and DEPTH_COMPONENT16 depth arrays; programs flat). IWER has no depth, so the real look and the compositor's alpha handling are unverified |
+| `DepthOcclusion` controller: hides three's hard depth mesh, per-frame uniforms (texture, eye viewports, near/far), `disable()` restores | implemented, device test pending | Which materials to patch, load-time pre-patching and the frame-loop call are in the module header. App wiring is for the integration agent |
+
 ## Later phases
 
 These items are planned, as in PLAN §12.

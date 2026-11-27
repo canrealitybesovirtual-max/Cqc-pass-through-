@@ -296,7 +296,7 @@ void main(){ vec2 t = floor( gl_FragCoord.xy ); float z = 0.8 + 0.12 * t.x + 0.0
   check('patched shaders compile and link (no shader errors)', shaderErrors.length === 0, shaderErrors.join(' || ') || `${programs0} programs`);
   const progs = renderer.info.programs;
   const runnable = progs.every((p) => !p.diagnostics || p.diagnostics.runnable);
-  check('every program runnable', runnable, progs.map((p) => p.name).join(', '));
+  check('every program runnable', runnable, `${progs.length} programs, diagnostics ${progs.filter((p) => p.diagnostics).length}`);
   const fsSrc = progs.map((p) => gl.getShaderSource(p.fragmentShader) || '');
   const vsSrc = progs.map((p) => gl.getShaderSource(p.vertexShader) || '');
   const withOcc = fsSrc.filter((s) => s.includes('float occVisibility()')).length;
