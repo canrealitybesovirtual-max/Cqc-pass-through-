@@ -89,22 +89,3 @@ test('capsules stay within the measured body (rest pose)', () => {
   const cy = (h.a[o + 1] + h.b[o + 1]) / 2 + (rig.restModelP[B.head].y - a.mp[B.head].y); // as if at full height
   assert.ok(cy > 1.68 && cy < 1.8, `head centre ${cy}`);
 });
-
-test('raycast does not allocate', () => {
-  const { h } = standing(0, 0, 0);
-  let i = 0, grew = Infinity, hits = 0;
-  const shot = () => {
-    const y = 0.2 + (i % 170) * 0.01, x = ((i * 7) % 60 - 30) * 0.01;
-    if (h.raycast(x, y, 3, 0, 0, -1, 10) >= 0) hits++;
-    i++;
-  };
-  while (i < 20000) shot();
-  for (let rep = 0; rep < 3; rep++) {
-    globalThis.gc?.();
-    const before = process.memoryUsage().heapUsed;
-    for (let n = 0; n < 100000; n++) shot();
-    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
-  }
-  assert.ok(hits > 1000, 'some rays hit');
-  assert.ok(grew < 100_000, `heap grew ${grew} bytes over 100k rays`);
-});

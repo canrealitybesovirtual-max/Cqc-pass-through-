@@ -33,6 +33,18 @@ Each item moves through four statuses: **planned → implemented → desktop-tes
 | Render static site (`render.yaml`) | implemented | |
 | ARCHITECTURE.md, FEATURES.md, DECISIONS.md, DEVICE_LOG.md | implemented | |
 
+## Test slice (v0.2): preload and warm-up
+
+| Item | Status | Notes |
+|---|---|---|
+| Import map `three/addons/` → `vendor/three/addons/` | desktop-tested | IWER e2e loads the GLTF, KTX2 and meshopt add-ons |
+| Preload before Enter: assets, audio decode, warm-up, with "Loading n%" | desktop-tested | IWER e2e: reaches 100 %, buttons disabled while loading, Enter MR enabled after; device load time pending |
+| Load failure: error shown, Enter MR off, probe sessions usable | desktop-tested | IWER e2e with a missing model |
+| `warmUp`: orphans attached, instanceColor primed, compile, one upload per frame ≥ 30 ms apart, forced-visible default-framebuffer draw, all flags restored, baseline | desktop-tested | Node tests + IWER e2e (8 programs, 14 textures, 11 geometries for the loaded models + probe scene) |
+| `warmXR`: one draw inside the first XR frame, re-baselines | desktop-tested | IWER e2e drives it through a system; not yet wired in App (needs the "Get ready" panel) |
+| `assertStable` dev check (programs, textures, geometries after the baseline) | desktop-tested | Node tests; IWER e2e: flat in probe and after warmXR. Device check pending |
+| Pools in the warm-up (`buildPools` hook in `main.js`) | planned | Integration wires the weapon views, FX and enemy pools |
+
 ## Later phases
 
 These items are planned, as in PLAN §12.

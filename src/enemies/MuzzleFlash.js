@@ -81,6 +81,7 @@ export class MuzzleFlash {
     this.texture = flashTexture();
     this.material = new THREE.MeshBasicMaterial({
       map: this.texture, color: 0xffffff, transparent: true, depthWrite: false, side: THREE.DoubleSide, toneMapped: false,
+      forceSinglePass: true, // a double-sided transparent material is otherwise drawn twice
     });
     this.material.name = 'enemy-muzzle-flash';
     this.mesh = new THREE.InstancedMesh(flashGeometry(), this.material, max);

@@ -99,6 +99,7 @@ async function run(o) {
   const t0 = clock();
   /** @param {number} f @param {string} label */
   const report = (f, label) => {
+    if (P.state !== 'loading') return; // late callbacks of fetches still in flight after a failure
     if (!(f >= P.progress)) f = P.progress; // forward only (also catches NaN)
     if (f > 1) f = 1;
     P.progress = f;

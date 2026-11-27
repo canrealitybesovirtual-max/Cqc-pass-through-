@@ -116,9 +116,9 @@ const clock = () => (typeof performance !== 'undefined' ? performance.now() : Da
 export function nextFrame() {
   return new Promise((resolve) => {
     let done = false;
-    const go = () => { if (!done) { done = true; resolve(); } };
+    const go = () => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+    const timer = setTimeout(go, 100);
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(go);
-    setTimeout(go, 100);
   });
 }
 
@@ -380,9 +380,12 @@ export async function warmUp(renderer, scenes, objects, onProgress, opt = {}) {
     // 2. programs
     report(0, 'compile');
     let t = now();
+    // Without KHR_parallel_shader_compile (Quest 3) compileAsync is compile() plus a 10 ms timer,
+    // and it logs a warning about the missing extension: call compile() and yield a frame instead.
+    const parallel = typeof r.compileAsync === 'function' && !(r.extensions && typeof r.extensions.has === 'function' && !r.extensions.has('KHR_parallel_shader_compile'));
     for (let i = 0; i < sceneList.length; i++) {
-      if (typeof r.compileAsync === 'function') await r.compileAsync(sceneList[i], camera);
-      else r.compile(sceneList[i], camera);
+      if (parallel) await r.compileAsync(sceneList[i], camera);
+      else { r.compile(sceneList[i], camera); await frame(); }
       report((0.3 * (i + 1)) / sceneList.length, 'compile');
     }
     compileMs = now() - t;

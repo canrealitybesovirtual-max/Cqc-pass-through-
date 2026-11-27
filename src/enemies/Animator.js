@@ -38,7 +38,7 @@
  */
 
 import { B, CORE_COUNT } from './Rig.js';
-import { Q, V3, Rng, clamp, rotationBetweenFrames, smooth, wrapAngle } from './math.js';
+import { Q, V3, Rng, clamp, rotationBetweenFrames } from './math.js';
 
 /** Tuned values (design; desktop-checked against renders, not yet in the headset). */
 export const ANIM = Object.freeze({
@@ -83,8 +83,6 @@ export const LOW = {
   fwd: new V3(0.513, -0.643, 0.569).normalize(),
   up: new V3(0.15, 0.72, 0.676).normalize(),
 };
-/** The aimed rifle's butt sits in the shoulder pocket (used by the clavicle). */
-const POCKET = new V3(-0.115, 1.415, 0.085);
 /** Left hand on the handguard, rifle space: finger direction, palm normal, wrist position. */
 const SUP_F = new V3(0.72, 0.18, -0.67).normalize();
 const SUP_N = new V3(0.35, 0.94, 0).normalize();
@@ -512,7 +510,7 @@ export class Animator {
     let sl = A.stepLen[0] + A.stepLen[1] * speed;
     if (sl > A.stepLen[2]) sl = A.stepLen[2];
     this.stepLen = sl;
-    let T = A.shufflePeriod;
+    /** @type {number} */ let T = A.shufflePeriod;
     if (moving) { T = sl / speed; if (T < A.stepPeriod[0]) T = A.stepPeriod[0]; else if (T > A.stepPeriod[1]) T = A.stepPeriod[1]; }
     this.period = T;
     const nv = this._v[20];

@@ -16,8 +16,10 @@ Quest 3 mixed-reality tactical FPS. three.js r187 (`WebGLRenderer`, WebGL2) and 
 ## Phase 1 runtime
 
 ```
-index.html ── import map: three → vendor/three/three.module.js
-  └ src/main.js            boot: optional IWER (?emulate), support check, renderer, App, HomePage
+index.html ── import map: three → vendor/three/three.module.js, three/addons/ → vendor/three/addons/
+  └ src/main.js            boot: optional IWER (?emulate), support check, renderer, App, HomePage, preload
+     ├ core/Preload.js     before Enter: Assets.load → AudioEngine.decodeAll → buildPools hook → warmUp
+     ├ core/Warmup.js      warmUp (pre-XR compile + uploads + draw), warmXR (one XR-frame draw), assertStable
      └ app/App.js          composition root; one XR session at a time
         ├ app/Game.js      state machine boot → menu → entering → xr → menu (+ pause reasons)
         ├ app/Loop.js      XR frame loop; systems timed by PerfMonitor; dt clamp; per-frame try/catch
@@ -33,7 +35,7 @@ index.html ── import map: three → vendor/three/three.module.js
         ├ debug/DebugDraw.js      controller rays, hit-test reticle
         ├ debug/TestCube.js       world-locked test cube (+ grid in VR)
         ├ ui/CanvasPanel.js       in-headset text panel: redraw on change, no mipmaps, tag-along
-        └ ui/HomePage.js          2D page: start buttons, retry, diagnostics summary
+        └ ui/HomePage.js          2D page: load bar, start buttons, retry, diagnostics summary
 ```
 
 ### Frame order
@@ -55,6 +57,15 @@ Each system is timed separately, and `renderer.info` is reset once per frame.
     2. `attachSession` requests the reference space first, falling back to `local-floor`.
     3. It then sets the space, scale and foveation, and calls `setSession`.
 3. The capability log is collected, and the lifecycle listeners and probes are attached.
+
+### Preload and warm-up (before Enter)
+
+1. `main.js` starts `preload()` (`core/Preload.js`) once the support check shows AR or VR. The page shows "Loading n%"; every session button stays disabled until the warm-up has drawn, because its default-framebuffer draw must not overlap XR.
+2. `Assets.load` (75 % of the bar), then `AudioEngine.decodeAll` (10 %; the context stays suspended until `audio.unlock()` inside the Enter click, which `HomePage.onEnter` does for play modes), then the `buildPools(assets, audio)` hook, then `warmUp` (15 %).
+3. `warmUp(renderer, scenes, objects)`: orphans are attached to the main scene (its fixed light set is part of every program key) and `setColorAt(0, white)` primes instanced pools; `compile` per scene (`compileAsync` only when `KHR_parallel_shader_compile` exists, which the Quest lacks); `initTexture` per texture, one per frame and ≥ 30 ms apart; one `render` per scene to the default framebuffer with every drawable, ancestor and LOD level forced visible and culling off; then every flag is restored and the orphans detached. The program, texture and geometry counts become the baseline.
+4. Enter MR is enabled only when this succeeded. On failure the page shows the error and keeps the probe sessions usable.
+5. The result is `preloaded` (exported by `core/Preload.js`, also `window.__app.preload`): `assets`, `audio`, `warm` (the baseline), `warmed` (the objects drawn), and a summary in the diagnostics JSON (`preload`).
+6. In a play session App calls `warmXR(renderer, scene, camera, pools)` inside the first XR frame (before the frame's render, behind the opaque "Get ready" panel) and `assertStable(renderer)` in dev builds.
 
 ### Known three.js r187 behaviours we design around (verified in source)
 

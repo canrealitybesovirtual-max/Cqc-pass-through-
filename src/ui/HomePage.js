@@ -41,6 +41,7 @@ export class HomePage {
    * @param {string} [label]
    */
   loading(fraction, label = '') {
+    if (this.load === 'ready' || this.load === 'failed') return; // a late callback after the end
     const first = this.load !== 'loading';
     this.load = 'loading';
     this.loadBox.hidden = false;

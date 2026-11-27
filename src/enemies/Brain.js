@@ -56,8 +56,8 @@ export const AI = Object.freeze({
   hearPath: 40, nearMiss: 1.0,
   flinch: 0.35, // s
   samples: 20, // engagement candidates per decision
-  spread: 1.6, // m between enemies' points
-  separation: 0.7, // m between enemies
+  spread: 2.0, // m between enemies' points
+  separation: 0.8, // m between enemies
   pathQuota: 600, // A* expansions per frame (PLAN §9: measure on Quest)
 });
 
@@ -406,7 +406,7 @@ export class Brain {
         if (j === a.i || !o.alive) continue;
         const gx = o.hasGoal ? o.goalX : o.x, gz = o.hasGoal ? o.goalZ : o.z;
         const dd = Math.sqrt((x - gx) * (x - gx) + (z - gz) * (z - gz));
-        if (dd < AI.spread) sc -= (AI.spread - dd) * 4;
+        if (dd < AI.spread) sc -= (AI.spread - dd) * 6;
       }
       if (sc > best) { best = sc; bx = x; bz = z; bestLos = los; }
     }
