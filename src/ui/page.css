@@ -1,0 +1,18 @@
+:root { color-scheme: dark; --bg: #0d1218; --fg: #e3e9ef; --dim: #93a3b3; --ok: #7ee29b; --bad: #ffb15c; --btn: #1d2a37; --btn2: #2b3e52; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.5 system-ui, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 26px; margin: 0 0 6px; }
+h1 small { color: var(--dim); font-weight: 400; font-size: 15px; }
+h2 { font-size: 18px; margin: 26px 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; }
+button { font: inherit; font-weight: 600; color: var(--fg); background: var(--btn); border: 1px solid var(--btn2); border-radius: 10px; padding: 14px 20px; min-height: 52px; cursor: pointer; }
+button:hover:not(:disabled) { background: var(--btn2); }
+button:disabled { opacity: .4; cursor: default; }
+button.quiet { font-weight: 400; color: var(--dim); }
+#support.ok { color: var(--ok); }
+#support.bad { color: var(--bad); }
+#msg { min-height: 1.5em; color: var(--dim); }
+ol li, ul li { margin: 4px 0; }
+#summary ul { padding-left: 18px; }
+#summary li { font-size: 15px; }

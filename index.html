@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CQC Pass-Through</title>
+  <script type="importmap">{ "imports": { "three": "./vendor/three/three.module.js" } }</script>
+  <link rel="stylesheet" href="./src/ui/page.css">
+</head>
+<body>
+  <main>
+    <h1>CQC Pass-Through <small id="ver"></small></h1>
+    <p id="support">Checking WebXR…</p>
+
+    <section>
+      <h2>Start</h2>
+      <div class="row">
+        <button id="bPlay" disabled>Enter MR</button>
+        <button id="bProbe" disabled>Probe session</button>
+        <button id="bBounds" disabled>Boundary probe</button>
+        <button id="bVR" disabled>VR test scene</button>
+        <button id="bRetry" hidden disabled>Tap again (reduced features)</button>
+      </div>
+      <p id="msg"></p>
+    </section>
+
+    <section>
+      <h2>Phase 1 headset tests</h2>
+      <ol>
+        <li><b>Probe session.</b> You should see your room with an orange cube ahead. Check the panel's lines.
+          <ul>
+            <li>Stand in the room you set up in Space Setup. Hold the <b>right trigger</b> and point at walls for a few seconds.</li>
+            <li>Walk carefully into another room. Point at its walls with the trigger the same way.</li>
+            <li>Put your hand in front of the cube: does your hand hide it? Then press <b>X</b> (clear off), then <b>X</b> again (clear on). Does the room ever turn black or smeared?</li>
+          </ul>
+        </li>
+        <li><b>Enter MR</b> (play session). Stand still. Press <b>A</b> and wait 60 s. Press <b>B</b> to switch the refresh rate. Press <b>A</b> again and wait 60 s.</li>
+        <li><b>Boundary probe.</b> Look around for 20 s.</li>
+        <li>In each session, notice whether the Quest's own boundary (Guardian) appears.</li>
+        <li>Exit each session by holding <b>both grips for 1 second</b>. Then tap <b>Copy</b> below and paste it into the chat.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Diagnostics</h2>
+      <div id="summary"></div>
+      <div class="row">
+        <button id="bCopy">Copy</button>
+        <button id="bDownload">Download</button>
+        <button id="bShare">Share</button>
+        <button id="bClear" class="quiet">Clear</button>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

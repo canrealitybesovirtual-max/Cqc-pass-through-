@@ -1,0 +1,1 @@
+IWER 2.8.0 (iwer@2.8.0) from npm, unmodified. MIT, see LICENSE. Dev only: loaded with ?emulate, never in normal play.
