@@ -109,10 +109,14 @@ test('the per-frame update does not allocate; a hit allocates at most a little',
   // hit in the interpreter, nothing once optimised); never objects, arrays or closures
   const hit = () => p.spawn(3 + (i++ % 7) * 0.1, 1.2, -2, 1, -0.1, 0.2);
   for (let k = 0; k < 200; k++) hit();
-  globalThis.gc?.();
-  const b0 = process.memoryUsage().heapUsed;
-  for (let k = 0; k < 1000; k++) hit();
-  const perHit = (process.memoryUsage().heapUsed - b0) / 1000;
+  // the least of three windows: one can catch V8 compiling spawn() (code space counts in heapUsed)
+  let perHit = Infinity;
+  for (let rep = 0; rep < 3; rep++) {
+    globalThis.gc?.();
+    const b0 = process.memoryUsage().heapUsed;
+    for (let k = 0; k < 500; k++) hit();
+    perHit = Math.min(perHit, (process.memoryUsage().heapUsed - b0) / 500);
+  }
   assert.ok(perHit < 8192, `${perHit.toFixed(0)} B per hit`);
   // frames (a new hit whenever the last one has gone, so there is always something to draw),
   // once V8 has optimised both

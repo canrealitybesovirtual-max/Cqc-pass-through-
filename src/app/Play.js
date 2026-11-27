@@ -506,6 +506,7 @@ export class PlayKit {
    * then). Cached arrays: no allocation per frame.
    */
   panelLines() {
+    if (this.game.spotting) return null;
     switch (this.step) {
       case STEP.CAPTURE: return CAPTURE_LINES;
       case STEP.WARM: case STEP.START: case STEP.REBUILD: return this.builtLines;
