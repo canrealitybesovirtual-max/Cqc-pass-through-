@@ -53,7 +53,17 @@ test('build fills the same buffers (no new geometry, material or attribute)', ()
   assert.equal(pos.array, posArray);
   assert.ok(pos.version > v0 && idx.version > i0, 'marked for upload');
   assert.equal(w.occluderBoxes, w.layout.boxes.length);
+  assert.equal(w.curtainBoxes, 1, 'v0.4.1: the hallway door into unmapped space has a curtain');
+  assert.equal(geometry.drawRange.count, (w.occluderBoxes + w.curtainBoxes) * 36, 'boxes and the standing curtain');
+  // the curtain stands down while the head is past it (in the hallway): a draw range change only
+  const v1 = pos.version;
+  w.update(1 / 72, 1000, null, { player: { head: { x: -1.15, z: -3.4 }, valid: true } });
+  assert.equal(w.curtainsOn, false);
   assert.equal(geometry.drawRange.count, w.occluderBoxes * 36);
+  w.update(1 / 72, 1014, null, { player: { head: { x: 0, z: 0 }, valid: true } });
+  assert.equal(w.curtainsOn, true);
+  assert.equal(geometry.drawRange.count, (w.occluderBoxes + w.curtainBoxes) * 36);
+  assert.equal(pos.version, v1, 'no upload');
   assert.ok(w.occluderBoxes * 12 <= 2400, 'triangle budget (PLAN §5: ≤ 2.4k)');
   // Bounds cover the house and nothing more.
   const bb = geometry.boundingBox;
@@ -156,6 +166,12 @@ test('a closed door in World: the occluder has no hole there; rebuild() rewrites
     rc.far = 4;
     return rc.intersectObject(m).length === 0;
   };
+  // v0.4.1: the open door's curtain stands behind the wall (the hallway is unmapped): the opening itself is open
+  rc.set(new THREE.Vector3(-1.15, 1.0, 0), new THREE.Vector3(0, 0, -1));
+  rc.far = 4;
+  const ch = rc.intersectObject(m);
+  assert.ok(ch.length > 0 && ch[0].point.z < -3.05 && ch[0].point.z > -3.25, `curtain beyond the wall: ${ch.length ? ch[0].point.z : 'none'}`);
+  w.update(1 / 72, 1000, null, { player: { head: { x: -1.15, z: -3.5 }, valid: true } }); // in the hallway: curtains down
   assert.ok(through(), 'open hallway door: no occluder in the opening');
   assert.ok(w.setDoorOpen(2, false));
   w.rebuild();

@@ -21,6 +21,10 @@ Read first: `CLAUDE.md`, `docs/PLAN.md` (§5, §8–10, §14), `docs/ARCHITECTUR
 - **The look** (builder L, `src/fx/`, `src/core/Renderer.js`): room light, contact shadows, impacts per real material, the passthrough colour match; its own `look` system after `game`; `ctx.look`.
 - **Automatic diagnostics upload** (builder I, `src/debug/Upload.js`): the user's extra 10.
 
+**v0.4.1 changes** (the user's house replayed; details in DECISIONS.md):
+- **World:** `NAV_HIDDEN` (nav flag 2048, `nav.isHidden(x, z)`) marks unscanned space: door pockets, and rooms behind the real walls. `layout.curtains` holds the depth-only door curtains. They are drawn after the boxes in the box occluder while `world.curtainsOn`, which `world.update` sets from `ctx.player.head`. `world.report().hidden` gives `{ rooms, curtains, pocketCells }`, and `doors[].curtain` is reported too. Floor heights come from the scan where it covers them (`meshStats.floorFix`). Where floors overlap, the smallest polygon wins.
+- **Enemies:** `ENEMY.heightMin` / `heightMax` (1.70 / 1.85 m). Each spawn sets `Animator.k`, `EnemyRig.setScale(k)` and `Hitbox.k`. `stats.heightMin` / `heightMax` go in the record. The Brain never sees or shoots from `NAV_HIDDEN` cells, and never picks an engagement point there, while `world.curtainsOn`.
+
 ## Rules for every module
 
 - **Ownership.** Each builder writes **only its own directories** (see "Ownership" at the end). You may read anything. If you need something from another module, code against the interface in this file. Never edit another module's files.

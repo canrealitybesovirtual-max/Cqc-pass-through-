@@ -167,29 +167,43 @@ test('A* from the bedroom to the living room goes through the door', () => {
   assert.ok(through);
 });
 
-test('findSpawn: behind the bedroom door, hidden, reachable, ≥ minDist, varied', () => {
+test('findSpawn: behind the bedroom door or in the hallway pocket, hidden, reachable, ≥ minDist, varied', () => {
   const w = new WorldCore();
   w.build(house(), { x: 0, z: 0 });
   const out = { x: 0, z: 0 };
   const seen = new Set();
   const p = w.createPlanner();
+  let bedroom = 0, pocket = 0;
   for (let k = 0; k < 12; k++) {
     w.update(0, k * 15000); // 15 s apart: the recent-spawn memory has expired
     // Looking straight at the bedroom door.
     assert.ok(w.findSpawn(0, 0, 3, -2.175, 3.5, out), `spawn ${k}`);
     assert.equal(w.spawner.lastTier, 3, 'far side of a door, hidden');
-    assert.ok(out.x > 3.1, `in the bedroom: ${out.x}`);
+    // v0.4.1: the hallway pocket is hidden by its door curtain (out of sight whatever the sight lines through the door)
+    const inPocket = w.nav.isHidden(out.x, out.z);
+    assert.ok(out.x > 3.1 || (inPocket && out.z < -3.1), `in the bedroom or behind the hallway door: ${out.x}, ${out.z}`);
+    if (inPocket) pocket++; else bedroom++;
     assert.ok(Math.hypot(out.x, out.z) >= 3.5);
     assert.ok(w.nav.isReachable(out.x, out.z));
     const fy = w.floorY(out.x, out.z);
-    for (const hh of [0.45, 1.1, 1.65]) assert.equal(w.segmentClear(0, -0.004 + 1.6, 0, out.x, fy + hh, out.z), false);
+    if (!inPocket) for (const hh of [0.45, 1.1, 1.65]) assert.equal(w.segmentClear(0, -0.004 + 1.6, 0, out.x, fy + hh, out.z), false);
     seen.add(`${out.x.toFixed(2)},${out.z.toFixed(2)}`);
-    // An enemy spawned there can walk to the living room.
-    p.request(1, out.x, out.z, 2.6, -2.6);
+    // An enemy spawned there can walk up to the player (the player zone splits the living room into two
+    // regions in this stationary build: the hallway pocket's side reaches the zone from the west)
+    const reg = w.nav.region[w.nav.index(out.x, out.z)];
+    let gi = -1, gd = Infinity;
+    for (let i = 0; i < w.nav.count; i++) {
+      if (w.nav.region[i] !== reg || !w.nav.isWalkable(w.nav.centerX(i), w.nav.centerZ(i))) continue;
+      const d = Math.hypot(w.nav.centerX(i), w.nav.centerZ(i));
+      if (d < gd) { gd = d; gi = i; }
+    }
+    assert.ok(gi >= 0 && gd < 3.5, `his region reaches the player: ${gd}`);
+    p.request(1, out.x, out.z, w.nav.centerX(gi), w.nav.centerZ(gi));
     while (p.pending()) p.step(1000);
     assert.ok(p.result(1, new Float32Array(64)) >= 2);
   }
   assert.ok(seen.size >= 3, `varied: ${[...seen].join(' ')}`);
+  assert.ok(bedroom > 0 && pocket > 0, `both doors used: bedroom ${bedroom}, hallway pocket ${pocket}`);
 });
 
 test('findSpawn: recent spawns are avoided; impossible distances fail; same seed, same sequence', () => {

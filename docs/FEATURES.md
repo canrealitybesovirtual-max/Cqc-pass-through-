@@ -244,6 +244,26 @@ How it was measured: a scripted ?emulate session (load, Enter, the worker build,
 
 See DEVICE_LOG "v0.4: tests to run": lay the Glock on the bed beside you and pick it up; drop it on the bed, a table and the floor; lay the AKM on the couch; throw a magazine at a wall; holster with the muzzle down; does anything stutter while "Reading your room…" shows; does the page say "Sent ✓" after you exit?
 
+## v0.4.1: the user's house replayed: walls, spawns, heights (desktop only)
+
+The user's v0.4 test in their house: "it's looking fake how they spawn, see through my walls, and their height". The session record (`spaceSnapshot` v2 with the global mesh, `play.world.report`, `play.enemies`) is replayed on the desktop through the same build (`tests/fixtures/house-v04-device.json`, `tests/e2e/replay-house.mjs`, also run by `emulate.mjs`, and `tests/unit/world.house-v04.test.js`). Statuses are desktop only; the headset must confirm.
+
+| Item | Status | Notes |
+|---|---|---|
+| Space behind the real walls is unscanned (`NAV_HIDDEN`) | desktop-tested | The living room's 4-point floor rectangle also covered the space behind its three doors and a closed corner behind two of its walls. v0.4 spawned 5 of 6 enemies there, in plain view through the doors, where the real house has other walls. Rule: a room whose cells see the real wall planes from behind (`scannedSideVote`) and that reaches the map's open edge |
+| Door curtains: a depth-only cover on the far face of every open door into unscanned space | desktop-tested | An enemy behind the door is hidden and appears as he steps into the doorway. The curtains stand down while the head is in hidden space or leaning through a door; this is a draw-range change only (no upload, no compile) |
+| Spawns come in through real doors | desktop-tested | Unscanned cells can be candidates only within 2.2 m behind a curtained door. They count as hidden while the curtains stand, and the roam search prefers them (+1.5). Replay: 0 of 186 candidates in unscanned space (v0.4: 86 of 269). From the living room, 60 of 60 searches came in through the back door; the other doors are under 5 m of path away, or unreachable (see DEVICE_LOG: the hall is closed off) |
+| An enemy in unscanned space never sees, shoots or holds a point there | desktop-tested (Node) | So there is no invisible shooter behind a curtain |
+| Wall corners closed in the occluder | desktop-tested | Slabs met end to end and left a 5 × 5 cm hole at each outer corner. The replay saw enemies through them: 8 leaks, up to 147 px at 192². Outer wall ends now reach 6 cm past the plane, and the mesh's wall crop reaches as far. Replay: 0 leaks |
+| Occlusion sweep of the recorded house | desktop-tested | 21 viewpoints (the start, plus a grid over bedroom, hall and living room) × every place an enemy can stand, 4 views each. Through real walls: 0 px (v0.4: 601 px). In unscanned space: 0 px (v0.4: 231,193 px). Enemies in plain view are still drawn (4646/4661) |
+| Depth precision (near 0.02 m, far 50 m) | checked | 24-bit depth gives under 0.5 mm at 12 m, and an enemy is at least 0.28 m behind a slab. Not a cause. The near plane is unchanged |
+| Floor heights from the scan | desktop-tested | The bedroom scan's floor plane (−1.585) sat 6.7 cm under its own hall's scanned floor (−1.518, 2.7 m² of mesh). A floor plane with ≥ 1 m² of scanned floor inside it now moves to that floor (`MeshPrep.calibrateFloors`, noted in the record). Where floor polygons overlap, the smallest wins: v0.4 put half the bedroom on the living room's height, so an enemy rose 7.5 cm mid-room |
+| Soldier height 1.70–1.85 m (helmet included), random per spawn | desktop-tested | The model is 1.868 m. Uniform scale about the root: the animator's world ↔ model conversions, the rig, the muzzle and the hit capsules all follow (head shots hit the drawn head). Feet stay planted (< 2 cm slide) and on the floor under him (replay: skinned vertices within 2 cm of the floor). `play.enemies.heightMin/heightMax` |
+
+### Ask in the headset (keep it short)
+
+See DEVICE_LOG "v0.4.1: tests to run".
+
 ## Later phases
 
 These items are planned, as in PLAN §12.

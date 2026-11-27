@@ -35,6 +35,10 @@
  *   decision (CQC-LOG:1840).
  * - Hearing: a player shot alerts every enemy within 40 m of path; a round
  *   passing within 1 m suppresses him (aim error up, shooting delayed).
+ * - Unscanned space (v0.4.1, NAV_HIDDEN: a door pocket or floor behind the real
+ *   walls, which the door curtains hide while `world.curtainsOn`): he never
+ *   sees, shoots from or picks an engagement point there; he walks out through
+ *   the door first (no invisible shooter behind a curtain).
  *
  * The owner reads per agent: x, y, z, yaw, vx, vz (root motion), aimX/Y/Z and
  * raise (for the animator), `fire` (a shot this frame), `flinched`, and calls
@@ -42,6 +46,7 @@
  */
 
 import { Rng, clamp, wrapAngle } from './math.js';
+import { NAV_HIDDEN } from '../world/NavGrid.js';
 
 export const AI = Object.freeze({
   thinkHz: 10,
@@ -199,7 +204,7 @@ export class Agent {
  * @typedef {{ head: P3, torsoTop: P3, torsoBottom: P3, alive?: boolean }} PlayerLike
  * @typedef {{ nav: import('../world/NavGrid.js').NavGrid,
  *   segmentClear: (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => boolean,
- *   floorY: (x: number, z: number) => number }} WorldLike
+ *   floorY: (x: number, z: number) => number, curtainsOn?: boolean }} WorldLike
  * @typedef {{ request: (id: number, sx: number, sz: number, gx: number, gz: number) => void,
  *   step: (n: number, maxMs?: number) => number, result: (id: number, out: Float32Array) => number, cancel: (id: number) => void }} PlannerLike
  */
@@ -404,6 +409,11 @@ export class Brain {
           a.seeX = ex; a.seeZ = ez; a.seePX = this.px; a.seePY = this.py; a.seePZ = this.pz; a.seeOK = see;
         }
       } else if (inCone) see = true;
+      // standing in unscanned space behind a door curtain: the player cannot see him, so he does not see the player
+      if (see && w && w.curtainsOn === true && w.nav) {
+        const nav = w.nav, ix = Math.floor((ex - nav.ox) * nav.inv), iz = Math.floor((ez - nav.oz) * nav.inv);
+        if (ix >= 0 && iz >= 0 && ix < nav.w && iz < nav.h && (nav.flags[iz * nav.w + ix] & NAV_HIDDEN) !== 0) see = false;
+      }
     }
     if (see && !a.los) {
       a.los = true;
@@ -466,6 +476,7 @@ export class Brain {
       S[0] = this.px + Math.sin(ang) * r; S[1] = this.pz + Math.cos(ang) * r;
       snapWalkable(nav, S);
       if (S[3] < 0 || (region && S[4] !== region)) continue;
+      if (/** @type {any} */ (w).curtainsOn === true && (nav.flags[S[3]] & NAV_HIDDEN) !== 0) continue; // never fight from unscanned space
       const x = S[0], z = S[1];
       const dp = Math.sqrt((x - this.px) * (x - this.px) + (z - this.pz) * (z - this.pz));
       if (dp < AI.ringMin || dp > AI.ringMax + 0.5) continue;

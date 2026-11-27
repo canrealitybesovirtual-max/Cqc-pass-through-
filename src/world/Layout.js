@@ -83,9 +83,10 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
  */
 /**
  * @typedef {{ cx: number, cz: number, c: number, s: number, hx: number, hz: number, y0: number, y1: number,
- *   label: string, kind: 'wall'|'furniture', face: number, jamb0: boolean, jamb1: boolean,
+ *   label: string, kind: 'wall'|'furniture'|'curtain', face: number, jamb0: boolean, jamb1: boolean,
  *   lintel: boolean, sill: boolean, navBlock: boolean, source: string, wall: number, covered?: boolean }} Box
  *   face: for wall pieces, the local-z side (−1/+1) of the real wall face; 0 for furniture.
+ *   kind 'curtain' (v0.4.1): a door curtain (Layout.curtains only, never in `boxes`).
  *   jamb0/jamb1: the −x / +x end of a wall piece borders a door opening.
  *   source: 'wall' | 'inferred' for wall pieces; 'mesh' | 'plane' | 'mesh+plane' for furniture.
  *   wall: the wall id of a wall piece (-1 for furniture).
@@ -96,7 +97,9 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
  * @typedef {{ floors: Floor[], ceilings: Ceiling[], walls: Wall[], doors: Door[], boxes: Box[], furniture: Box[],
  *   floorRef: number, floorY0: number, ceilingY: number, virtual: boolean, partialVirtual: boolean,
  *   bounds: { x0: number, x1: number, z0: number, z1: number }, notes: string[],
- *   mappedFloors: number, inferredWalls: number, pockets: number }} Layout
+ *   mappedFloors: number, inferredWalls: number, pockets: number, curtains?: Box[] }} Layout
+ *   curtains (v0.4.1, set by WorldCore after the nav bake): depth-only boxes in the open doors that lead from
+ *   scanned rooms into unscanned space (a pocket, or floor behind the real walls); occluder only (no nav, no shapes).
  */
 /**
  * @typedef {{ doorOpen?: ArrayLike<boolean|undefined|null>|null, defaultDoorOpen?: boolean, interiorSlab?: 'player'|'centred' }} LayoutOptions
@@ -110,6 +113,11 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
 
 /** Wall slab thickness behind the face (PLAN §6.3). */
 export const WALL_T = 0.1;
+/**
+ * v0.4.1: an outer wall end (not a door jamb) of the occluder reaches this far past the wall plane's end, so two
+ * walls meeting at a corner overlap (WALL_T / 2 + 1 cm); the global mesh's wall-face crop reaches as far (MeshPrep).
+ */
+export const WALL_END = 0.06;
 /** Door ↔ wall matching. */
 const DOOR_COS = Math.cos((20 * Math.PI) / 180);
 const DOOR_DIST = 0.35;
@@ -195,6 +203,45 @@ function worldPlane(p) {
   };
 }
 
+/** Directions of the scanned-side vote (8, offset 0.1 rad so a ray never runs along an axis-aligned wall). */
+const VOTE_DX = new Float64Array(8), VOTE_DZ = new Float64Array(8);
+for (let k = 0; k < 8; k++) { VOTE_DX[k] = Math.cos(k * Math.PI / 4 + 0.1); VOTE_DZ[k] = Math.sin(k * Math.PI / 4 + 0.1); }
+
+/**
+ * Which side of the REAL walls is (x, z) on (v0.4.1)? Space Setup's wall planes
+ * all face into the room that was scanned (the layout's `n`, after the learned
+ * flip), so from a point inside a scanned room the first real wall plane met in
+ * any direction is seen from its front; from a point behind the scanned walls
+ * (floor polygon area outside the rooms, e.g. a 4-point floor rectangle that
+ * also covers the space behind the living room's doors) most of them are seen
+ * from the back. Inferred walls (map edges, not real) never vote.
+ * Returns front − back over 8 directions (0 when no real wall is met).
+ * Pure and allocation-free.
+ * @param {Wall[]} walls
+ * @param {number} x @param {number} z
+ * @returns {number}
+ */
+export function scannedSideVote(walls, x, z) {
+  let vote = 0;
+  for (let k = 0; k < 8; k++) {
+    const dx = VOTE_DX[k], dz = VOTE_DZ[k];
+    let best = Infinity, side = 0;
+    for (let i = 0; i < walls.length; i++) {
+      const w = walls[i];
+      if (w.inferred) continue;
+      const qx = w.bx - w.ax, qz = w.bz - w.az, den = dx * qz - dz * qx;
+      if (den > -1e-12 && den < 1e-12) continue;
+      const wx = w.ax - x, wz = w.az - z;
+      const t = (wx * qz - wz * qx) / den, u = (wx * dz - wz * dx) / den;
+      if (t <= 0 || u < 0 || u > 1 || t >= best) continue;
+      best = t;
+      side = (x - w.ax) * w.nx + (z - w.az) * w.nz > 0 ? 1 : -1;
+    }
+    vote += side;
+  }
+  return vote;
+}
+
 /**
  * @param {Floor[]} floors
  * @param {number} x @param {number} z
@@ -207,19 +254,25 @@ function insideFloors(floors, x, z) {
 }
 
 /**
- * Height of the floor under (x, z): the containing floor, else the nearest one.
+ * Height of the floor under (x, z): the containing floor (the smallest one where floors overlap), else the
+ * nearest one.
  * @param {Floor[]} floors
  * @param {number} fallback
  * @param {number} x @param {number} z
  */
 export function floorHeightAt(floors, fallback, x, z) {
-  let best = Infinity, y = fallback;
+  let best = Infinity, y = fallback, inArea = Infinity, inY = NaN;
   for (const f of floors) {
-    if (x >= f.x0 && x <= f.x1 && z >= f.z0 && z <= f.z1 && pointInPolygon(f.pts, f.n, x, z)) return f.y;
+    if (x >= f.x0 && x <= f.x1 && z >= f.z0 && z <= f.z1 && pointInPolygon(f.pts, f.n, x, z)) {
+      // overlapping floors (v0.4.1): the smallest polygon is the most specific (a room's own floor, not
+      // another room's bounding rectangle reaching over it)
+      if (f.area < inArea) { inArea = f.area; inY = f.y; }
+      continue;
+    }
     const d = distSqToPolygon(f.pts, f.n, x, z);
     if (d < best) { best = d; y = f.y; }
   }
-  return y;
+  return inArea < Infinity ? inY : y;
 }
 
 /**

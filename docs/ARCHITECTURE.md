@@ -39,7 +39,8 @@ index.html ── import map: three → vendor/three/three.module.js, three/addo
         ├ xr/LiveDepth.js  keeps three's depth texture on this frame's texture; depth diagnostics
         ├ xr/DepthOcclusion.js  soft-edge live-depth occlusion (opt-in, not wired)
         ├ world/           Space Setup snapshot v2 (+ the global mesh, MeshCodec), layout, shapes, nav grid, A*, spawns,
-        │                  occluders (boxes + the mesh occluder), MeshPrep / MeshBVH / WorldStatics, Roam index, Realign;
+        │                  occluders (boxes + the mesh occluder + v0.4.1 door curtains), unscanned space (NAV_HIDDEN),
+        │                  MeshPrep (+ floor heights from the scan) / MeshBVH / WorldStatics, Roam index, Realign;
         │                  the world worker (WorldWorker → world.worker.js → WorldBuild) and the sliced apply (WorldState)
         ├ physics/         Rapier loader, PhysicsWorld (statics in slices, fixed step, sleep, NaN guard, lost net,
         │                  release placement), PoseHistory (throw estimate), ItemRules, ItemShapes, StaticGeometry
@@ -149,6 +150,7 @@ three r187 draws its occlusion pass (a full-screen quad writing `gl_FragDepth`) 
 - **Desktop:**
     - `npm test` runs the Node unit tests.
     - `NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs` runs Playwright with IWER: preload (physics, look, the world worker), probe (with fake per-frame depth), a Roam play round (unbounded requested, the worker build, card, start where you stand, spawns in another room, draw, fire, hit, reload, the watch: wake, ray + trigger menu, RESTART, AMMO LINE saved, GUN FIT nudge saved and reloaded; v0.4 physics: the Glock laid on the fixture table, dropped on the bed, thrown at a wall, picked up again, no stepping at rest; gloves while held, AKM fire mode and material impacts, a 1.5 m/s run cue without a pause, a reset with a transform and its realign), the upload (stubbed: the row, the failure → retry on reload, Copy), diagnostics Copy, VR, the reduced retry (Roam rules on local-floor, the boundary note), a one-spot round (with a moved spot and the rebuild, then the watch's MODE row back to Roam), a virtual room, a grip-fit page and a failed load. It prints the play session's CPU per frame and draw calls.
+    - `NODE_PATH=$(npm root -g) node tests/e2e/replay-house.mjs [--shots <dir>]` (v0.4.1, also run at the end of `emulate.mjs`) replays the user's real house (`tests/fixtures/house-v04-device.json`, the v0.4 headset session's snapshot with its global mesh) through the real World. It sweeps occlusion from the recorded viewpoints (no enemy pixels through real walls or in unscanned space), checks that spawn candidates come only from right behind doors, and checks that the soldiers' drawn heights and feet sit on the floor.
     - `NODE_PATH=$(npm root -g) node tests/e2e/depth-occlusion.mjs` checks the soft-occlusion shaders on the GPU path.
     - `node tools/serve.mjs` then `http://localhost:8080/?emulate` runs the page in the emulator (the house fixture). `?emulate&snapshot=<url>` plays in a saved snapshot or a diagnostics export (your real house); `?emulate&replay` uses the newest snapshot in this browser's diagnostics.
 - **Headset:** open the Render URL in the Quest Browser and follow the on-page tests. Then copy the diagnostics JSON into the chat.

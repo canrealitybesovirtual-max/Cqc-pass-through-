@@ -155,6 +155,8 @@ export class Hitbox {
     this.b = new Float64Array(n * 3);
     /** Quick-reject sphere (world). */
     this.cx = 0; this.cy = -100; this.cz = 0;
+    /** Body scale (v0.4.1: the soldier's height / the model's), applied to the ends and the radii. */
+    this.k = 1;
     this.valid = false;
     // last hit
     this.hitIndex = -1;
@@ -165,24 +167,27 @@ export class Hitbox {
 
   /**
    * Place the capsules from a solved pose and its root.
-   * @param {{ mp: V3[], mq: import('./math.js').Q[], rootX: number, rootY: number, rootZ: number, rootYaw: number }} pose
+   * The pose's scale (`pose.k`, the animator's) sizes the capsules too.
+   * @param {{ mp: V3[], mq: import('./math.js').Q[], rootX: number, rootY: number, rootZ: number, rootYaw: number, k?: number }} pose
    */
   update(pose) {
     const S = this.set, n = S.count, p = this._p;
-    const c = Math.cos(pose.rootYaw), s = Math.sin(pose.rootYaw), X = pose.rootX, Y = pose.rootY, Z = pose.rootZ;
+    const k = pose.k !== undefined && pose.k > 0 ? pose.k : 1;
+    this.k = k;
+    const c = Math.cos(pose.rootYaw) * k, s = Math.sin(pose.rootYaw) * k, X = pose.rootX, Y = pose.rootY, Z = pose.rootZ;
     for (let i = 0; i < n; i++) {
       const bone = S.bone[i], q = pose.mq[bone], j = pose.mp[bone], o = i * 3;
       for (let e = 0; e < 2; e++) {
         const L = e === 0 ? S.la : S.lb, out = e === 0 ? this.a : this.b;
         p.set(L[o], L[o + 1], L[o + 2]).applyQ(q).add(j);
         out[o] = X + p.x * c + p.z * s;
-        out[o + 1] = Y + p.y;
+        out[o + 1] = Y + p.y * k;
         out[o + 2] = Z - p.x * s + p.z * c;
       }
     }
     const pv = pose.mp[B.pelvis];
     this.cx = X + pv.x * c + pv.z * s;
-    this.cy = Y + pv.y;
+    this.cy = Y + pv.y * k;
     this.cz = Z - pv.x * s + pv.z * c;
     this.valid = true;
   }
@@ -197,13 +202,14 @@ export class Hitbox {
    */
   raycast(ox, oy, oz, dx, dy, dz, max) {
     if (!this.valid) return -1;
-    const ts = raySphere(ox, oy, oz, dx, dy, dz, this.cx, this.cy, this.cz, REACH);
+    const k = this.k;
+    const ts = raySphere(ox, oy, oz, dx, dy, dz, this.cx, this.cy, this.cz, REACH * k);
     if (ts < 0 || ts > max) return -1;
     const S = this.set, A = this.a, Bv = this.b;
     let best = max, bi = -1;
     for (let i = 0; i < S.count; i++) {
       const o = i * 3;
-      const t = rayCapsule(ox, oy, oz, dx, dy, dz, A[o], A[o + 1], A[o + 2], Bv[o], Bv[o + 1], Bv[o + 2], S.radius[i]);
+      const t = rayCapsule(ox, oy, oz, dx, dy, dz, A[o], A[o + 1], A[o + 2], Bv[o], Bv[o + 1], Bv[o + 2], S.radius[i] * k);
       if (t >= 0 && t < best) { best = t; bi = i; }
     }
     if (bi < 0) return -1;

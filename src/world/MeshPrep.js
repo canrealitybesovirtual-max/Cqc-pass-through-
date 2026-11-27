@@ -9,6 +9,13 @@
  *    pose; vertices within 1 mm merged; degenerate triangles dropped. The
  *    welded mesh is also what the session record stores (`raw`), so a desktop
  *    replay runs exactly this pipeline again.
+ * 1b. **Floor heights from the scan** (v0.4.1, `calibrateFloors`): a Space Setup
+ *    floor plane with at least `floorFixArea` m² of horizontal scanned triangles
+ *    inside its polygon, within `floorFixBand` of it, moves to their area-weighted
+ *    median height when that differs by more than `floorFixMin` (the user's
+ *    bedroom room scan put its floor 6.7 cm under the hall's scanned floor; the
+ *    enemies there stood on the wrong height). Pockets follow their door's floor.
+ *    `stats.floorFix` lists the moves.
  * 2. **Orient** (normals toward free space). The Quest mesh's winding is not
  *    documented, and Rapier's FIX_INTERNAL_EDGES makes a trimesh one-sided
  *    (the research bench: a body hitting a back face passes through), so:
@@ -49,7 +56,7 @@
  *    trimesh (subarray views, no copy) for physics.
  */
 
-import { floorHeightAt } from './Layout.js';
+import { WALL_END, floorHeightAt } from './Layout.js';
 import { pointInPolygon } from '../util/geom2d.js';
 
 export const MESH = Object.freeze({
@@ -84,6 +91,10 @@ export const MESH = Object.freeze({
    *  seat is ~40 cm under its volume's top, which is the backrest; v0.4 verifier). */
   coverAbove: 0.15,
   maxTris: 262144,
+  /** Floor calibration (v0.4.1): horizontal scan within this of a floor plane, at least this much of it (m²), moves it when off by more than floorFixMin. */
+  floorFixBand: 0.15,
+  floorFixArea: 1.0,
+  floorFixMin: 0.015,
 });
 
 export const SURF = Object.freeze({ OTHER: 0, FLOOR: 1, WALL: 2, CEIL: 3, SOFT: 4, HARD: 5 });
@@ -168,6 +179,7 @@ export function prepMesh(raw, layout, opts = {}, o = MESH) {
   // per-triangle geometry (as delivered)
   const N = new Float32Array(3 * m), A = new Float32Array(m), C = new Float32Array(3 * m);
   for (let t = 0; t < m; t++) geomOf(V, rawIdx, t, N, A, C);
+  /** @type {any} */ (st).floorFix = calibrateFloors(L, N, A, C, m, o);
   let tp = now();
   st.phaseMs.weld = tp - t0;
 
@@ -368,6 +380,53 @@ function nearCeiling(L, x, y, z, band) {
 }
 
 /**
+ * Floor heights from the scanned triangles (step 1b; build time, allocates). Moves `L.floors[k].y` (mapped
+ * floors with enough evidence), then the virtual floors (pockets, the patch) to the floor at their door / centre,
+ * and the layout's floorRef / floorY0.
+ * @param {import('./Layout.js').Layout} L
+ * @param {Float32Array} N @param {Float32Array} A @param {Float32Array} C @param {number} m @param {typeof MESH} o
+ * @returns {{ floor: number, from: number, to: number, area: number }[]}
+ */
+export function calibrateFloors(L, N, A, C, m, o) {
+  /** @type {{ floor: number, from: number, to: number, area: number }[]} */ const out = [];
+  if (L.virtual) return out;
+  for (const f of L.floors) {
+    if (f.virtual) continue;
+    /** @type {number[]} */ const ys = [], as = [];
+    let total = 0;
+    for (let t = 0; t < m; t++) {
+      const ny = N[3 * t + 1];
+      if (ny < o.horizCos && ny > -o.horizCos) continue;
+      const cy = C[3 * t + 1];
+      if (cy < f.y - o.floorFixBand || cy > f.y + o.floorFixBand) continue;
+      const cx = C[3 * t], cz = C[3 * t + 2];
+      if (cx < f.x0 || cx > f.x1 || cz < f.z0 || cz > f.z1 || !pointInPolygon(f.pts, f.n, cx, cz)) continue;
+      ys.push(cy); as.push(A[t]); total += A[t];
+    }
+    if (total < o.floorFixArea) continue;
+    const ord = ys.map((_, i) => i).sort((a, b) => ys[a] - ys[b]);
+    let acc = 0, med = f.y;
+    for (const i of ord) { acc += as[i]; if (acc >= total / 2) { med = ys[i]; break; } }
+    if (Math.abs(med - f.y) <= o.floorFixMin) continue;
+    out.push({ floor: f.id, from: Math.round(f.y * 1000) / 1000, to: Math.round(med * 1000) / 1000, area: Math.round(total * 10) / 10 });
+    f.y = med;
+  }
+  if (!out.length) return out;
+  const mapped = L.floors.filter((f) => !f.virtual);
+  for (const f of L.floors) {
+    if (!f.virtual) continue;
+    const d = f.pocket && f.door >= 0 ? L.doors[f.door] : null;
+    const x = d ? d.cx : (f.x0 + f.x1) / 2, z = d ? d.cz : (f.z0 + f.z1) / 2;
+    f.y = floorHeightAt(mapped, f.y, x, z);
+  }
+  let main = mapped[0];
+  for (const f of mapped) if (f.area > main.area) main = f;
+  L.floorY0 = main.y;
+  L.floorRef = Math.min(...mapped.map((f) => f.y));
+  return out;
+}
+
+/**
  * On a real wall face (within wallBand, coplanar)?
  * @param {import('./Layout.js').Wall[]} walls
  * @param {number} x @param {number} y @param {number} z @param {number} nx @param {number} nz @param {typeof MESH} o
@@ -389,7 +448,7 @@ function wallAt(walls, x, y, z, nx, nz, o, band) {
     if (Math.abs(nx * w.nx + nz * w.nz) < o.wallCos) continue;
     const rx = x - w.ax, rz = z - w.az;
     const u = rx * w.tx + rz * w.tz, d = rx * w.nx + rz * w.nz;
-    if (u < -0.1 || u > w.len + 0.1 || Math.abs(d) > band) continue;
+    if (u < -WALL_END || u > w.len + WALL_END || Math.abs(d) > band) continue; // as far as the slab reaches (v0.4.1)
     return k;
   }
   return -1;

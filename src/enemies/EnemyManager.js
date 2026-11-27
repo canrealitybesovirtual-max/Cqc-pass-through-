@@ -51,7 +51,7 @@ import { HitPuff } from './HitPuff.js';
 import { CapsuleSet, Hitbox, PARTS, PART_HEAD, PART_NECK, rayCapsule, raySphere } from './Hitbox.js';
 import { MuzzleFlash } from './MuzzleFlash.js';
 import { B } from './Rig.js';
-import { V3 } from './math.js';
+import { Rng, V3 } from './math.js';
 
 export const ENEMY = Object.freeze({
   health: 100, // CONTRACTS: damage values are against 100 hp (damage TO the player: DIFFICULTY)
@@ -60,6 +60,13 @@ export const ENEMY = Object.freeze({
   viewCos: Math.cos(1.0), // ±57°: wider than the Quest's view, so nobody pops at the edge
   missSoundR: 2.5, // m: a miss striking this close to the player is heard
   range: 60,
+  /**
+   * Standing height per soldier, helmet and boots included (v0.4.1, the user: "their height"): uniform in
+   * [min, max] m, drawn at spawn. The model is 1.868 m (manifest `soldier.height`); a real man with a helmet is
+   * about 1.75–1.85 m, so every soldier is scaled down a little and no two look alike.
+   */
+  heightMin: 1.7,
+  heightMax: 1.85,
 });
 
 /** @typedef {{ dist: number, x: number, y: number, z: number, nx: number, ny: number, nz: number, kind: string, surface: string, enemy: number, part: string }} Hit */
@@ -116,6 +123,10 @@ export class EnemyManager {
     this.legHit = new Uint8Array(n);
     /** Spawn tier per enemy (see TIER_KEYS). */
     this.tier = new Uint8Array(n);
+    /** Standing height per enemy (m, helmet included) and its scale of the model (v0.4.1). */
+    this.height = new Float32Array(n).fill(this.def.height || 1.868);
+    this.scale = new Float32Array(n).fill(1);
+    this.sizeRng = new Rng((seed ^ 0x6a09e667) >>> 0);
     this.order = 0;
 
     // events
@@ -146,6 +157,8 @@ export class EnemyManager {
       spawnDirect: 0, spawnBehind: 0, spawnHiddenRoom: 0, spawnHiddenDoor: 0, spawnInView: 0, lastSpawnTier: 0,
       /** Hits shown with a puff; deaths that fell away from the shot line (blocked), and those with no clear 1.2 m at all. */
       puffs: 0, fallsTurned: 0, fallsCramped: 0,
+      /** Heights given at spawn (m, helmet included), lowest and highest this session (v0.4.1). */
+      heightMin: 0, heightMax: 0,
     };
     // Path planner timing for the session record (read when the stats are copied).
     Object.defineProperty(this.stats, 'pathTimeouts', { enumerable: true, get: () => (this.planner && this.planner.stats ? this.planner.stats.timeouts | 0 : 0) });
@@ -246,15 +259,25 @@ export class EnemyManager {
     this.stats.lastSpawnTier = tr;
     this.brain.spawn(i, x, z, Number.isFinite(facing) ? facing : 0);
     const a = this.brain.agents[i];
+    // his height: the feet stay on the floor under him (root y = floor y), the body, rifle and hit capsules scale about it
+    const hgt = ENEMY.heightMin + (ENEMY.heightMax - ENEMY.heightMin) * this.sizeRng.next();
+    const k = hgt / (this.def.height || 1.868);
+    this.height[i] = hgt;
+    this.scale[i] = k;
+    const st = this.stats;
+    if (st.heightMin === 0 || hgt < st.heightMin) st.heightMin = Math.round(hgt * 1000) / 1000;
+    if (hgt > st.heightMax) st.heightMax = Math.round(hgt * 1000) / 1000;
     this.health[i] = ENEMY.health;
     this.legHit[i] = 0;
     this.gruntT[i] = 0;
     this.spawnOrder[i] = ++this.order;
     this.lodAcc[i] = (i / this.max) / ENEMY.lodHz;
     const an = this.anims[i];
+    an.k = k;
     an.reset(a.x, a.y, a.z, a.yaw);
     const rig = this.pool.rigs[i];
     rig.apply(an);
+    rig.setScale(k);
     rig.setRoot(a.x, a.y, a.z, a.yaw);
     rig.root.visible = true;
     this.hitboxes[i].update(an);

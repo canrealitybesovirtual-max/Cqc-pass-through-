@@ -97,6 +97,16 @@ export class EnemyRig {
   }
 
   /**
+   * Body scale about the root (v0.4.1: each soldier 1.70–1.85 m; the model is 1.868 m). The bones, the
+   * skinned body, the rifle and the culling sphere are under the root, so one uniform scale sizes all of
+   * them; a scale is a matrix uniform, not part of any program key. At spawn only.
+   * @param {number} k
+   */
+  setScale(k) {
+    this.root.scale.set(k, k, k);
+  }
+
+  /**
    * Copy a solved pose onto the bones and the rifle.
    * @param {import('./Animator.js').Animator} a
    */

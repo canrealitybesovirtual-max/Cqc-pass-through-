@@ -151,8 +151,10 @@ test('door records: matched walls, offsets, width, bottom, walkable, side, where
   const r = w.report();
   assert.deepEqual(r.doors[2], {
     id: 2, c: [r.doors[2].c[0], r.doors[2].c[1]], width: 0.9, bottom: 0, y: [0, 2.03], walls: [0], offsets: [0.01],
-    walkable: true, passable: true, inZone: false, open: true, side: 'front', leadsTo: 'unmapped', pocket: true,
+    walkable: true, passable: true, inZone: false, open: true, side: 'front', leadsTo: 'unmapped', pocket: true, curtain: true,
   });
+  assert.equal(r.doors[0].curtain, false, 'the bedroom door joins two scanned rooms: no curtain');
+  assert.deepEqual(r.hidden, { rooms: 0, curtains: 1, pocketCells: 0 });
   assert.equal(w.stats.passableDoors, 3);
 });
 
@@ -544,10 +546,13 @@ test('dev overlay edges (pure): every occluder box, door frames by state, pocket
   const max = 256 * EDGE_VERTS_PER_BOX + 512;
   const pos = new Float32Array(max * 3), col = new Float32Array(max * 3);
   const n = writeOverlayEdges(L, pos, col, 256, max);
-  assert.equal(n, L.boxes.length * EDGE_VERTS_PER_BOX + L.doors.length * 8 + L.pockets * 8);
+  assert.equal(L.curtains.length, 1, 'the open hallway door into unmapped space has a curtain (v0.4.1)');
+  const nb = L.boxes.length + L.curtains.length;
+  assert.equal(n, nb * EDGE_VERTS_PER_BOX + L.doors.length * 8 + L.pockets * 8);
   assert.equal(n % 2, 0);
   const colorAt = (i) => [col[3 * i], col[3 * i + 1], col[3 * i + 2]].map((v) => Math.round(v * 100) / 100);
-  const doorStart = L.boxes.length * EDGE_VERTS_PER_BOX;
+  const doorStart = nb * EDGE_VERTS_PER_BOX;
+  assert.deepEqual(colorAt(doorStart - 1), OVERLAY_COLOR.curtain.map((v) => Math.round(v * 100) / 100), 'curtain edges last');
   assert.deepEqual(colorAt(doorStart), OVERLAY_COLOR.doorOpen.map((v) => Math.round(v * 100) / 100));
   assert.deepEqual(colorAt(doorStart + 8), OVERLAY_COLOR.doorClosed.map((v) => Math.round(v * 100) / 100));
   assert.deepEqual(colorAt(n - 1), OVERLAY_COLOR.pocket.map((v) => Math.round(v * 100) / 100));

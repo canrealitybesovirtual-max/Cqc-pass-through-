@@ -26,7 +26,7 @@
  * 0.62 m warning): the body may brush a jamb by 1 cm, which the occluder's 2 cm
  * jamb shrink never cuts.
  *
- * Flags are 16-bit (NAV_POCKET is bit 8, NAV_SHIELD bit 10).
+ * Flags are 16-bit (NAV_POCKET is bit 8, NAV_SHIELD bit 10, NAV_HIDDEN bit 11).
  *
  * Roam (whole-house play, v0.3) adds, per cell:
  * - `room`: room id from a 4-connected flood fill over floor cells that are
@@ -57,6 +57,13 @@ export const NAV_VIRTUAL = 128; // virtual floor (no Space Setup data there)
 export const NAV_POCKET = 256; // virtual spawn pocket behind a door into unmapped space (also NAV_VIRTUAL)
 export const NAV_IWALL = 512; // inferred wall slab (no wall plane there: the edge of the map, not a real wall)
 export const NAV_SHIELD = 1024; // within 0.25 m of a REAL wall slab (off-floor cells there are behind the wall, not an open edge)
+/**
+ * v0.4.1: unscanned space the player cannot see into: a door pocket, or floor behind the real walls (a room the
+ * scanned walls face away from, e.g. the part of a 4-point floor rectangle outside the rooms). Covered by the wall
+ * slabs and the door curtains: an enemy there is never drawn while the player is in scanned space, never engages
+ * from there, and spawns there only next to a door (NAV_POCKET) so he walks in through it.
+ */
+export const NAV_HIDDEN = 2048;
 
 const SQRT2 = Math.SQRT2;
 /** "Far" in the distance transforms (squared cells). */
@@ -176,6 +183,12 @@ export class NavGrid {
   isWalkable(x, z) {
     const i = this.index(x, z);
     return i >= 0 && (this.flags[i] & NAV_WALK) !== 0;
+  }
+
+  /** Unscanned space behind the real walls or in a door pocket (NAV_HIDDEN, v0.4.1)? @param {number} x @param {number} z */
+  isHidden(x, z) {
+    const i = this.index(x, z);
+    return i >= 0 && (this.flags[i] & NAV_HIDDEN) !== 0;
   }
 
   /** Clearance in metres (0 outside the grid or on an obstacle). @param {number} x @param {number} z */

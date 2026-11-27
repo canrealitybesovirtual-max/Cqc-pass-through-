@@ -73,6 +73,9 @@ export class World extends WorldCore {
     this.occluder.frustumCulled = false; // spans the house; also keeps the pre-build warm-up draw
     this.occluder.matrixAutoUpdate = false;
     this.occluderBoxes = 0;
+    /** v0.4.1: door curtains written after the boxes (drawn while `curtainsOn`), and the box count now drawn. */
+    this.curtainBoxes = 0;
+    this._occDrawn = 0;
 
     // The global mesh as a depth-only occluder (the same material: no new program).
     this.maxMeshVerts = o.maxMeshVerts ?? MESH_OCC_VERTS;
@@ -153,6 +156,8 @@ export class World extends WorldCore {
     this.occIdx.needsUpdate = true;
     this.occluder.visible = true;
     this.occluderBoxes = 0;
+    this.curtainBoxes = 0;
+    this._occDrawn = 1;
     const mp = /** @type {Float32Array} */ (this.meshPos.array), mi = /** @type {Uint32Array} */ (this.meshIdx.array);
     mp[0] = 0; mp[1] = -100; mp[2] = 0; mp[3] = 0.01; mp[4] = -100; mp[5] = 0; mp[6] = 0; mp[7] = -100; mp[8] = 0.01;
     mi[0] = 0; mi[1] = 1; mi[2] = 2;
@@ -231,16 +236,17 @@ export class World extends WorldCore {
 
   /**
    * The box occluder from buffers the worker made (memcpy + one range).
-   * @param {{ pos: Float32Array, idx: Uint16Array, n: number, bounds: Float32Array, total: number }} B
+   * @param {{ pos: Float32Array, idx: Uint16Array, n: number, curtains?: number, bounds: Float32Array, total: number }} B
    */
   copyBoxes(B) {
     const n = B.n;
     /** @type {Float32Array} */ (this.occPos.array).set(B.pos);
     /** @type {Uint16Array} */ (this.occIdx.array).set(B.idx);
     if (B.total > n) this.stats.notes.push(`occluder holds ${n} of ${B.total} boxes`);
-    this.occluderBoxes = n;
+    this.curtainBoxes = B.curtains || 0;
+    this.occluderBoxes = n - this.curtainBoxes;
     const geo = this.occluder.geometry;
-    geo.setDrawRange(0, n * OCC_INDICES_PER_BOX);
+    this.setOccluderRange();
     if (n > 0) {
       addRange(this.occPos, 0, n * OCC_VERTS_PER_BOX * 3);
       addRange(this.occIdx, 0, n * OCC_INDICES_PER_BOX);
@@ -338,12 +344,16 @@ export class World extends WorldCore {
   writeBoxes(dropCovered) {
     const all = this.layout ? this.layout.boxes : [];
     const boxes = dropCovered && this.coveredFurniture > 0 ? all.filter((b) => !b.covered) : all;
+    const curtains = this.layout && this.layout.curtains ? this.layout.curtains : [];
     const pos = /** @type {Float32Array} */ (this.occPos.array), idx = /** @type {Uint16Array} */ (this.occIdx.array);
-    const n = writeOccluderBoxes(boxes, pos, idx, this.maxOccluderBoxes);
-    if (boxes.length > n) this.stats.notes.push(`occluder holds ${n} of ${boxes.length} boxes`);
-    this.occluderBoxes = n;
+    const nb = writeOccluderBoxes(boxes, pos, idx, this.maxOccluderBoxes);
+    const nc = writeOccluderBoxes(curtains, pos, idx, this.maxOccluderBoxes, nb);
+    const n = nb + nc;
+    if (boxes.length + curtains.length > n) this.stats.notes.push(`occluder holds ${n} of ${boxes.length + curtains.length} boxes`);
+    this.occluderBoxes = nb;
+    this.curtainBoxes = nc;
     const geo = this.occluder.geometry;
-    geo.setDrawRange(0, n * OCC_INDICES_PER_BOX);
+    this.setOccluderRange();
     if (n > 0) {
       addRange(this.occPos, 0, n * OCC_VERTS_PER_BOX * 3);
       addRange(this.occIdx, 0, n * OCC_INDICES_PER_BOX);
@@ -375,9 +385,29 @@ export class World extends WorldCore {
     this.overlay.visible = this.overlayOn && nv > 0;
   }
 
+  /**
+   * The box occluder's draw range: the boxes, plus the door curtains while they stand (`curtainsOn`).
+   * A range change only (no upload, no compile); allocation-free.
+   */
+  setOccluderRange() {
+    const n = this.occluderBoxes + (this.curtainsOn ? this.curtainBoxes : 0);
+    if (n === this._occDrawn) return;
+    this._occDrawn = n;
+    this.occluder.geometry.setDrawRange(0, n * OCC_INDICES_PER_BOX);
+  }
+
+  /**
+   * WorldCore.update (Roam bake, player tracking, curtains on / off for the head), then the curtains' draw range.
+   * @param {number} dt @param {number} t @param {any} [frame] @param {any} [ctx]
+   */
+  update(dt, t, frame, ctx) {
+    super.update(dt, t, frame, ctx);
+    if (this.curtainBoxes > 0) this.setOccluderRange();
+  }
+
   /** WorldCore.report plus the meshes' fill. */
   report() {
-    return { ...super.report(), occluderBoxes: this.occluderBoxes, overlaySegments: this.overlayVerts / 2,
+    return { ...super.report(), occluderBoxes: this.occluderBoxes, curtainBoxes: this.curtainBoxes, overlaySegments: this.overlayVerts / 2,
       meshOccluder: { tiles: this.meshTilesUp, of: this.meshTilesTotal, dropped: this.meshTilesDropped, tris: this.meshTrisDrawn, uploads: this.meshTileUploads } };
   }
 }

@@ -22,8 +22,8 @@
  *   beyond the zone edge.
  */
 
-import { WALL_T, buildLayout, floorHeightAt } from './Layout.js';
-import { NAV_DOOR, NAV_FURN, NAV_INSIDE, NAV_IWALL, NAV_OBST, NAV_POCKET, NAV_SHIELD, NAV_VIRTUAL, NAV_WALK, NAV_WALL, NAV_ZONE, NavGrid } from './NavGrid.js';
+import { WALL_T, buildLayout, floorHeightAt, scannedSideVote } from './Layout.js';
+import { NAV_DOOR, NAV_FURN, NAV_HIDDEN, NAV_INSIDE, NAV_IWALL, NAV_OBST, NAV_POCKET, NAV_SHIELD, NAV_VIRTUAL, NAV_WALK, NAV_WALL, NAV_ZONE, NavGrid } from './NavGrid.js';
 import { ROAM, RoamIndex } from './Roam.js';
 import { PathPlanner } from './PathPlanner.js';
 import { ShapeSet } from './Shapes.js';
@@ -63,6 +63,20 @@ export const SPAWN_BUDGET_MS = 0.5;
 const ROAM_FALLBACK_AFTER = 3;
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/**
+ * v0.4.1 unscanned space and door curtains:
+ * - a room is behind the real walls when its cells' scanned-side votes sum below zero (up to `voteCells` cells
+ *   sampled per room); its cells and every pocket cell get NAV_HIDDEN;
+ * - hidden cells within `pocketR` of a curtained door, on its far side, may hold a spawn (NAV_POCKET);
+ * - a curtain is a 2 cm depth-only box on the far face of the door's wall, `curtainPad` wider than the
+ *   door each side (into the jambs) and up into the lintel;
+ * - the curtains stand down while the player's head is in hidden space or within `pastFront` of a curtain's
+ *   plane (leaning through the door): at most `maxCurtains`.
+ */
+export const HIDDEN = Object.freeze({ voteCells: 48, pocketR: 2.2, curtainPad: 0.06, curtainT: 0.02, pastFront: 0.12, pastSide: 0.4, maxCurtains: 32 });
+/** Floats per curtain in `curtainData`: centre x, z, hidden-side normal x, z, along x, z, half width. */
+const CURTAIN_STRIDE = 7;
 
 /** Async build phases (`world.buildPhase`). */
 export const BUILD = Object.freeze({ IDLE: 0, WORKING: 1, COPY: 2, COMMIT: 3, UPLOAD: 4 });
@@ -111,6 +125,21 @@ export class WorldCore {
     this.roamFailStreak = 0;
     /** spawnRoam's inputs: head x, z, velocity x, z, view x, z. */
     this._spawnIn = new Float64Array(6);
+    /**
+     * v0.4.1: the door curtains stand (the player is in scanned space): enemies in NAV_HIDDEN cells are not
+     * drawn, cannot be seen by the spawner's test and never engage. False while the player's head is in hidden
+     * space or leaning through a curtained door (`trackCurtains`, every frame).
+     */
+    this.curtainsOn = true;
+    /** Curtain planes for trackCurtains (CURTAIN_STRIDE floats each) and their count. */
+    this.curtainData = new Float64Array(HIDDEN.maxCurtains * CURTAIN_STRIDE);
+    this.curtainCount = 0;
+    /** trackCurtains' head (x, z), the nav cell it last decided in, and its limits (−pastFront, pastSide). */
+    this._curtainP = new Float64Array(2);
+    this._curtainCell = -2;
+    this._curtainK = Float64Array.of(-HIDDEN.pastFront, HIDDEN.pastSide);
+    /** Rooms the last build found behind the real walls (unscanned). */
+    this.hiddenRooms = 0;
     /** The last build was skipped (Roam, same snapshot and doors, only the start moved). */
     this.skipped = false;
     /** @type {import('./Layout.js').Layout|null} */ this.layout = null;
@@ -135,7 +164,7 @@ export class WorldCore {
       buildMs: 0, floors: 0, walls: 0, inferredWalls: 0, doors: 0, closedDoors: 0, passableDoors: 0, pockets: 0,
       furniture: 0, shapes: 0, droppedShapes: 0,
       cells: 0, walkable: 0, regions: 0, spawnCandidates: 0, doorSpawnCandidates: 0, pocketSpawnCandidates: 0,
-      rooms: 0, cell: 0.1, builds: 0, skippedBuilds: 0, realigns: 0,
+      rooms: 0, cell: 0.1, builds: 0, skippedBuilds: 0, realigns: 0, hiddenRooms: 0, curtains: 0, hiddenPocketCells: 0,
       meshTris: 0, meshMs: 0, bvhMs: 0, workerBuilds: 0, workerMs: 0, applyFrames: 0, applyMaxMs: 0,
       /** Worst main-thread step per apply phase (ms). */
       applyPhaseMs: { copy: 0, commit: 0, upload: 0 },
@@ -237,6 +266,7 @@ export class WorldCore {
     this.floorY0 = L.floorY0;
 
     this.bakeNav(L, sx, sz, r, notes, roam);
+    this.markHidden(L, notes);
     if (roam) {
       this.roamIndex.build(L);
       if (L.virtual) this.roamIndex.skipEdge(); // a virtual room has no map edge
@@ -266,6 +296,8 @@ export class WorldCore {
     s.cells = this.nav.count;
     s.walkable = this.nav.walkableCount;
     s.regions = this.nav.regionCount;
+    s.hiddenRooms = this.hiddenRooms;
+    s.curtains = L.curtains ? L.curtains.length : 0;
     s.spawnCandidates = this.spawner.count;
     s.doorSpawnCandidates = this.spawner.doorCount;
     s.pocketSpawnCandidates = this.spawner.pocketCount;
@@ -274,8 +306,165 @@ export class WorldCore {
     s.builds++;
     s.notes = notes;
     s.buildMs = now() - t0;
+    this.indexCurtains();
     this.built = true;
     return true;
+  }
+
+  /**
+   * v0.4.1, after the nav bake: unscanned space and the door curtains.
+   * 1. Pocket cells are hidden. Every room (4-connected floor component between walls and doors) votes with
+   *    up to HIDDEN.voteCells of its cells (`scannedSideVote`: is the first real wall plane met in 8 directions
+   *    seen from its front or its back?); a room seen from behind the real walls that also reaches the map's
+   *    open edge (an inferred wall, or no floor and no real wall) is unscanned: NAV_HIDDEN.
+   *    (The user's house: the living room's 4-point floor rectangle also covered the space behind its three
+   *    doors and a closed corner behind two of its walls; v0.4 spawned five of six enemies there, in plain view
+   *    through the doors, where the real house has other walls.)
+   * 2. Each open door with scanned floor on one side and hidden (or no) floor on the other gets a curtain on the
+   *    far face of its wall (`layout.curtains`), and the hidden cells within HIDDEN.pocketR of it on that side may
+   *    hold a spawn (NAV_POCKET): an enemy there is out of sight until he walks in through the real door.
+   * Build time (allocates).
+   * @param {import('./Layout.js').Layout} L @param {string[]} notes
+   */
+  markHidden(L, notes) {
+    const nav = this.nav, n = nav.count, fl = nav.flags;
+    /** @type {import('./Layout.js').Box[]} */ const curtains = [];
+    L.curtains = curtains;
+    this.hiddenRooms = 0;
+    for (let i = 0; i < n; i++) if ((fl[i] & NAV_POCKET) !== 0) fl[i] |= NAV_HIDDEN;
+    let realWalls = 0;
+    for (const w of L.walls) if (!w.inferred) realWalls++;
+    if (L.virtual || realWalls < 3) return;
+    const minCells = Math.max(1, Math.round(ROAM.minRoomM2 / (nav.cell * nav.cell)));
+    const rooms = nav.labelRooms(minCells, this.roamIndex.maxRooms);
+    if (rooms > 0) {
+      const room = nav.room, cnt = new Int32Array(rooms + 1), seen = new Int32Array(rooms + 1), vote = new Int32Array(rooms + 1);
+      for (let i = 0; i < n; i++) if (room[i]) cnt[room[i]]++;
+      for (let i = 0; i < n; i++) {
+        const r = room[i];
+        if (!r || (fl[i] & NAV_VIRTUAL) !== 0) continue;
+        const stride = Math.max(1, Math.floor(cnt[r] / HIDDEN.voteCells));
+        if (seen[r]++ % stride !== 0) continue;
+        vote[r] += scannedSideVote(L.walls, nav.centerX(i), nav.centerZ(i));
+      }
+      // ... and reaches the map's open edge (an inferred wall, or off the floor with no real wall near): the space
+      // between the scanned walls and the floor polygon's edge. A room closed by real walls alone is never hidden,
+      // whichever way its interior walls face (one wall plane between two scanned rooms faces only one of them).
+      const edge = new Uint8Array(rooms + 1), w = nav.w, h = nav.h;
+      const open = (/** @type {number} */ j) => (fl[j] & NAV_IWALL) !== 0 || (fl[j] & (NAV_INSIDE | NAV_SHIELD | NAV_WALL)) === 0;
+      for (let i = 0; i < n; i++) {
+        const r = room[i];
+        if (!r || edge[r] || vote[r] >= 0) continue;
+        const ix = i % w, iz = (i - ix) / w;
+        if ((ix > 0 && open(i - 1)) || (ix < w - 1 && open(i + 1)) || (iz > 0 && open(i - w)) || (iz < h - 1 && open(i + w))) edge[r] = 1;
+      }
+      const hid = new Uint8Array(rooms + 1);
+      for (let r = 1; r <= rooms; r++) if (vote[r] < 0 && edge[r]) { hid[r] = 1; this.hiddenRooms++; }
+      if (this.hiddenRooms) for (let i = 0; i < n; i++) if (hid[room[i]]) fl[i] |= NAV_HIDDEN;
+    }
+    // where a probe point stands: 2 scanned floor, 1 hidden floor, 0 no floor
+    const status = (/** @type {number} */ x, /** @type {number} */ z) => {
+      const i = nav.index(x, z);
+      if (i < 0 || (fl[i] & NAV_INSIDE) === 0) return 0;
+      return (fl[i] & NAV_HIDDEN) !== 0 ? 1 : 2;
+    };
+    const side = (/** @type {import('./Layout.js').Door} */ d, /** @type {number} */ sg) => {
+      let best = 0;
+      for (const r of [0.45, 0.7, 0.95]) {
+        const st = status(d.cx + d.nx * r * sg, d.cz + d.nz * r * sg);
+        if (st === 2) return 2;
+        if (st === 1) best = 1;
+      }
+      return best;
+    };
+    let pockets = 0;
+    for (const d of L.doors) {
+      if (!d.open || d.walls === 0 || curtains.length >= HIDDEN.maxCurtains) continue;
+      const f = side(d, 1), b = side(d, -1);
+      if ((f === 2) === (b === 2)) continue; // scanned on both sides, or on neither
+      const sg = f === 2 ? -1 : 1, hx = d.nx * sg, hz = d.nz * sg;
+      // the far face of the door's wall slab(s), measured from the door centre toward the hidden side
+      let far = 0.03, top = d.y1;
+      for (let k = 0; k < d.wallIds.length; k++) {
+        const w = L.walls[d.wallIds[k]], off = d.offsets[k];
+        const s0 = w.centred ? -WALL_T / 2 - off : -WALL_T - off, s1 = w.centred ? WALL_T / 2 - off : -off;
+        const kk = w.nx * hx + w.nz * hz >= 0 ? 1 : -1;
+        far = Math.max(far, kk * s0, kk * s1);
+        top = Math.max(top, w.y1);
+      }
+      if (far > 0.4) far = 0.4;
+      const t = HIDDEN.curtainT / 2, half = d.width / 2 + HIDDEN.curtainPad;
+      curtains.push({
+        cx: d.cx + hx * (far + t), cz: d.cz + hz * (far + t), c: d.tx, s: d.tz, hx: half, hz: t,
+        y0: d.y0 - 0.02, y1: Math.max(d.y1, Math.min(d.y1 + HIDDEN.curtainPad, top)), label: 'curtain', kind: 'curtain', face: 0,
+        jamb0: false, jamb1: false, lintel: false, sill: false, navBlock: false, source: 'curtain', wall: -1,
+        nx: hx, nz: hz, door: d.id,
+      });
+      // spawn room right behind it: hidden floor within pocketR, on the far side
+      if (b === 1 || f === 1) {
+        const R = HIDDEN.pocketR, R2 = R * R;
+        const ix0 = Math.max(0, Math.floor((d.cx - R - nav.ox) * nav.inv)), ix1 = Math.min(nav.w - 1, Math.floor((d.cx + R - nav.ox) * nav.inv));
+        const iz0 = Math.max(0, Math.floor((d.cz - R - nav.oz) * nav.inv)), iz1 = Math.min(nav.h - 1, Math.floor((d.cz + R - nav.oz) * nav.inv));
+        for (let iz = iz0; iz <= iz1; iz++) {
+          for (let ix = ix0; ix <= ix1; ix++) {
+            const i = iz * nav.w + ix;
+            if ((fl[i] & (NAV_HIDDEN | NAV_INSIDE)) !== (NAV_HIDDEN | NAV_INSIDE) || (fl[i] & NAV_POCKET) !== 0) continue;
+            const dx = nav.centerX(i) - d.cx, dz = nav.centerZ(i) - d.cz;
+            if (dx * dx + dz * dz > R2 || dx * hx + dz * hz < far + 0.2) continue;
+            fl[i] |= NAV_POCKET;
+            pockets++;
+          }
+        }
+      }
+    }
+    if (this.hiddenRooms) notes.push(`${this.hiddenRooms} room(s) behind the real walls: unscanned, hidden (spawns only next to their doors)`);
+    if (curtains.length) notes.push(`${curtains.length} door curtain(s): enemies beyond a door into unscanned space stay hidden until they walk through`);
+    this.stats.hiddenPocketCells = pockets;
+  }
+
+  /** The curtains' planes for trackCurtains (build and commit; allocation-free). */
+  indexCurtains() {
+    const C = this.layout && this.layout.curtains ? this.layout.curtains : [], D = this.curtainData;
+    const m = Math.min(C.length, HIDDEN.maxCurtains);
+    for (let k = 0; k < m; k++) {
+      const c = /** @type {any} */ (C[k]), o = k * CURTAIN_STRIDE;
+      D[o] = c.cx; D[o + 1] = c.cz; D[o + 2] = c.nx; D[o + 3] = c.nz; D[o + 4] = c.c; D[o + 5] = c.s; D[o + 6] = c.hx;
+    }
+    this.curtainCount = m;
+    this.curtainsOn = true;
+    this._curtainCell = -2;
+  }
+
+  /**
+   * Curtains on or off for the player's head (allocation-free; the planes are looked at only when the head
+   * enters another nav cell): off while the head stands on a hidden cell, or has reached a curtain's plane
+   * (within HIDDEN.pastFront of it, inside its width + pastSide): from there a curtain would hide the scanned
+   * room the player looks back into.
+   * @param {{ x: number, z: number }} h
+   */
+  trackCurtains(h) {
+    const P = this._curtainP;
+    P[0] = h.x; P[1] = h.z;
+    this.curtainStep();
+  }
+
+  /** trackCurtains' work on `_curtainP`. */
+  curtainStep() {
+    if (this.curtainCount === 0) { this.curtainsOn = true; return; }
+    const nav = this.nav, P = this._curtainP, x = P[0], z = P[1];
+    const ix = Math.floor((x - nav.ox) * nav.inv), iz = Math.floor((z - nav.oz) * nav.inv);
+    const inGrid = ix >= 0 && iz >= 0 && ix < nav.w && iz < nav.h;
+    const i = inGrid ? iz * nav.w + ix : -1;
+    if (i === this._curtainCell) return;
+    this._curtainCell = i;
+    let on = !(i >= 0 && (nav.flags[i] & NAV_HIDDEN) !== 0);
+    const D = this.curtainData, front = this._curtainK[0], sideK = this._curtainK[1];
+    for (let k = 0; k < this.curtainCount && on; k++) {
+      const o = k * CURTAIN_STRIDE, dx = x - D[o], dz = z - D[o + 1];
+      const along = dx * D[o + 2] + dz * D[o + 3], lat = dx * D[o + 4] + dz * D[o + 5];
+      if (along > front && along < 3 && (lat < 0 ? -lat : lat) < D[o + 6] + sideK) on = false;
+    }
+    this.curtainsOn = on;
   }
 
   /**
@@ -324,6 +513,9 @@ export class WorldCore {
     this.stats.meshTris = p.indices.length / 3;
     this.stats.meshMs = Math.round((t1 - t0) * 10) / 10;
     this.stats.bvhMs = this.meshStats.bvhMs;
+    for (const f of /** @type {any} */ (p.stats).floorFix || []) {
+      notes.push(`floor ${f.floor} moved ${Math.round((f.to - f.from) * 1000) / 10} cm to its scanned surface (${f.to}, ${f.area} m² of scan)`);
+    }
     if (!p.stats.oneSided) notes.push(`global mesh orientation uncertain (${p.stats.upVotePct} % agree): two-sided colliders`);
     if (p.stats.truncated) notes.push(`global mesh truncated: ${p.stats.truncated} triangles over the cap`);
   }
@@ -624,6 +816,7 @@ export class WorldCore {
       applyMaxMs: s0.applyMaxMs, applyPhaseMs: s0.applyPhaseMs };
     const st = r.state;
     commitScalars(this, st.meta);
+    this.indexCurtains();
     Object.assign(this.stats, keep);
     this.stats.builds++;
     this.stats.workerBuilds++;
@@ -779,9 +972,12 @@ export class WorldCore {
       if (cell > nav.baseCell) notes.push(`nav cells ${(cell * 100).toFixed(1)} cm for a ${spanX.toFixed(1)} × ${spanZ.toFixed(1)} m house (capacity ${nav.capacity})`);
       nav.reset(x0, z0, w, h, cell);
     }
-    // Mapped floors first; virtual floors (patch, pockets) only where no mapped floor is.
+    // Mapped floors first; virtual floors (patch, pockets) only where no mapped floor is. Where floors overlap
+    // the smallest claims the cell (v0.4.1: the living room's 111 m² rectangle reached over half the bedroom and
+    // its hall, so enemies there stood on the living room's plane, 7.5 cm off the bedroom's; floorHeightAt agrees).
+    const order = L.floors.map((_, k) => k).sort((a, b) => L.floors[a].area - L.floors[b].area || a - b);
     for (let pass = 0; pass < 2; pass++) {
-      for (let k = 0; k < L.floors.length; k++) {
+      for (const k of order) {
         const f = L.floors[k];
         if (f.virtual !== (pass === 1)) continue;
         nav.fillPolygon(f.pts, f.n, NAV_INSIDE | (f.virtual ? NAV_VIRTUAL : 0) | (f.pocket ? NAV_POCKET : 0), k < 127 ? k : -1, f.virtual);
@@ -962,10 +1158,12 @@ export class WorldCore {
   update(dt, t, frame, ctx) {
     this.time = t * 0.001;
     if (this.buildPhase !== BUILD.IDLE) this.buildStep(t);
-    if (!this.roamOn || !this.built || this.buildPhase === BUILD.COPY) return;
+    if (!this.built || this.buildPhase === BUILD.COPY) return;
+    const p = ctx && ctx.player;
+    if (p && p.valid !== false) this.trackCurtains(p.head);
+    if (!this.roamOn) return;
     const R = this.roamIndex;
     if (R.baking) R.step(this.bakeBudgetMs);
-    const p = ctx && ctx.player;
     if (p && p.valid !== false) R.track(p.head);
   }
 
@@ -1115,7 +1313,9 @@ export class WorldCore {
         id: d.id, c: [c2(d.cx), c2(d.cz)], width: c2(d.width), bottom: c2(d.y0 - this.floorY(d.cx, d.cz)), y: [c2(d.y0), c2(d.y1)],
         walls: d.wallIds.slice(), offsets: d.offsets.map(c2), walkable: d.walkable, passable: d.passable, inZone: d.inZone, open: d.open,
         side: d.side, leadsTo: d.leadsTo, pocket: d.pocket >= 0,
+        curtain: !!(L.curtains && L.curtains.some((c) => /** @type {any} */ (c).door === d.id)),
       })),
+      hidden: { rooms: s.hiddenRooms || 0, curtains: L.curtains ? L.curtains.length : 0, pocketCells: s.hiddenPocketCells || 0 },
       furniture: L.furniture.map((b) => ({
         label: b.label, c: [c2(b.cx), c2(b.cz)], size: [c2(2 * b.hx), c2(2 * b.hz), c2(b.y1 - b.y0)], y: [c2(b.y0), c2(b.y1)],
         yaw: deg(b.c, b.s), source: b.source, blocks: b.navBlock,

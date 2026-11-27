@@ -41,7 +41,7 @@
  * fall back (edge margin 99 = no edge known; path = the build-start field).
  */
 
-import { NAV_DOOR, NAV_INSIDE, NAV_IWALL, NAV_POCKET, NAV_SHIELD, NAV_VIRTUAL, NAV_WALK, NAV_WALL } from './NavGrid.js';
+import { NAV_DOOR, NAV_HIDDEN, NAV_INSIDE, NAV_IWALL, NAV_POCKET, NAV_SHIELD, NAV_VIRTUAL, NAV_WALK, NAV_WALL } from './NavGrid.js';
 
 export const ROAM = Object.freeze({
   /** Rooms smaller than this get no id (m²). */
@@ -194,7 +194,7 @@ export class RoamIndex {
       RZ[r] += nav.centerZ(i);
       const f = nav.flags[i];
       if (f & NAV_POCKET) RF[r] |= ROOM_POCKET;
-      if (f & NAV_VIRTUAL) RF[r] |= ROOM_VIRTUAL;
+      if (f & (NAV_VIRTUAL | NAV_HIDDEN)) RF[r] |= ROOM_VIRTUAL; // v0.4.1: unscanned space behind the real walls too
     }
     for (let r = 1; r <= rooms; r++) if (RC[r] > 0) { RX[r] /= RC[r]; RZ[r] /= RC[r]; }
 

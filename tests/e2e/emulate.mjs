@@ -4,6 +4,8 @@
 // Exit code 0 = all checks passed. Prints the play session's CPU time per frame and draw calls.
 import { createRequire } from 'node:module';
 import { serve } from '../../tools/serve.mjs';
+import { runHouseReplay } from './replay-house.mjs';
+import { VERSION } from '../../src/version.js';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
@@ -422,7 +424,7 @@ try {
   ok('upload: the probe session is sent after it is saved (row: app, version, kind, mode, device, payload = the last session); "Sent ✓" on the page',
     !!upProbe && !!u0 && u0.method === 'POST' && u0.url === `https://${UPLOAD_HOST}/rest/v1/diagnostics` && u0.headers.apikey === 'sb_publishable_YNOltLcjVFMzeljWuHbzdg_sWCdgrfh'
       && u0.headers.authorization === 'Bearer sb_publishable_YNOltLcjVFMzeljWuHbzdg_sWCdgrfh' && /application\/json/.test(u0.headers['content-type'] || '') && u0.headers.prefer === 'return=minimal'
-      && u0.body.app === 'cqc-pass-through' && u0.body.version === 'v0.4' && /Chrome/.test(u0.body.device) && u0.body.device.length <= 120
+      && u0.body.app === 'cqc-pass-through' && u0.body.version === VERSION && /Chrome/.test(u0.body.device) && u0.body.device.length <= 120
       && Object.keys(u0.body).sort().join() === 'app,device,kind,mode,payload,version'
       && u0.body.payload.sessions.length === 1 && u0.body.payload.sessions[0].mode === 'probe' && u0.body.payload.app === 'cqc-pass-through' && !!u0.body.payload.preload,
     `${upProbe}; ${u0 ? `${(u0.bytes / 1024).toFixed(0)} KB, device "${u0.body.device}"` : 'no upload'}`);
@@ -986,7 +988,7 @@ try {
   const ur = uploads.slice(upReload).find((u) => u.body && u.body.mode === 'play');
   const urS = ur && ur.body.payload.sessions[0];
   ok('upload: the next page load sends the waiting play session (the compact last session with the encoded global mesh, the physics, the world build) and clears it',
-    !!reSent && !!ur && ur.answered === 201 && ur.body.kind === 'session' && ur.body.version === 'v0.4' && urS && urS.mode === 'play'
+    !!reSent && !!ur && ur.answered === 201 && ur.body.kind === 'session' && ur.body.version === VERSION && urS && urS.mode === 'play'
       && urS.spaceSnapshot && urS.spaceSnapshot.globalMesh && urS.spaceSnapshot.globalMesh.encoding === 'cqc-mesh-1' && typeof urS.spaceSnapshot.globalMesh.data === 'string' && urS.spaceSnapshot.globalMesh.data.length > 1000
       && urS.physics && urS.physics.attached && urS.play && urS.play.world && urS.play.world.async && ur.bytes < 1.4 * 1024 * 1024 && ur.body.payload.sessionsKept >= 2,
     `${reSent ? reSent.text : 'not sent'}; ${ur ? `${(ur.bytes / 1024).toFixed(0)} KB, mesh ${urS && urS.spaceSnapshot && urS.spaceSnapshot.globalMesh ? urS.spaceSnapshot.globalMesh.data.length : 0} chars of base64` : 'no request'}`);
@@ -1163,6 +1165,10 @@ try {
   ok('preload failure: probe still enters XR', await bad.waitForFunction(() => window.__app.game.state === 'xr', null, { timeout: 8000 }).then(() => true, () => false));
   await bad.evaluate(() => window.__app.session && window.__app.session.end());
   await bad.close();
+
+  // ---- v0.4.1: the user's real house (the v0.4 headset session's snapshot) replayed through the real World:
+  // no enemy pixels through real walls or in unscanned space, door spawns only, soldiers' heights and feet
+  for (const c of await runHouseReplay(browser, port)) ok(c.name, c.pass, c.info);
 } catch (e) {
   ok('test script crashed', false, e.stack);
 } finally {

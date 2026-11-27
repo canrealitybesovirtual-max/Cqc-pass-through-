@@ -36,6 +36,17 @@
  * are kept in a ring (x, z, tier, time, room, player room) for the session
  * record (`report`).
  *
+ * v0.4.1 (the user's house: five of six spawns stood in plain view through
+ * the living room's doors, in space Space Setup never scanned): a cell in
+ * unscanned space (NAV_HIDDEN: behind the real walls, see WorldCore.markHidden)
+ * is a candidate only next to a door into scanned space (NAV_POCKET), like the
+ * door pockets; while the door curtains stand (`world.curtainsOn`: the player is
+ * in scanned space) such a candidate is hidden whatever the sight lines say (the
+ * walls and the curtains cover it), so an enemy can wait right behind an open
+ * door and walk in through it. The roam search prefers these door spawns
+ * (`ROAM_SPAWN.doorBonus`): enemies come into the scanned rooms through real
+ * doorways instead of appearing in the middle of a room.
+ *
  * Roam (the default play mode, `buildRoam` + `beginRoam` / `stepRoam`): the
  * player walks the whole house, so candidates cover every room (no path
  * minimum from the build start), each with its cell and room. A search is
@@ -46,11 +57,11 @@
  * (RoamIndex.pathFromPlayerCell: through the doors of the player's room; in a
  * small house, when nothing qualifies, 3.5–5 m will do); and hidden from the
  * eyes (the 5 sight lines). Score: path near 9 m, a random
- * part, +0.5 for a room not used by the last two spawns. The pick is checked
+ * part, +1.0 for a room not used by the last two spawns, +1.0 behind a door. The pick is checked
  * again against the newest head when the search ends.
  */
 
-import { NAV_DOOR, NAV_INSIDE, NAV_POCKET, NAV_VIRTUAL, NAV_WALK } from './NavGrid.js';
+import { NAV_DOOR, NAV_HIDDEN, NAV_INSIDE, NAV_POCKET, NAV_VIRTUAL, NAV_WALK } from './NavGrid.js';
 
 /** Spawn log ring size (x, z, tier, time, room, player room per entry). */
 export const SPAWN_LOG = 16;
@@ -72,6 +83,10 @@ export const ROAM_SPAWN = Object.freeze({
   enough: 6,
   /** Read the clock every this many candidates. */
   clockEvery: 16,
+  /** Score bonus for a spawn behind a door into unscanned space (a pocket): he walks in through the doorway (v0.4.1). */
+  doorBonus: 1.0,
+  /** Score bonus for a room neither of the last two spawns used (variety: not always the same door; v0.4.1, was 0.5). */
+  freshBonus: 1.0,
 });
 
 /** Spawn tiers (`lastTier`, `finds[]`, the log). IN_VIEW is the last resort, not the best. */
@@ -111,6 +126,8 @@ export class SpawnFinder {
     this.virtualFallback = false;
     /** Cells the last build skipped because they are virtual floor. */
     this.skippedVirtual = 0;
+    /** Cells the last build skipped because they are unscanned space away from a door (NAV_HIDDEN, v0.4.1). */
+    this.skippedHidden = 0;
     this.seed = seed >>> 0 || 1;
     this.rng = this.seed;
     /** Ring of recent spawns: x, z, time (s). */
@@ -182,6 +199,7 @@ export class SpawnFinder {
     this.failStreak = 0;
     this.virtualFallback = false;
     this.skippedVirtual = 0;
+    this.skippedHidden = 0;
     this.roam = false;
     this.roomsWithCandidates = 0;
     this.rsActive = false;
@@ -209,6 +227,7 @@ export class SpawnFinder {
           this.skippedVirtual++;
           continue;
         }
+        if ((fl & NAV_HIDDEN) !== 0 && (fl & NAV_POCKET) === 0) { this.skippedHidden++; continue; }
         const x = nav.centerX(i), z = nav.centerZ(i);
         if (!open(nav, x, z)) continue;
         const ix = i % w, iz = (i - ix) / w;
@@ -263,6 +282,7 @@ export class SpawnFinder {
     this.roam = true;
     this.count = this.doorCount = this.pocketCount = 0;
     this.skippedVirtual = 0;
+    this.skippedHidden = 0;
     this.virtualFallback = false;
     const w = nav.w, h = nav.h, B = Math.max(1, Math.round(0.5 / nav.cell));
     const bw = Math.ceil(w / B), bh = Math.ceil(h / B);
@@ -272,6 +292,7 @@ export class SpawnFinder {
       if ((fl & NAV_WALK) === 0 || (fl & NAV_INSIDE) === 0 || (fl & NAV_DOOR) !== 0) continue;
       if (nav.clr[i] < this.spawnClear || nav.room[i] === 0) continue;
       if ((fl & NAV_VIRTUAL) !== 0 && (fl & NAV_POCKET) === 0) { this.skippedVirtual++; continue; }
+      if ((fl & NAV_HIDDEN) !== 0 && (fl & NAV_POCKET) === 0) { this.skippedHidden++; continue; }
       if (!open(nav, nav.centerX(i), nav.centerZ(i))) continue;
       const ix = i % w, iz = (i - ix) / w;
       const b = Math.floor(iz / B) * bw + Math.floor(ix / B);
@@ -388,8 +409,8 @@ export class SpawnFinder {
       this.rsEvals++;
       if (this.visible(world, this.rsEyeY, hx, hz, x, z, Math.sqrt(d2))) continue;
       const pathPref = 1 - Math.min(1, Math.abs(pc * 0.01 - RS.pathPeak) / RS.pathWidth);
-      const fresh = r !== this.lastRooms[0] && r !== this.lastRooms[1] ? 0.5 : 0;
-      const score = pathPref + fresh + (this.rand() / 4294967296) * 2;
+      const fresh = r !== this.lastRooms[0] && r !== this.lastRooms[1] ? RS.freshBonus : 0;
+      const score = pathPref + fresh + (this.pocket[c] ? RS.doorBonus : 0) + (this.rand() / 4294967296) * 2;
       if (near) {
         if (score > this.rsNearScore) { this.rsNearScore = score; this.rsNear = c; }
         continue;
@@ -558,7 +579,7 @@ export class SpawnFinder {
       });
     }
     return {
-      candidates: this.count, doorSide: this.doorCount, pocket: this.pocketCount, room: this.count - this.doorCount,
+      candidates: this.count, doorSide: this.doorCount, pocket: this.pocketCount, room: this.count - this.doorCount, skippedHidden: this.skippedHidden,
       virtualFallback: this.virtualFallback, roam: this.roam, roomsWithCandidates: this.roomsWithCandidates,
       roamSearch: this.roam ? { ...this.roamStats } : null,
       fromStart: { tier3: hiddenDoor, tier2: hiddenRoom, visible, tooNear },
@@ -587,6 +608,12 @@ export class SpawnFinder {
    * @param {number} x @param {number} z @param {number} d horizontal distance
    */
   visible(world, eyeY, ex, ez, x, z, d) {
+    // unscanned space behind the walls / a door curtain: covered while the curtains stand (v0.4.1)
+    const nav = /** @type {any} */ (world).nav;
+    if (nav && /** @type {any} */ (world).curtainsOn === true) {
+      const ix = Math.floor((x - nav.ox) * nav.inv), iz = Math.floor((z - nav.oz) * nav.inv);
+      if (ix >= 0 && iz >= 0 && ix < nav.w && iz < nav.h && (nav.flags[iz * nav.w + ix] & NAV_HIDDEN) !== 0) return false;
+    }
     const fy = world.floorY(x, z);
     if (world.segmentClear(ex, eyeY, ez, x, fy + 1.65, z)) return true;
     if (world.segmentClear(ex, eyeY, ez, x, fy + 1.1, z)) return true;

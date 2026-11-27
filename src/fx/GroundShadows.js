@@ -349,7 +349,7 @@ export class GroundShadows {
           if (ci < 0) continue;
           const o = this.next();
           if (o < 0) return;
-          cp[0] = cs.radius[ci];
+          cp[0] = cs.radius[ci] * hb.k;
           const C = capsuleFloor(hb.a, hb.b, ci * 3, cp, this._c);
           Wv[W.PX] = C[0]; Wv[W.PZ] = C[1]; Wv[W.AX] = C[2]; Wv[W.AZ] = C[3];
           Wv[W.A] = C[4] > SHADOW.footA ? C[4] : SHADOW.footA; Wv[W.B] = SHADOW.footB; Wv[W.H] = C[6];
@@ -370,7 +370,7 @@ export class GroundShadows {
           const ci = D[j];
           const o = this.next();
           if (o < 0) return;
-          cp[0] = cs.radius[ci];
+          cp[0] = cs.radius[ci] * hb.k;
           const C = capsuleFloor(hb.a, hb.b, ci * 3, cp, this._c);
           Wv[W.PX] = C[0]; Wv[W.PZ] = C[1]; Wv[W.AX] = C[2]; Wv[W.AZ] = C[3];
           Wv[W.A] = C[4]; Wv[W.B] = C[5]; Wv[W.H] = C[6];

@@ -36,6 +36,13 @@
  *   modelQ[b] = Δparent · D · restModelQ[b],  Δparent = modelQ[p] · restModelQ[p]⁻¹
  * so "bend forward" is a rotation about +X for every bone, whatever UE axes the
  * bone has. IK-solved bones get absolute model rotations instead.
+ *
+ * Size (v0.4.1, the user: "their height"): `k` scales the soldier about his
+ * root (the model is 1.868 m with the helmet; EnemyManager gives each one a
+ * height of 1.70–1.85 m). The pose is still solved in the model's own units;
+ * every world ↔ model conversion here (feet, aim point, hit point, toWorld)
+ * goes through k, and the rig's root carries the same scale, so the drawn
+ * body, the feet on the floor, the muzzle and the hit capsules all agree.
  */
 
 import { B, CORE_COUNT } from './Rig.js';
@@ -143,6 +150,8 @@ export class Animator {
 
     // inputs (world space), set by the owner before update()
     this.rootX = 0; this.rootY = 0; this.rootZ = 0; this.rootYaw = 0;
+    /** Body scale about the root (world metres per model metre; 1 = the model's 1.868 m). Set before reset(). */
+    this.k = 1;
     this.goodX = 0; this.goodY = 0; this.goodZ = 0; this.goodYaw = 0;
     this.vx = 0; this.vz = 0;
     this.aimX = 0; this.aimY = 1.4; this.aimZ = 5;
@@ -259,8 +268,9 @@ export class Animator {
     const c = Math.cos(this.rootYaw), s = Math.sin(this.rootYaw);
     // to model space
     const mx = dx * c - dz * s, mz = dx * s + dz * c;
-    const rx0 = hx - this.rootX, rz0 = hz - this.rootZ;
-    const rx = rx0 * c - rz0 * s, rz = rx0 * s + rz0 * c, ry = hy - this.rootY - this.def.pelvisY;
+    const ik = 1 / this.k;
+    const rx0 = (hx - this.rootX) * ik, rz0 = (hz - this.rootZ) * ik;
+    const rx = rx0 * c - rz0 * s, rz = rx0 * s + rz0 * c, ry = (hy - this.rootY) * ik - this.def.pelvisY;
     const k = clamp(strength, 0.2, 2.5);
     const V = this.sprV;
     if (part === 'head' || part === 'neck') {
@@ -270,7 +280,7 @@ export class Animator {
     V[0] += mz * (part === 'pelvis' ? 2 : 4.5) * k; // torso bends with the bullet
     V[1] += (rz * mx - rx * mz) * 9 * k; // twist from the off-axis hit
     V[2] += -ry * mx * 3 * k - mx * 1.5 * k; // lean away
-    if (part === 'pelvis' || (part === 'limb' && hy - this.rootY < 0.9)) V[5] += 0.6 * k; // knees buckle
+    if (part === 'pelvis' || (part === 'limb' && (hy - this.rootY) * ik < 0.9)) V[5] += 0.6 * k; // knees buckle
   }
 
   /** One rifle shot: kick back and muzzle rise, shoulder pushed back. */
@@ -395,8 +405,8 @@ export class Animator {
   neutral(f, out) {
     const sv = this.speed / 0.6, r = this.raise, still = sv >= 1 ? 0 : 1 - sv;
     const blade = r * still; // bladed stance while aiming in place
-    const side = (f === 0 ? 1 : -1) * (ANIM.stanceHalfWidth + 0.02 * blade);
-    const fwd = this.def.ankleZ + (f === 0 ? 0.1 : -0.1) * blade;
+    const side = (f === 0 ? 1 : -1) * (ANIM.stanceHalfWidth + 0.02 * blade) * this.k;
+    const fwd = (this.def.ankleZ + (f === 0 ? 0.1 : -0.1) * blade) * this.k;
     const c = Math.cos(this.rootYaw), s = Math.sin(this.rootYaw);
     out.x = this.rootX + side * c + fwd * s;
     out.z = this.rootZ - side * s + fwd * c;
@@ -465,8 +475,8 @@ export class Animator {
     // ── aim (model space)
     const T = this._tgt;
     {
-      const wx = this.sx - this.rootX, wz = this.sz - this.rootZ;
-      T.set(wx * c - wz * s, this.sy - this.rootY, wx * s + wz * c);
+      const ik = 1 / this.k, wx = (this.sx - this.rootX) * ik, wz = (this.sz - this.rootZ) * ik;
+      T.set(wx * c - wz * s, (this.sy - this.rootY) * ik, wx * s + wz * c);
     }
     const chestY = d.restModelP[B.spine3].y;
     let yawAim = Math.atan2(T.x, T.z);
@@ -638,7 +648,8 @@ export class Animator {
       const u = ft.swingT < 0 ? 0 : ft.swingT > 1 ? 1 : ft.swingT;
       ly += sp * Math.sin(Math.PI * u);
     }
-    const wx = ft.px + lx * fc + lz * fs - this.rootX, wz = ft.pz - lx * fs + lz * fc - this.rootZ;
+    const ik = 1 / this.k;
+    const wx = (ft.px - this.rootX) * ik + lx * fc + lz * fs, wz = (ft.pz - this.rootZ) * ik - lx * fs + lz * fc;
     out.set(wx * c - wz * s, ly, wx * s + wz * c);
     return out;
   }
@@ -1134,9 +1145,9 @@ export class Animator {
    * @param {V3} m @param {V3} out
    */
   toWorld(m, out) {
-    const c = Math.cos(this.rootYaw), s = Math.sin(this.rootYaw);
-    const x = m.x, z = m.z;
-    out.set(this.rootX + x * c + z * s, this.rootY + m.y, this.rootZ - x * s + z * c);
+    const c = Math.cos(this.rootYaw), s = Math.sin(this.rootYaw), k = this.k;
+    const x = m.x * k, z = m.z * k;
+    out.set(this.rootX + x * c + z * s, this.rootY + m.y * k, this.rootZ - x * s + z * c);
     return out;
   }
 

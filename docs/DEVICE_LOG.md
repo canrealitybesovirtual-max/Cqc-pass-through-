@@ -52,6 +52,15 @@ Records to read (the uploaded row's `payload`): `preload.physics` (import, init,
 
 Acceptance (research-phys §15): the physics system p95 at or under 1 ms a frame in a fight; collider slices at or under 6 ms; Rapier load at or under 0.6 s before Enter; `upVotePct` at least 80 %; no lying item lost inside furniture; your "it lies on the bed" judgement.
 
+## v0.4.1: tests to run
+
+v0.4.1 fixes what you saw in your house in v0.4 (enemies seen through walls, fake spawns, their height). Play a few waves in Roam as before, in the same rooms.
+
+1. **Through walls:** stand in the living room and in the bedroom. Do you ever see a soldier through a wall or a wall corner?
+2. **Spawns:** do soldiers now walk in through a real doorway, out of sight until they reach it? Say if one appears in the open, or "inside" a wall behind an open door.
+3. **Height:** do they look like real people now (1.70–1.85 m)? Are their feet on your floor in the bedroom, the hall and the living room (not floating, not sunk)?
+4. Exit. The upload goes by itself.
+
 ## Entries
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)
@@ -88,3 +97,27 @@ Sessions run: VR test, Boundary probe, Play. The Probe session and the 60 s timi
 - The depth probe ran without the depth feature (the attributes are present anyway). It is now gated on `enabledFeatures`.
 - A "planes" event was logged on every `lastChangedTime` tick (filling the 300-event log). It is now logged only when the count changes, and the ticks are counted.
 - The panel uploaded 679 times in 121 s. It is now limited to 2 redraws per second, and 1 per 10 s during timing runs.
+
+### v0.4 · 2026-11-27 · Quest 3, Roam in the user's house (240 s, realistic difficulty)
+
+The user: "it's looking fake how they spawn, see through my walls, and their height". The session record is replayed on desktop (`tests/fixtures/house-v04-device.json`, `tests/e2e/replay-house.mjs`).
+
+**What the record shows (device facts)**
+
+| Item | Result |
+|---|---|
+| Space | `unbounded` granted. Floors at y −1.51 (living room scan, 111 m², a 4-point rectangle) and −1.585 (bedroom scan, 14.4 m²). The global mesh covers the living room and the hall only (23.4k triangles kept; wall-face triangles cropped: 5,679) |
+| Layout | 20 walls (4 inferred on the rectangle's edges), 6 doors, 8 interior walls with a centred slab, 2 door pockets, 7 nav rooms |
+| Spawns | All 6 were tier 3 (`spawnHiddenDoor`, the roam search). 5 of 6 stood in space Space Setup never scanned: 4 behind the living room's doors (the rectangle's area outside its walls) and 1 in a closed corner behind two living-room walls (no door: it could never reach you). 18 path time-outs, 0 hits on you |
+| Floors | The bedroom scan's floor plane is 6.7 cm under the scanned floor of its own hall (−1.518). The living room's rectangle overlapped half the bedroom and gave it −1.51 there. Enemies stood on two heights in one room |
+
+**Found on desktop (replay of this record) and fixed in v0.4.1**
+
+- **Seen through walls, through open doors:** the floor rectangle made the space behind the living room's doors "mapped floor". Enemies spawned there, in view through the doorway, where your house has other walls. That space is now unscanned (`NAV_HIDDEN`). Each open door into it has a depth-only curtain on the far face of the wall, and spawns there only right behind a door. Replay: 231,193 px → 0 px of enemy in unscanned space from 21 of your positions.
+- **Seen through walls, at corners:** wall slabs ended exactly at the wall plane's ends, leaving a 5 × 5 cm hole at every outer corner. Replay: 8 leaks (up to 147 px at 192 px) → 0. Outer wall ends now reach 6 cm further.
+- **Depth precision** (near 0.02 m, far 50 m, 24-bit): under 0.5 mm at 12 m. Not a cause.
+- **Height:** the model is 1.868 m (helmet included). Soldiers are now 1.70–1.85 m, random per spawn, with feet, rifle and hit capsules scaled together. Floors come from the scan where the mesh covers them: the bedroom scan's floor moved from −1.585 to −1.518. Where floors overlap, the smaller polygon (the room's own) wins.
+
+**Still open (seen in the record, not fixed in v0.4.1)**
+
+The two room scans' walls close the hall off in both directions. The record says you walked bedroom → hall → living room, but the nav has no way through: the living room scan's wall at the hall's north end, and the bedroom scan's walls on the hall's east and south sides, stand where you walked. Enemies cannot reach the bedroom or the hall, and their slabs may hide enemies behind real openings. Re-drawing the rooms in Space Setup would show whether the scan or the game is wrong.
