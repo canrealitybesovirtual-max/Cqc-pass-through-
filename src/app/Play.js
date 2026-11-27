@@ -24,7 +24,8 @@ import { WristHud } from '../ui/WristHud.js';
  *      opaque "Get ready" panel, which also carries the controls card);
  *   3. warm: next frame, one draw of every pool into the XR framebuffer
  *      (`warmXR`, before that frame's own render), re-baselining the counts;
- *   4. start: the card stays up until a trigger pull (after 1 s) or 8 s;
+ *   4. start: the card stays up until a trigger pull is released (after 1 s) or
+ *      8 s (the same pull never also confirms the spot);
  *   5. spot: `game.pickSpot` (SafeSpot): the ring follows the head until the
  *      player pulls the trigger in an open spot (GameSession's own panel; App's
  *      panel is hidden). The confirm callback runs inside game.preUpdate, so
@@ -373,7 +374,7 @@ export class PlayKit {
   }
 
   /**
-   * The card stays up until a trigger pull (after CARD_MIN_MS) or CARD_MAX_MS;
+   * The card stays up until a trigger pull is released (after CARD_MIN_MS) or CARD_MAX_MS;
    * then the player chooses the spot (GameSession's panel and ring).
    * @param {number} t
    */
@@ -381,8 +382,12 @@ export class PlayKit {
     if (this.cardAt < 0) this.cardAt = t;
     const up = t - this.cardAt;
     const I = this.ctx.input;
-    const trig = !!I && ((I.left && I.left.triggerDown) || (I.right && I.right.triggerDown));
-    if (!(up >= CARD_MAX_MS || (trig && up >= CARD_MIN_MS))) return;
+    // Move on when the pull is RELEASED (and never while a trigger is held): pickSpot runs before
+    // game.preUpdate in this same frame, and a trigger-down edge there would also confirm a clear
+    // (or unmapped) spot at once, skipping the spot step the player was just told about.
+    const released = !!I && ((I.left && I.left.triggerUp) || (I.right && I.right.triggerUp));
+    const held = !!I && ((I.left && I.left.triggerHeld) || (I.right && I.right.triggerHeld));
+    if (!((up >= CARD_MAX_MS && !held) || (released && up >= CARD_MIN_MS))) return;
     this.game.pickSpot(this._onSpot);
     this.step = STEP.SPOT;
     if (this.rec && this.rec.play) { this.rec.play.step = 'spot'; this.rec.play.cardMs = Math.round(up); this.rec.play.cardSkipped = up < CARD_MAX_MS; }

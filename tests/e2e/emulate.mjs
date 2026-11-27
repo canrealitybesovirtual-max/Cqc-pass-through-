@@ -630,6 +630,24 @@ try {
   await waitState('menu');
   await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
 
+  // ---- No Space Setup data (a virtual room, where every spot is "unmapped"): the trigger pull that
+  // dismisses the card must not also confirm the spot (the card's step runs before game.preUpdate in
+  // the same frame, so it moves on at the release); a second pull then starts the round there.
+  await page.evaluate(() => { const k = window.__app.play; window.__fixture0 = k.fixture; k.fixture = { version: 1, space: 'local-floor', planes: [], meshes: [] }; });
+  await page.click('#bPlay');
+  const vIn = await waitState('xr');
+  const vCard = vIn && await skipCard();
+  await sleep(700);
+  const vSpot = await page.evaluate(() => { const k = window.__app.play; return { step: k.stepName, spotting: k.game.spotting, status: k.game.spotStatus, virtual: k.world.virtual, spot: window.__app.rec.play.spot || null }; });
+  ok('virtual room: the card\'s trigger pull leads to the spot step, it does not confirm the spot too', vCard && vSpot.virtual && vSpot.step === 'spot' && vSpot.spotting && vSpot.status === 'unmapped' && !vSpot.spot,
+    JSON.stringify(vSpot));
+  await press('left', 'trigger', 150);
+  const vPlay = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'play' && { spot: a.rec.play.spot, phase: k.game.phaseName }; }, null, 8000);
+  ok('virtual room: a second trigger pull confirms the unmapped spot and starts the round', !!vPlay && vPlay.spot && vPlay.spot.rebuilt === false && ['ready', 'wave'].includes(vPlay.phase),
+    vPlay && JSON.stringify(vPlay));
+  await page.evaluate(() => { window.__app.play.fixture = window.__fixture0; window.__app.session.end(); });
+  await waitState('menu');
+
   const errs = consoleErrors.filter((e) => !/test rejection/.test(e));
   ok('no console errors', errs.length === 0, errs.slice(0, 5).join(' || '));
 

@@ -69,7 +69,7 @@ In play, the `player` step also runs `game.preUpdate` (GameSession's pause and f
     1. **capture:** once the Space Setup plane count has been stable for 0.5 s (or after 3 s), `captureSnapshot(frame, space)` copies planes and meshes (`?emulate`: the house fixture). The snapshot goes into `rec.spaceSnapshot`.
     2. **build:** `world.build(snapshot, head)` once, synchronously, behind App's opaque "Get ready" panel (which carries the controls card).
     3. **warm:** next frame, every pool is drawn once into the XR framebuffer (`warmXR`, before that frame's render, which clears and draws over it) and the baseline moves to include XR's own resources.
-    4. **start:** the card stays up until a trigger pull (after 1 s) or 8 s.
+    4. **start:** the card stays up until a trigger pull is released (after 1 s) or 8 s. Moving on at the release means the same pull never also confirms the spot (pickSpot runs before `game.preUpdate` in that frame).
     5. **spot:** `game.pickSpot(cb)`: App's panel hides; GameSession's ring follows the head (green clear, amber tight, red blocked) with a floor arrow and a message until the trigger confirms a spot (a 1 s hold for a tight one). The callback runs inside `game.preUpdate`, so PlayKit starts the round in the next frame's `world` step.
     6. **rebuild** (only when the spot is more than 0.25 m from where the world was built): App's panel shows again, the next frame runs `world.build(world.snapshot, zone, { doors })` and draws with the panel up (uploading the occluder's rewritten buffers).
     7. **go:** `game.start(zone)`; GameSession shows "Get ready", then the waves.
