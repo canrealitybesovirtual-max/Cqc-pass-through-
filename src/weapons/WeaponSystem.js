@@ -10,7 +10,7 @@ import {
   Carry, GrabSense, SLOTS, arcPoint, pointDist, segmentDist,
   CARRY_SLOT, CARRY_DRAW, CARRY_HAND, CARRY_HOLSTER, CARRY_DROP, CARRY_SHRINK, CARRY_GROW, EV_STOWED,
 } from '../player/Slots.js';
-import { HANDLING, MagWell, MAG_GUIDED, TriggerGate, HapticGate, rackFraction, boreAtThighs } from '../player/Handling.js';
+import { HANDLING, MagWell, MAG_FREE, MAG_GUIDED, TriggerGate, HapticGate, rackFraction, boreAtThighs } from '../player/Handling.js';
 
 /**
  * The `weapons` system (CONTRACTS.md "W2"): both guns, the body slots, the
@@ -93,6 +93,7 @@ const _ZN = new THREE.Vector3(0, 0, -1);
 const _XA = new THREE.Vector3(1, 0, 0);
 const _YA = new THREE.Vector3(0, 1, 0);
 const _arc = new Float64Array(3);
+const _slot = new Float64Array(3);
 const _side = new Float64Array(3);
 
 /** One controller as the weapons see it. */
@@ -407,8 +408,8 @@ export class WeaponSystem {
         const k = c.blend, ys = this.body.yawS;
         _side[0] = Math.cos(ys); _side[1] = 0; _side[2] = -Math.sin(ys);
         _arc[0] = w.relP.x; _arc[1] = w.relP.y; _arc[2] = w.relP.z;
-        // arcPoint reads a and b as array-likes: use the scratch for a, the slot pose for b
-        arcPoint(_arc, /** @type {any} */ (w.sp.toArray(_b)), k, _side, _arc, 0);
+        _slot[0] = w.sp.x; _slot[1] = w.sp.y; _slot[2] = w.sp.z;
+        arcPoint(_arc, _slot, k, _side, _arc, 0);
         w.bp.set(_arc[0], _arc[1], _arc[2]);
         w.bq.slerpQuaternions(w.relQ, w.sq, k);
         break;
@@ -579,12 +580,13 @@ export class WeaponSystem {
       }
     }
     this._seatCheck(w);
-    // trigger, behind the draw gate
+    // trigger, behind the draw gate (the muzzle must clear where it sat in the slot)
     const trig = s ? s.trigger : 0;
     v.toWorld(v.muzzle, _v);
     v.dirWorld(_ZN, _v2);
     const atThigh = this.body.valid && boreAtThighs(_v.x, _v.y, _v.z, _v2.x, _v2.y, _v2.z, this.body.thighs);
-    const open = w.gate.update(trig, _v.distanceTo(w.slotP), atThigh);
+    _v3.copy(v.muzzle).applyQuaternion(w.sq).add(w.sp);
+    const open = w.gate.update(trig, _v.distanceTo(_v3), atThigh);
     inst.setTrigger(open && w.carry.state === CARRY_HAND && !this.paused ? trig : 0);
   }
 
@@ -595,7 +597,7 @@ export class WeaponSystem {
   _seatCheck(w) {
     if (this.lRole !== L_MAG || this.handMag !== w || !this.L.ok) return;
     const v = w.view;
-    if (w.inst.magSeated) { w.well.state = 0; return; }
+    if (w.inst.magSeated) { w.well.state = MAG_FREE; return; }
     v.handMagPose(this.L.pos, this.L.quat, this._mp, this._mq);
     v.toLocal(this._mp, w.bp, w.bq, _v).sub(v.magSeat);
     _q.copy(w.bq).invert().multiply(this._mq);
@@ -815,5 +817,3 @@ export class WeaponSystem {
     this.fx.setWarm(on);
   }
 }
-
-const _b = [0, 0, 0];
