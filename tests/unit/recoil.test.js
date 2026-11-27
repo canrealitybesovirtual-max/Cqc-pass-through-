@@ -201,10 +201,15 @@ test('documented figures: the Glock flips, the AKM rises more and stacks in auto
 
 test('fire and update do not allocate', () => {
   const r = new Recoil(AKM.recoil, 5);
-  for (let i = 0; i < 2000; i++) { r.fire((i & 1) === 1); r.update(0.011); }
-  globalThis.gc?.();
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 200000; i++) { if (i % 9 === 0) r.fire((i & 1) === 1); r.update(0.011); }
-  const grew = process.memoryUsage().heapUsed - before;
-  assert.ok(grew < 200_000, `heap grew ${grew} bytes over 200k updates and 22k shots`);
+  let i = 0, grew = Infinity;
+  const frame = () => { if (i % 9 === 0) r.fire((i & 1) === 1); r.update(0.011); i++; };
+  while (i < 50000) frame();
+  // least growth over three windows (see weapon.fuzz.test.js): 22k shots and 200k updates each
+  for (let rep = 0; rep < 3; rep++) {
+    globalThis.gc?.();
+    const before = process.memoryUsage().heapUsed;
+    for (let n = 0; n < 200000; n++) frame();
+    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
+  }
+  assert.ok(grew < 100_000, `heap grew ${grew} bytes over 200k updates and 22k shots`);
 });

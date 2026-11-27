@@ -123,11 +123,17 @@ test('the mechanism does not allocate per frame (fire, cycle, lock, reload, auto
     g.snapshot();
     a.snapshot();
   };
-  for (let i = 0; i < 20000; i++) frame(i);
-  globalThis.gc?.();
-  const before = process.memoryUsage().heapUsed;
-  for (let i = 0; i < 200000; i++) frame(i);
-  const grew = process.memoryUsage().heapUsed - before;
+  // The least growth over three 100k-frame windows after a warm-up: JIT tiering under a loaded test
+  // run can box a few doubles early on, but a real per-frame allocation (16 B or more) would show
+  // in every window as 1.6 MB or more.
+  let i = 0, grew = Infinity;
+  for (; i < 50000; i++) frame(i);
+  for (let rep = 0; rep < 3; rep++) {
+    globalThis.gc?.();
+    const before = process.memoryUsage().heapUsed;
+    for (const end = i + 100000; i < end; i++) frame(i);
+    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
+  }
   assert.ok(g.shots > 9000 && a.shots > 9000, `shots ${g.shots} / ${a.shots}`);
-  assert.ok(grew < 300_000, `heap grew ${grew} bytes over 200k frames`);
+  assert.ok(grew < 150_000, `heap grew ${grew} bytes over 100k frames`);
 });

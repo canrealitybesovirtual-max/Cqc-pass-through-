@@ -366,15 +366,13 @@ export class WeaponInstance {
       if (s === SLIDE_CYCLE) {
         const need = (1 - this.slidePos) * sd.backS;
         if (left < need) {
-          const pos = this.slidePos + left / sd.backS;
-          this.slidePos = pos < 1 ? pos : 1;           // rounding never overshoots the rear
+          this.slidePos = Math.min(this.slidePos + left / sd.backS, 1);   // rounding never overshoots
           left = 0;
         } else { left -= need; this._atRear(); }
       } else if (s === SLIDE_FORWARD) {
         const need = (this.slidePos - this.stopPos) * sd.homeS;
         if (left < need) {
-          const pos = this.slidePos - left / sd.homeS;
-          this.slidePos = pos > this.stopPos ? pos : this.stopPos;
+          this.slidePos = Math.max(this.slidePos - left / sd.homeS, this.stopPos);
           left = 0;
         } else { left -= need; this._arrive(); }
       } else if (s === SLIDE_BATTERY && this.autoT >= 0) {

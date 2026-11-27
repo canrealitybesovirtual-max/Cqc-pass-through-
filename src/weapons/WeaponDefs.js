@@ -148,8 +148,8 @@ export const GLOCK = deepFreeze({
 /**
  * AKM.
  * - Cyclic 600 rpm = 100 ms a round: carrier back 35 ms, home 55 ms *(design split)*, then the
- *   AKM's hammer-release retarder holds the hammer 10 ms after the carrier closes (it exists to
- *   stop bolt bounce and is what steadies the rate). The rate is therefore an outcome of the
+ *   AKM's hammer-release retarder holds the hammer 10 ms after the carrier closes (it lets the
+ *   carrier settle in battery before the hammer falls). The rate is therefore an outcome of the
  *   cycle, as on the real rifle: with the trigger held the auto sear trips each time the carrier
  *   closes, including after you let go of the charging handle.
  * - A rack needs (nearly) full travel: eject and feed at 95 % *(design)*. The hammer is cocked by
