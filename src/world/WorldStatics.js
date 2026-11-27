@@ -53,6 +53,9 @@ export const PRISM_STRIDE = 18;
 export const ROLE = Object.freeze({ SURFACE: 0, BACKSTOP: 1, CATCH: 2 });
 export const STATIC = Object.freeze({
   prismDepth: 0.3, backstopDrop: 0.03, backstopT: 0.04, backstopShrink: 0.03, catchMin: 40, catchPad: 10, catchT: 0.5, catchGap: 0.002,
+  // the lowest real top a piece of furniture owns (surfaceTops): up-facing (n·y ≥ topUp) owned triangles more than topAbove over
+  // its base, their area-weighted topPct quantile; the backstops follow it when it is more than topKeep under the volume's top
+  topUp: 0.8, topAbove: 0.15, topPct: 0.1, topKeep: 0.01,
 });
 /** Friction / restitution per SURF class (combine: Average friction, Min restitution). Items: polymer 0.6 / 0.15, steel 0.5 / 0.2. */
 export const MATERIAL = Object.freeze([
@@ -74,6 +77,55 @@ const SOLID_RE = /\b(bed|couch|sofa)\b/;
  *   oneSided: boolean, catchY: number, bounds: Float32Array, floorPts: Float64Array, floorOff: Int32Array, floorN: Int32Array, floorCount: number,
  *   stats: { slabs: number, backstops: number, catches: number, inferredWalls: number, prisms: number, tiles: number, tris: number, covered: number, oneSided: boolean } }} StaticGeometry
  */
+
+/**
+ * The lowest real top each piece of furniture owns (v0.4 verifier): the area-weighted `topPct` quantile of the
+ * heights of the up-facing triangles it owns more than `topAbove` over its base (when the mesh is reliably
+ * oriented, faces must point up; otherwise either way). NaN where it owns none. The backstops go under it,
+ * not under the volume's top: a couch's volume reaches its backrest, a bed's duvet sags, and a backstop
+ * above the real surface holds a dropped gun in the air. Build time only (worker); allocates.
+ * @param {import('./Layout.js').Layout} L
+ * @param {{ vertices: Float32Array, indices: Uint32Array, owner: Int16Array, stats?: any }} mesh
+ * @param {typeof STATIC} [o]
+ * @returns {Float64Array}
+ */
+export function surfaceTops(L, mesh, o = STATIC) {
+  const nf = L.furniture.length, out = new Float64Array(nf).fill(NaN);
+  const V = mesh && mesh.vertices, I = mesh && mesh.indices, O = mesh && mesh.owner;
+  if (!V || !I || !O || !nf) return out;
+  const signed = !!(mesh.stats && mesh.stats.oneSided);
+  /** @type {number[][]} */ const hw = [];
+  for (let k = 0; k < nf; k++) hw.push([]);
+  const n = Math.min(O.length, Math.floor(I.length / 3));
+  for (let t = 0; t < n; t++) {
+    const k = O[t];
+    if (k < 0 || k >= nf) continue;
+    const a = 3 * I[3 * t], b = 3 * I[3 * t + 1], c = 3 * I[3 * t + 2];
+    const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2];
+    const vx = V[c] - V[a], vy = V[c + 1] - V[a + 1], vz = V[c + 2] - V[a + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (!(len > 1e-12)) continue;
+    const up = (signed ? ny : Math.abs(ny)) / len;
+    if (!(up >= o.topUp)) continue;
+    const y = (V[a + 1] + V[b + 1] + V[c + 1]) / 3;
+    if (!(y >= L.furniture[k].y0 + o.topAbove)) continue;
+    hw[k].push(y, 0.5 * len * up); // height, projected area
+  }
+  for (let k = 0; k < nf; k++) {
+    const a = hw[k], m = a.length >> 1;
+    if (!m) continue;
+    const order = Array.from({ length: m }, (_, i) => i).sort((i, j) => a[2 * i] - a[2 * j]);
+    let total = 0;
+    for (let i = 0; i < m; i++) total += a[2 * i + 1];
+    let acc = 0;
+    for (const i of order) {
+      acc += a[2 * i + 1];
+      if (acc >= o.topPct * total) { out[k] = a[2 * i]; break; }
+    }
+  }
+  return out;
+}
 
 /**
  * @param {import('./Layout.js').Layout} L
@@ -104,15 +156,19 @@ export function buildStatics(L, mesh, positions) {
   }
   const covered = mesh ? mesh.covered : null;
   const S = STATIC;
+  const tops = covered ? surfaceTops(L, mesh) : null;
   for (let k = 0; k < L.furniture.length; k++) {
     const b = L.furniture[k];
     const soft = SOLID_RE.test(b.label || '');
     const surf = soft ? SURF.SOFT : SURF.HARD;
     if (covered && covered[k]) {
       st.covered++;
-      const top = b.y1 - S.backstopDrop;
+      // under the LOWEST real top it owns: a couch's Space Setup volume reaches its backrest (the seat is ~40 cm lower)
+      // and a scanned duvet or cushion sags below the volume's top; a backstop above them would hold a gun in the air
+      const lt = tops ? tops[k] : NaN;
+      const top = (lt === lt && lt < b.y1 - S.topKeep ? lt : b.y1) - S.backstopDrop;
       slab(b.cx, b.cz, b.c, b.s, b.hx - S.backstopShrink, b.hz - S.backstopShrink, top - S.backstopT, top, surf, ROLE.BACKSTOP);
-      if (soft) slab(b.cx, b.cz, b.c, b.s, b.hx - S.backstopShrink, b.hz - S.backstopShrink, b.y0 + S.backstopShrink, b.y1 - S.backstopShrink, surf, ROLE.BACKSTOP);
+      if (soft) slab(b.cx, b.cz, b.c, b.s, b.hx - S.backstopShrink, b.hz - S.backstopShrink, b.y0 + S.backstopShrink, top, surf, ROLE.BACKSTOP);
     } else {
       slab(b.cx, b.cz, b.c, b.s, b.hx, b.hz, b.y0, b.y1, surf, ROLE.SURFACE);
     }

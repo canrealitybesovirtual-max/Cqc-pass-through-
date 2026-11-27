@@ -159,8 +159,8 @@ Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g)
 
 ### Not in this build
 
-- The user's chosen extras **10 (automatic diagnostics upload), 8 (home defense), 7 (room clearing)**: not built. The data side for 7 and 8 exists (rooms, door graph, exterior doors); windows are not parsed yet.
-- Walkthrough pre-scan, the silent learner, real-surface physics (Rapier), IndexedDB persistence: not built.
+- The user's chosen extras **8 (home defense), 7 (room clearing)**: not built (v0.4 built 10, the automatic upload). The data side for 7 and 8 exists (rooms, door graph, exterior doors); windows are not parsed yet.
+- Walkthrough pre-scan, the silent learner, IndexedDB persistence: not built. (Real-surface physics came in v0.4.)
 - A watch toggle for the gloves; a watch-fit page; the pre-scan "rooms found" on the watch.
 
 ### Ask in the headset (keep it short)
@@ -170,6 +170,79 @@ Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g)
 3. Watch → GUN FIT: is the slide just above your thumb? Nudge it, SAVE, reload the page: is it kept?
 4. Walk briskly: does the watch buzz (no pause)?
 5. Looking down: is the holster legible and the AKM gone from view?
+
+## v0.4: real-surface physics, the scanned house in a worker, the look, automatic diagnostics (desktop only)
+
+Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs`, 152 checks) plus `npm test` (621 tests after the verifier pass). **Nothing in this section has run on the Quest yet.** The emulator renders about 4 frames a second, and the physics takes at most 3 steps of 1/90 s a frame, so it runs in slow motion there; every number below is desktop.
+
+### Real-surface physics (Rapier 0.20.0)
+
+| Item | Status | Notes |
+|---|---|---|
+| Rapier 0.20.0 vendored (`vendor/rapier/`, Apache-2.0, npm integrity + sha256 in `VERSION.txt`), loaded before Enter with its own share of the bar | desktop-tested | e2e: import 28–103 ms, init 26–88 ms; Node test checks the hash |
+| Contact warm-up at load (a scratch world: every collider pair, CCD, queries; one-sided and two-sided mesh) | desktop-tested | e2e: 0.7–0.76 s, 245 steps (max 44–47 ms in the warm-up itself); the first drop in play then steps in 0.6 ms max. Quest load time unmeasured (×4 planning factor ≈ 3 s) |
+| `physics` system after `weapons`: fixed 1/90 s step, interpolated, at most 3 steps a frame; nothing steps (no Rapier call) while every item sleeps | desktop-tested | e2e: a resting table drop takes 0 steps over 2 s while the skipped-frame count grows; step p50 0.13 ms, p95 0.23–0.28 ms, max 0.6–2 ms (desktop); the system's frame average 0.07 ms |
+| Static colliders from the world build: one-sided trimesh tiles (FIX_INTERNAL_EDGES at ≥ 80 % orientation votes), wall slabs, floor / ceiling prisms, backstops, a catch slab; 4 ms slices; the card, the spot round start and the realign wait for them | desktop-tested | e2e (fixture): 20 slabs, 8 prisms, 3 tiles, 1080 triangles, built in one 2.5 ms slice |
+| The Glock laid on a table with a still hand settles on top and stays | desktop-tested | e2e: 1.5 cm above the fixture table's top (the gun's breech face on its side), inside the top, 0 mm movement in 2 s |
+| Dropped from 0.4 m onto the bed: lands on the soft top (the collider sits 1.5 cm into it) and stays | desktop-tested | e2e on the fixture bed (synthetic scan with ±3 cm lumps): the breech face 0.3 cm above the scanned surface, 0 mm movement in 2 s. "Lies on the bed" on the real Quest mesh pending |
+| A throw into a wall: CCD, no tunnelling, rests in the same room, not lost | desktop-tested | e2e: released at 9.1 m/s at the north wall (z = −3): nearest z −2.97, came to rest on the floor 0.7 m back. The emulator's 4 fps cannot produce a real 9 m/s hand (that reads as a tracking jump), so the e2e synthesises the hand's 90 Hz history; the release, the estimate, the flight and the contact are the real ones |
+| Pick-up from anywhere (right grip within 0.13 m of the grip, or 0.05 m of the box): the draw blends from where it lies | desktop-tested | e2e: picked up from the table, the bed and the floor |
+| Holster rule: muzzle within 60° of the holster axis and no surface within 3 cm below; elsewhere the gun lies in the world; the AKM sling keeps the reach-only rule | desktop-tested | e2e holsters with the muzzle down (a level gun let go at the hip now drops: stricter than v0.3) |
+| Magazines (A / X, or let go from the left hand) are physics items with their rounds; left grip within 0.10 m picks one up; let go at the pouch goes back in; a pool of 10 per weapon, out-of-view recycling | desktop-tested (drop) / implemented (pick-up, pouch) | e2e: A drops it into the loose pool; pick-up and pouch are in P's Node tests |
+| Landing sounds by surface (the magazine clatter pitched down for guns; cloth on soft surfaces) | implemented | No gun-drop recording exists |
+| Contact shadows under lying items | desktop-tested | e2e: the lying gun adds an item shadow |
+| Lying items move with the house on a realign (`realignItems` at the realign build's commit) | implemented | Not isolated in the e2e (the realign runs with a magazine on the floor, no check of its new pose) |
+| Lost-object net (10 s outside the house returns the item), NaN guard, Rapier panic → v0.3 rules for the session | implemented | P's Node tests; never seen in the e2e (`guard` in `rec.physics`) |
+| `?physics=off` (the v0.3 rules) | implemented | Not in the e2e |
+| `rec.physics` (load, build, step histogram, items, the last 40 releases, guard) and `rec.physicsLoad` | desktop-tested | e2e |
+| Bullets pushing lying items, ragdolls, the optional seat dent, XRPose velocity in the record | planned | |
+
+### The scanned house (snapshot v2, the world worker)
+
+| Item | Status | Notes |
+|---|---|---|
+| Snapshot v2: the Space Setup meshes' triangles copied once at capture (never in JSON); the global mesh encoded in the record (`cqc-mesh-1`, gzip, base64) | desktop-tested (fixture) | The fixture's 10,932-triangle synthetic scan: 7.8 KB of base64. Real capture: IWER has no meshes; the Quest's global mesh layout, winding and label are unverified |
+| Every session build in the world worker (capture, MODE row, spot rebuild, realign); 0.5 ms apply slices, atomic commit, mesh-occluder tiles one range a frame | desktop-tested | e2e: worker 60–85 ms; the main thread's world step at most 0.3 ms during the build (it was a 57 ms synchronous build in v0.3's realigns); all other systems at most 3.4 ms a frame meanwhile |
+| Mesh occluder (depth only, the box occluder's program) and the BVH in bullets and sight lines; covered furniture boxes skipped | desktop-tested | e2e: 1080 mesh triangles kept after the crops, 3 tiles; one more draw per eye (42 calls for both eyes with 4 enemies) |
+| Copy leaves the encoded mesh out; Download, Share and the upload keep it | desktop-tested | e2e |
+| Desktop replay of a recorded house with its mesh (`?emulate&snapshot=` / `&replay`: hydrated) | implemented | Not in the e2e |
+| `?worker=0` (build on the main thread, A/B) | implemented | |
+
+### The look
+
+| Item | Status | Notes |
+|---|---|---|
+| PBR Neutral tone mapping and exposure chosen before any compile; the passthrough-match hook on every opaque lit material; its pools in the warm-up | desktop-tested | e2e: 28–29 programs at warm-up, flat through the round (10 materials matched, 6 tuned) |
+| World hits → material impacts (decal from the atlas, puff, sound per real material) | desktop-tested | e2e: the AKM burst into the north wall: 1–4 plaster impacts (the rest hit enemies), 29–68 particles, nothing compiled or uploaded. Wood, fabric, metal, glass from the Space Setup labels: L's Node tests only |
+| Room light (per room, by time of day and windows; manual presets saved), contact shadows under enemies and items | implemented / desktop-tested (shadows) | How it looks in passthrough pending. The watch rows (ROOM LIGHT, FLOOR) and the camera toggle are not wired (no UI yet) |
+| `?tm=`, `?exposure=`, `?sat=`, `?shadows=0`, `?impacts=0`, `?match=0` | implemented | Load-time A/B switches |
+
+### Automatic diagnostics upload (the user's extra 10)
+
+| Item | Status | Notes |
+|---|---|---|
+| The last session (compact, with the encoded mesh) to the Supabase table `public.diagnostics` after each saved session and on Copy; `keepalive` up to 64 KB, without it above | desktop-tested (stubbed) | e2e with the request intercepted: the row (app, version, kind, mode, device, payload), the four headers, the probe session (54 KB), the play session (115 KB), Copy (kind `copy`). Node tests cover keepalive by size and a refused keepalive retried without it |
+| A failed upload waits in localStorage (at most 3) and goes on the next page load; the page says "Sent ✓" / "Will retry" | desktop-tested | e2e: a 503 → "Will retry", one waiting; the reload sends it and clears it |
+| Dev builds and `?emulate` never upload unless `?upload=1` | desktop-tested | Node tests; the e2e's other pages never send |
+| The real endpoint | partly verified | The table, its RLS policy (anon INSERT only, `app = 'cqc-pass-through'`) and the row shape: one `kind: 'test'` row inserted as the anon role through the Supabase MCP (row 1). The HTTP path itself could not be tried from the build machine (its proxy refuses the host); the first headset session is the real test. Whether the Quest Browser sends keepalive requests with a CORS preflight is unverified (refused ones are re-sent without keepalive) |
+
+### Verifier pass: hitch audit and realism (desktop, headless)
+
+How it was measured: a scripted ?emulate session (load, Enter, the worker build, card, wave 1, a draw, a drop on the bed, a set-down on the table, a throw, the first round into each material, a kill, an A drop + pouch reload, the watch menu, two realigns) with every system's CPU per frame, every GL compile / texture upload, the JS heap per frame, long animation frames with script attribution, the CDP sampling heap profiler per phase, and a per-method timing drill-down of every slow frame. SwiftShader frames take 40–250 ms, so the frame interval (and the PerfMonitor hitch log) says nothing here; CPU outside the render × 4 (the planning factor) stands in for the Quest.
+
+| Item | Status | Notes |
+|---|---|---|
+| Nothing compiles or uploads in play | desktop-tested | 0 shader compiles / links and 0 texImage calls from Enter to exit; programs 28, textures 37, geometries 47 flat; only canvas texSubImage (watch, panels) |
+| A couch (any furniture whose Space Setup volume rises above its real top) holds a dropped gun on its real seat | desktop-tested (Node) | As built, the couch failed the mesh coverage rule (its seat is ~40 cm under its volume's top, the backrest), so it became a solid box: a Glock dropped on the seat rested at 0.866 m. Now covered from its scan at any height, and its backstops go under the lowest real top it owns: it rests on the seat (Rapier test). ScanSynth's flat-topped furniture hid this; the e2e fixture still cannot show it |
+| No contact shadow without its body during a pause | desktop-tested | The watch menu (any pause) hid the soldiers and a dropped magazine under the safety veil but left their blobs on the floor |
+| The soldiers' frame code is JIT-warmed at load (`EnemyManager.warmUp`, ~50–70 ms) | desktop-tested | First 60 frames of a soldier: 4.6 → 1.2 ms alive, 5.5 → 0.9 ms dying; 4.4 → 0.5 MB boxed in the first wave's first second |
+| The bones' pose copy skips three's Euler sync (`EnemyRig.apply`) | desktop-tested | A warmed soldier's frame: 2.9 KB → 0.04 KB of garbage, about 7× faster |
+| Still over budget ×4 (behind a panel or a held pause, by design) | desktop-tested | The XR warm draw (world step 4–10 ms), static collider slices (≤ 4 ms by the clock), the pause panel's first canvas redraw (game 4–7 ms) |
+| Still over budget ×4 in play (not fixed) | open | GC pauses of 2–6 ms landing in whichever system runs (the residual garbage: three's uniform uploads, the XR API, Brain / BodyEstimator / Player / Recoil / Handling sites); one 13.7 ms Rapier step at the first bed contact in 1 of 3 runs (a GC in the same frame; ≤ 2.8 ms in the other two); the watch dial's first redraw in play (2.3–2.8 ms); A* steps measured at 0.6–1.5 ms against their 0.35 ms budget (the clock is only read every 64 expansions). The device record (`systemsMs`, `hitches`, `physics.running.stepMs.max`, `enemies.pathMaxStepMs`) is the real test |
+
+### Ask in the headset (keep it short)
+
+See DEVICE_LOG "v0.4: tests to run": lay the Glock on the bed beside you and pick it up; drop it on the bed, a table and the floor; lay the AKM on the couch; throw a magazine at a wall; holster with the muzzle down; does anything stutter while "Reading your room…" shows; does the page say "Sent ✓" after you exit?
 
 ## Later phases
 

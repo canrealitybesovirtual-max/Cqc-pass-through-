@@ -24,6 +24,15 @@ import { B, CORE_COUNT, RigDef } from './Rig.js';
 export const BODY_RADIUS = 1.25;
 
 /**
+ * A three Quaternion's components from {x, y, z, w}, without its onChange hook (the Euler sync).
+ * @param {THREE.Quaternion} t @param {{ x: number, y: number, z: number, w: number }} q
+ */
+function setQ(t, q) {
+  const o = /** @type {any} */ (t);
+  o._x = q.x; o._y = q.y; o._z = q.z; o._w = q.w;
+}
+
+/**
  * Joint list of a skeleton for RigDef (rest = the loaded bind pose).
  * @param {THREE.Skeleton} skeleton
  * @returns {import('./Rig.js').JointDesc[]}
@@ -92,17 +101,18 @@ export class EnemyRig {
    * @param {import('./Animator.js').Animator} a
    */
   apply(a) {
+    // Quaternion components are written directly (v0.4 verifier): Quaternion.set() also runs three's
+    // onChange hook, which re-derives each bone's Euler `rotation` (a matrix and an asin per bone, read
+    // by nothing here), and in the browser that call chain boxed about 3 KB of numbers per soldier per
+    // frame. The bones' matrices are composed from `quaternion` as before.
     const core = this.core;
-    for (let b = 0; b < CORE_COUNT; b++) {
-      const q = a.lq[b];
-      core[b].quaternion.set(q.x, q.y, q.z, q.w);
-    }
+    for (let b = 0; b < CORE_COUNT; b++) setQ(core[b].quaternion, a.lq[b]);
     const p = a.pelvisLocal;
     core[B.pelvis].position.set(p.x, p.y, p.z);
-    for (let i = 0; i < this.fingers.length; i++) { const q = a.fingerQ[i]; this.fingers[i].quaternion.set(q.x, q.y, q.z, q.w); }
-    for (let i = 0; i < this.twists.length; i++) { const q = a.twistQ[i]; this.twists[i].quaternion.set(q.x, q.y, q.z, q.w); }
+    for (let i = 0; i < this.fingers.length; i++) setQ(this.fingers[i].quaternion, a.fingerQ[i]);
+    for (let i = 0; i < this.twists.length; i++) setQ(this.twists[i].quaternion, a.twistQ[i]);
     this.rifle.position.set(a.rifleP.x, a.rifleP.y, a.rifleP.z);
-    this.rifle.quaternion.set(a.rifleQ.x, a.rifleQ.y, a.rifleQ.z, a.rifleQ.w);
+    setQ(this.rifle.quaternion, a.rifleQ);
     const pc = a.mp[B.pelvis];
     this.sphere.center.set(pc.x, pc.y, pc.z);
   }

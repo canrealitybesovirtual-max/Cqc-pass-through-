@@ -15,6 +15,12 @@ Read first: `CLAUDE.md`, `docs/PLAN.md` (§5, §8–10, §14), `docs/ARCHITECTUR
 - **`scene.environment`** is a PMREM room made in `createRenderer`, before the warm-up, and never replaced.
 - **Reference-space resets and drift** realign the world behind a held pause (`src/world/Realign.js`).
 
+**v0.4 changes** (details in DECISIONS.md and the sections below):
+- **Real-surface physics** (builder P, `src/physics/`, `vendor/rapier/`): Rapier 0.20.0 for dropped guns and magazines on the scanned house; its own `physics` system after `weapons`. A gun let go away from its slot lies in the world (W2 "Slots" below).
+- **Snapshot v2 and the world worker** (builder S, `src/world/README.md`): the global mesh is captured, encoded in the record, prepared in the worker (BVH for bullets and sight lines, the mesh occluder, the static colliders); every session build is `buildAsync` / `realignAsync`.
+- **The look** (builder L, `src/fx/`, `src/core/Renderer.js`): room light, contact shadows, impacts per real material, the passthrough colour match; its own `look` system after `game`; `ctx.look`.
+- **Automatic diagnostics upload** (builder I, `src/debug/Upload.js`): the user's extra 10.
+
 ## Rules for every module
 
 - **Ownership.** Each builder writes **only its own directories** (see "Ownership" at the end). You may read anything. If you need something from another module, code against the interface in this file. Never edit another module's files.
@@ -52,6 +58,7 @@ Built by the integration layer and passed to every system:
  * @property {Player} player
  * @property {BodyEstimator} body   // v0.3: weapons.body (holster sockets, `seated`): one seated decision for everyone
  * @property {(ox:number,oy:number,oz:number,dx:number,dy:number,dz:number,max:number,out:Hit,ignoreEnemy?:number)=>boolean} raycast  // world + enemies, nearest
+ * @property {import('../src/fx/Look.js').Look|null} look   // v0.4: world hits → look.impact(hit, dx, dy, dz, weapon) when look.impactsOn
  */
 ```
 
@@ -61,11 +68,13 @@ Every system implements `update(dt, t, frame, ctx)`, where `dt` is in seconds (c
 2. world
 3. player
 4. weapons
-5. enemies
-6. game
-7. audio
-8. ui
-9. render
+5. physics (v0.4: `weapons.physicsUpdate`)
+6. enemies
+7. game
+8. look (v0.4: `look.update`)
+9. audio
+10. ui
+11. render
 
 **Hit record**: one reused object.
 
@@ -208,7 +217,8 @@ export class PathPlanner { /* pure, time-sliced A*: */ request(id, sx,sz, gx,gz)
     - AKM on the back, grabbed over the right shoulder.
     - Magazine pouch on the left hip.
     - Grab with the grip within 0.13 m.
-    - Release within 0.24 m of the holster to holster the gun. Released anywhere else, it returns to its slot after 0.3 s (scale or teleport, never a transparency switch).
+    - Release within 0.24 m of the holster to holster the gun. Released anywhere else, it returns to its slot after 0.3 s (scale or teleport, never a transparency switch). *(v0.3 rule; with physics off or failed it still applies.)*
+    - **v0.4 (physics on):** a gun released away from its slot lies in the world (`CARRY_FREE`): a still hand sets it down, a moving one drops or throws it (PoseHistory: least squares over 70 ms, ω × r, caps 12 m/s and 25 rad/s). The holster takes the Glock only with its muzzle within 60° of the holster's axis and no real surface within 3 cm below; the AKM sling keeps the reach-only rule. The right grip within 0.13 m of a lying gun's grip (or 0.05 m of its box) picks it up from anywhere (the 0.15 s draw blend from where it lies). Magazines dropped with A / X or let go from the left hand are physics items carrying their rounds; the left grip within 0.10 m picks one up; a magazine let go at the pouch goes back in. Only the lost-object net (10 s outside the house) returns an item to its slot (shrink, grow).
 - `src/weapons/WeaponSystem.js` (the system that registers): owns both weapons.
     - Right trigger fires using `ctx.raycast` from the muzzle along the bore (the hit uses the bore at the moment the trigger breaks).
     - Hits emit `enemyHit` or world FX.
@@ -256,6 +266,33 @@ export class EnemyManager {
 - **Enemy shots** use `ctx.world.segmentClear` and the player capsule (`ctx.player`). They emit `playerHit` (torso 25, head 50) and `enemyShot`.
 - **Draw calls:** at most 2 per enemy (body + rifle). Animate bones fully when within 8 m and visible; otherwise at 20 Hz, round-robin.
 
+## Physics (builder P, v0.4): `src/physics/`, `vendor/rapier/`
+
+```js
+const r = await weapons.initPhysics({ off })   // Preload, after the pools, before the GPU warm-up: loadRapier, attachPhysics, warmUp
+weapons.physExternal = true; weapons.physicsUpdate(dt, ctx)   // the `physics` system (PlayKit)
+weapons.realignItems(m)                         // at the commit of a realign build (old → new)
+weapons.physicsReport()                         // rec.physics (session end; allocates)
+// PhysicsWorld (pure): defineKind, warmUp, beginStatic(geo) + buildSlice(ms) → ready, step(dt), release, placeAt, gapBelow,
+//   nearest (JS cache), readPose / pose / readMatrix (interpolated), state(id), landing(id), landSurf(id), transformAll(m), report
+```
+
+- The static colliders come from `world.staticGeometry()` (StaticGeometry: slabs, prisms, trimesh tiles, backstops, catch slab) whenever its identity changes, in 4 ms slices.
+- Fixed 1/90 s step, interpolated, at most 3 steps a frame; nothing steps (no Rapier call) while every item sleeps; never create or remove bodies inside callbacks (removal is deferred to the next step); a NaN pose or a Rapier panic turns the physics off for the session (Guard) and the items go back to their slots.
+
+## Look (builder L, v0.4): `src/fx/`, `src/core/Renderer.js`
+
+```js
+const atlas = await loadDecalAtlas()            // at load (a worker)
+const look = new Look({ scene, hemi, sun, storage, atlas })
+look.prepareMaterials(roots); look.attach({ world, physics, enemies, weapons, audio }); look.warmUp()   // before the GPU warm-up
+look.warmMeshes() / look.setWarm(on)            // in every warm-up list
+look.onWorldBuilt(world, snapshot, { moved }); look.snap()   // after each build (moved: after a realign)
+look.update(dt, t, frame, ctx)                  // the `look` system
+look.impact(hit, dx, dy, dz, weapon)            // WeaponSystem's world hits (when look.impactsOn)
+look.reset(); rec.play.look = look.report()     // restart / session end
+```
+
 ## Game, audio, watch (builders G / R, U): `src/game/`, `src/audio/`, `src/ui/Watch.js`
 
 - `src/audio/AudioEngine.js`:
@@ -300,6 +337,7 @@ export class EnemyManager {
     - It stores the snapshot in the session record (`rec.spaceSnapshot`), so the user's real house can be replayed on desktop later.
     - The `probe` mode stays as it is.
 - **`?emulate`:** loads `tests/fixtures/house.json`. IWER has no scene data.
+- **v0.4: automatic diagnostics upload** (`src/debug/Upload.js`, the `Uploader`): App sends every saved session record after it is saved (`setTimeout`, never the frame loop); the page's Copy sends the last session too (kind `copy`). The table, the headers, keepalive, the pending queue and the on/off rules are in ARCHITECTURE.md "Automatic diagnostics upload".
 - **End-to-end check:** extend `tests/e2e/emulate.mjs`.
     - Play starts; enemies spawn and walk; firing with the trigger hits; reload; exit.
     - No console errors.
@@ -319,4 +357,7 @@ export class EnemyManager {
 | G (game) | `src/game/**`, `src/audio/**`, `src/ui/WristHud.js` (legacy), `tests/unit/game*.test.js`, `tests/unit/audio*.test.js` |
 | U (watch, v0.3) | `src/ui/Watch.js`, `src/ui/watch*.js`, `src/ui/HomePage.js`, `tests/unit/watch*.test.js` |
 | R (Roam, v0.3) | `src/xr/XRSession.js`, `src/world/**` (Roam, Realign), `src/safety/**`, `src/game/**`, their tests |
-| I (integration) | everything else (`src/app/**`, `src/main.js`, `index.html`, `src/core/Warmup.js`, `tests/e2e/**`, `docs/**`), plus fixes anywhere after the builders finish (v0.3: `WeaponSystem.triggerBlocked` / `fitHold`, the Spot button in `HomePage`) |
+| P (physics, v0.4) | `src/physics/**`, `vendor/rapier/**`, `src/weapons/LooseItems.js`, the physics parts of `src/weapons/WeaponSystem.js`, `WeaponFX.js` and `src/player/Slots.js`, `tests/unit/physics*.test.js`, `tests/unit/weapon.physics*.test.js`, `tests/unit/weapon.loose*.test.js`, `tests/unit/slots.physics*.test.js` |
+| S (world, v0.4) | as above, plus the world worker (`src/world/world.worker.js`, `WorldWorker.js`, `WorldBuild.js`, `WorldState.js`) and the mesh modules |
+| L (look, v0.4) | `src/fx/**`, `src/core/Renderer.js`, `tests/unit/fx*.test.js` |
+| I (integration) | everything else (`src/app/**`, `src/main.js`, `index.html`, `src/core/Warmup.js`, `tests/e2e/**`, `docs/**`), plus fixes anywhere after the builders finish (v0.3: `WeaponSystem.triggerBlocked` / `fitHold`, the Spot button in `HomePage`; v0.4: `src/debug/Upload.js`, `WeaponSystem.physExternal` / `physicsUpdate` and the `ctx.look` impact branch, the upload line in `HomePage`, `Preload`'s physics stage) |

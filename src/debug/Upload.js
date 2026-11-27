@@ -114,7 +114,7 @@ export function compactPayload(payload, max = UPLOAD.payloadMax) {
   let p = payload, bytes = utf8Length(JSON.stringify(p ?? null));
   if (bytes <= max) return { payload: p, bytes, trimmed };
   const sessions = p && Array.isArray(p.sessions) ? p.sessions : [];
-  p = { ...p, sessions: sessions.map((s) => (s && s.spaceSnapshot ? { ...s, spaceSnapshot: snapshotForCopy(s.spaceSnapshot) } : s)) };
+  p = { ...p, sessions: sessions.map((/** @type {any} */ s) => (s && s.spaceSnapshot ? { ...s, spaceSnapshot: snapshotForCopy(s.spaceSnapshot) } : s)) };
   trimmed.push('mesh');
   bytes = utf8Length(JSON.stringify(p));
   if (bytes <= max) return { payload: p, bytes, trimmed };

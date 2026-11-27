@@ -2,7 +2,7 @@
   "name": "cqc-pass-through",
   "private": true,
   "type": "module",
-  "description": "Quest 3 mixed-reality tactical FPS (three.js + WebXR). No build step; no runtime dependencies besides vendored three.js.",
+  "description": "Quest 3 mixed-reality tactical FPS (three.js + WebXR). No build step; no runtime dependencies besides vendored three.js and Rapier.",
   "scripts": {
     "test": "node --test --expose-gc tests/unit/*.test.js",
     "serve": "node tools/serve.mjs",

@@ -34,6 +34,24 @@ v0.2.1 adds the safe-spot step, a controls card, 72 Hz, a closer near plane, the
 4. If the gun sits at a wrong angle or height in your hand, reload the page with e.g. `?gripPitch=5` or `?gripY=0.01` and say which value felt right.
 5. Tap **Copy** (now the last session only) and paste it into the chat. New in the record: `probes.frameRate` (72 Hz request and the measured rate), `audio` (context state at start, after 1 s, at the end), `view.near`, `play.spot`, `play.world.rebuild`, `play.grip`, `play.safety`.
 
+## v0.4: tests to run
+
+v0.4 adds real-surface physics for dropped guns and magazines, the world built in a worker from your Space Setup scan (with its global mesh), the room-matched look and the automatic diagnostics upload. Loading takes longer (the physics warms up before Enter MR is enabled).
+
+1. **Sit on your bed.** Draw the Glock, lay it on the bed beside you and let go: does it lie on the bed (not floating, not sunk)? Pick it up again.
+2. **Drop it** from chest height onto the bed, a table and the floor: does each bounce and sound look and sound right?
+3. **Lay the AKM on the couch.** Drop a magazine (A) on a table edge; pick it up with the left grip.
+4. **Throw a magazine at a wall:** it must never vanish through it.
+5. **Holster:** let go at the hip with the muzzle pointing down: does it holster? Level at the hip it now drops (realism).
+6. **Fire about 20 rounds** at walls and furniture next to the bed: do the holes, dust and sounds fit the material? Do the cases stay on the bed (silent there, tink on the floor)?
+7. **Look:** do the guns, the soldiers and their shadows sit in your room's light, or look pasted on?
+8. **Hitches:** did anything stutter while "Reading your room…" showed, or later?
+9. Exit. The page should say **Diagnostics upload: Sent ✓** (no Copy needed). If it says **Will retry**, reload the page once.
+
+Records to read (the uploaded row's `payload`): `preload.physics` (import, init, warm-up ms), `sessions[0].play.world.async` (worker ms; the main thread's longest world step and frame while it built), `sessions[0].play.world.report.mesh` (`upVotePct`, `oneSided`, `classes`, label), `sessions[0].physics` (step p95 / max, items, releases, guard), `sessions[0].play.look`, `hitches`, `systemsMs.physics` / `.look`.
+
+Acceptance (research-phys §15): the physics system p95 at or under 1 ms a frame in a fight; collider slices at or under 6 ms; Rapier load at or under 0.6 s before Enter; `upVotePct` at least 80 %; no lying item lost inside furniture; your "it lies on the bed" judgement.
+
 ## Entries
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)

@@ -31,15 +31,16 @@
       <p>Wait for <b>Ready</b> under Start, then tap <b>Enter MR</b> (the whole house). A “Get ready” card shows the controls while the game reads your Space Setup rooms; pull the trigger to start.</p>
       <ul>
         <li><b>Whole house:</b> walk anywhere you scanned in Space Setup. Enemies come from other rooms. Walk, don’t run: running, the edge of the scanned area and walls close to your head make the <b>watch vibrate</b> and show a warning (nothing appears in front of you). Tracking loss pauses. <b>Enter MR: one spot</b> is the old stationary mode (a ring on the floor).</li>
-        <li><b>Glock:</b> right hand on your <b>right hip</b>, squeeze the <b>right grip</b> (sitting: on your right thigh). <b>AKM:</b> right hand <b>over your right shoulder</b>, squeeze. Let go at the hip / shoulder to put it back.</li>
+        <li><b>Glock:</b> right hand on your <b>right hip</b>, squeeze the <b>right grip</b> (sitting: on your right thigh). <b>AKM:</b> right hand <b>over your right shoulder</b>, squeeze. To holster, let go at the hip with the <b>muzzle pointing down</b>; the AKM goes back over the shoulder.</li>
+        <li><b>Put it down anywhere:</b> let go of a gun anywhere else and it falls, lands and stays like a real one — on your bed, a table, the couch or the floor (a still hand lays it down; a moving hand drops or throws it). Squeeze the right grip on it to pick it up again. Dropped magazines lie there too, with their rounds: pick one up with the left grip; let one go at your left hip to put it back in the pouch.</li>
         <li><b>Fire:</b> trigger. <b>A</b> (or <b>X</b> with your left hand on the gun): drop the magazine. <b>B</b> (or <b>Y</b> with your left hand on the gun): Glock slide release, AKM fire mode (safe / auto / semi; the right stick click too).</li>
         <li><b>Reload:</b> left grip at your <b>left hip</b> takes a magazine; push it up into the gun. AKM: squeeze the seated magazine with the left hand to pull it out. <b>Rack:</b> left grip on the slide (AKM: the charging handle), pull back, let go. (Holding A 1 s with no magazine reloads by itself, for testing.)</li>
         <li><b>Two hands:</b> left grip on the AKM handguard.</li>
         <li><b>Watch (left wrist):</b> health, rounds, wave and fire mode. Look at it, then <b>touch it with the right controller</b> (or point at it and pull the trigger) for the menu: RESUME, RESTART, DIFFICULTY, MODE (whole house / one spot), GUN FIT (tilt, height, forward per gun; SAVE keeps it), AMMO LINE, EXIT.</li>
         <li><b>Pause:</b> the watch menu, or <b>B + Y</b> with empty hands. <b>Exit:</b> watch → EXIT, or hold <b>Y</b> for 2 s.</li>
-        <li>Afterwards tap <b>Copy</b> below and paste it into the chat.</li>
+        <li>Afterwards the diagnostics are <b>sent automatically</b> (the page says “Sent ✓”, or “Will retry” on the next load). Copy below still works for pasting into the chat.</li>
       </ul>
-      <p class="quiet">The Quest boundary cannot be turned off from a web page. In whole-house mode the game asks for whole-house tracking; if the Quest refuses, the page says so and the boundary applies. Gun fit from the address (for testing): <code>?gripPitch=5</code> (degrees, + = muzzle up), <code>&amp;gripY=0.01</code> (metres, + = gun higher), <code>&amp;gripZ=0.01</code> (metres, + = gun back toward you); <code>?gloves=0</code> hides the gloves. The values used are saved with each session.</p>
+      <p class="quiet">The Quest boundary cannot be turned off from a web page. In whole-house mode the game asks for whole-house tracking; if the Quest refuses, the page says so and the boundary applies. Gun fit from the address (for testing): <code>?gripPitch=5</code> (degrees, + = muzzle up), <code>&amp;gripY=0.01</code> (metres, + = gun higher), <code>&amp;gripZ=0.01</code> (metres, + = gun back toward you); <code>?gloves=0</code> hides the gloves; <code>?physics=off</code> brings back the old rule (a gun let go returns to its slot). The values used are saved with each session.</p>
     </section>
 
     <section>
@@ -58,6 +59,7 @@
       </div>
       <p id="diagSize" class="quiet"></p>
       <p id="upload" class="quiet"></p>
+      <p class="quiet">Each session's diagnostics (the last session, with your house's scan) go automatically to this project's private diagnostics database (insert-only) after the session ends and when you tap Copy.</p>
     </section>
   </main>
   <script type="module" src="./src/main.js"></script>

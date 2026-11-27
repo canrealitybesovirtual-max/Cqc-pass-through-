@@ -185,6 +185,8 @@ export class PlayKit {
     for (const m of Array.isArray(sm) ? sm : sm ? [sm] : []) if (m && 'envMapIntensity' in m) m.envMapIntensity = ENEMY_CLOTH_ENV;
     this.enemies = new EnemyManager(assets, scene, MAX_ENEMIES, { world, planner: this.planner, light: gfx.flashLights[1] });
     this.enemies.bind(this.events); // applies 'enemyHit' itself: WeaponSystem gets no { enemies }
+    /** v0.4 verifier: the soldiers' per-frame code is JIT-warmed at load (the first wave ran cold: slower, boxing). */
+    this.enemyWarmMs = Math.round(this.enemies.warmUp() * 10) / 10;
     const enemies = this.enemies;
     /**
      * CONTRACTS "Ctx.raycast": world + enemies, nearest. world.raycast and
@@ -1057,6 +1059,7 @@ export class PlayKit {
         lighting: this.lighting ? { ...this.lighting, envMap: !!this.envTexture } : null,
       };
       try { rec.play.look = this.look ? { ...this.look.report(), prep: this.lookPrep } : null; } catch (err) { rec.play.look = { error: String(err) }; }
+      rec.play.enemyWarmMs = this.enemyWarmMs;
       try { rec.physics = this.weapons.physicsReport(); } catch (err) { rec.physics = { error: String(err) }; }
     }
     if (this.look) this.look.reset();

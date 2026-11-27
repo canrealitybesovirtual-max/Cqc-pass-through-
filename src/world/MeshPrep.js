@@ -36,7 +36,9 @@
  *    door's opening (± width/2 − 2 cm, its height, ± 0.35 m deep): the leaf
  *    was wherever it was during the scan.
  * 5. **Coverage**: a furniture volume is `covered` when it owns ≥ 40 kept
- *    triangles and its up-facing top triangles cover ≥ 50 % of its top. Covered
+ *    triangles and its up-facing triangles (any height 15 cm or more over its
+ *    base: a couch's seat lies well under its volume's top, the backrest)
+ *    cover ≥ 50 % of its footprint. Covered
  *    furniture is drawn and hit through the mesh (the shape set and the box
  *    occluder drop its box); uncovered furniture keeps its box.
  * 6. **Tiles**: one tile per furniture owner (no seam across a table top),
@@ -78,6 +80,9 @@ export const MESH = Object.freeze({
   maxTileTris: 4096,
   coverMinTris: 40,
   coverTopFrac: 0.5,
+  /** Up-facing owned surface counts toward coverage from this far above the volume's base (any height above it: a couch's
+   *  seat is ~40 cm under its volume's top, which is the backrest; v0.4 verifier). */
+  coverAbove: 0.15,
   maxTris: 262144,
 });
 
@@ -213,7 +218,7 @@ export function prepMesh(raw, layout, opts = {}, o = MESH) {
     keep[t] = 1;
     if (f >= 0) {
       ownTris[f]++;
-      if (ny > 0.7 && cy >= furn[f].y1 - 0.1) ownTop[f] += A[t] * ny;
+      if (ny > 0.7 && cy >= furn[f].y0 + o.coverAbove) ownTop[f] += A[t] * ny;
     }
   }
 

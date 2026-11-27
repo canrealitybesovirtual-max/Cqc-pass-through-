@@ -425,6 +425,57 @@ export class EnemyManager {
     this.lastEnemy = -1;
   }
 
+  /**
+   * JIT warm-up at load (v0.4 verifier), before the GPU warm-up: one spare rig walks, turns, aims,
+   * fires, flinches, is shot at, dies (falling both ways) and lies still, through the same per-frame
+   * code a soldier runs in play (Animator.update at the full rate and the 20 Hz LOD rate,
+   * EnemyRig.apply, Hitbox.update and its raycast), so the first wave runs on optimised code. Cold,
+   * the first second of a soldier ran about 3× slower and boxed about 70 KB a frame (headless
+   * Chromium; the GC then paused a later frame). Allocates nothing that stays; leaves the rig reset,
+   * hidden and its hitbox invalid. The animator's random stream moves on (harmless).
+   * @param {number} [frames] alive frames (the deaths take half as many each)
+   * @returns {number} ms spent
+   */
+  warmUp(frames = 480) {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const i = this.max - 1, an = this.anims[i], rig = this.pool.rigs[i], hb = this.hitboxes[i];
+    const visible = rig.root.visible;
+    const frame = (/** @type {number} */ dt) => {
+      an.update(dt);
+      rig.apply(an);
+      rig.setRoot(an.rootX, an.rootY, an.rootZ, an.rootYaw);
+      hb.update(an);
+      // shots at him: chest from the front, head from the side
+      hb.raycast(an.rootX, an.rootY + 1.3, an.rootZ + 4, 0, 0, -1, 10);
+      hb.raycast(an.rootX + 4, an.rootY + 1.62, an.rootZ, -1, 0, 0, 10);
+    };
+    an.reset(0, 0, -3, 0);
+    for (let k = 0; k < frames; k++) {
+      const s = k / frames, walk = (k >> 7) & 1;
+      an.vx = walk ? 0.9 * Math.sin(s * 9) : 0;
+      an.vz = walk ? 0.9 * Math.cos(s * 9) : 0;
+      an.rootX += an.vx / 72; an.rootZ += an.vz / 72;
+      an.rootYaw = Math.atan2(an.vx, an.vz + 1e-3);
+      an.aimX = an.rootX + 4 * Math.sin(s * 5); an.aimY = 1.2 + 0.4 * Math.sin(s * 3); an.aimZ = an.rootZ + 4 * Math.cos(s * 5);
+      an.raiseTarget = (k >> 5) & 1 ? 1 : 0.2;
+      if (k % 23 === 0) an.recoil();
+      if (k % 97 === 50) an.hit(0, 0, -1, an.rootX, an.rootY + 1.2, an.rootZ, k % 2 ? 'torso' : 'limb', 1);
+      frame(k % 4 === 3 ? 1 / 20 : 1 / 72);
+    }
+    for (let d = 0; d < 2; d++) {
+      an.hit(0, 0, -1, an.rootX, an.rootY + 1.6, an.rootZ, d ? 'head' : 'torso', 2);
+      an.die(d ? 1 : 0, d ? 0 : -1, d === 1);
+      for (let k = 0; k < frames >> 1; k++) frame(k % 4 === 3 ? 1 / 45 : 1 / 72);
+      an.reset(0, 0, -3, 0);
+    }
+    an.reset(0, 0, 0, 0);
+    rig.apply(an);
+    rig.setRoot(0, 0, 0, 0);
+    hb.valid = false;
+    rig.root.visible = visible;
+    return (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+  }
+
   /** Every object the warm-up must draw (all instances, rifles, the flash and hit-puff pools). */
   warmMeshes() {
     /** @type {import('three').Object3D[]} */

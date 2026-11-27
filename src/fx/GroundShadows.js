@@ -33,6 +33,7 @@
 import * as THREE from 'three';
 import { SH, SH_LEN, SHADOW, W, W_LEN, BF_LEN, boxFootprint, capsuleFloor, writeShadow } from './shadowMath.js';
 import { B } from '../enemies/Rig.js';
+import { K_MAG9, K_MAG762 } from '../physics/ItemShapes.js';
 
 const VERT = /* glsl */`
 varying vec2 vUv;
@@ -77,6 +78,16 @@ export function isSoftSurface(/** @type {string} */ s) {
 const ST_FREE = 0, ST_MOVING = 1, ST_RESTING = 2;
 /** WeaponSystem carry state "in the hand" (Slots.js CARRY_HAND). */
 const CARRY_HAND = 2;
+/**
+ * Is this object drawn: its own and every ancestor's `visible`? A pause hides
+ * the enemies and the loose magazines under GameSession's safety veil; their
+ * blobs must go with them (v0.4 verifier: they floated on the floor).
+ * @param {any} o
+ */
+function shown(o) {
+  for (let p = o; p; p = p.parent) if (!p.visible) return false;
+  return true;
+}
 
 export class GroundShadows {
   /**
@@ -242,9 +253,12 @@ export class GroundShadows {
   gatherItems() {
     const P = this.phys, st = P.st, cur = P.cur, kinds = P.kinds, kindOf = P.kindOf, n = Math.min(this.maxItems, st.length);
     const C = this.itemPose, R = this.itemRec;
+    // paused: the loose magazines are hidden under the veil (the lying guns stay in view)
+    const Wp = this.weapons, magsHidden = !!(Wp && Wp.worldRoot && !shown(Wp.worldRoot));
     for (let i = 0; i < n; i++) {
       const s = st[i];
       if (s !== ST_MOVING && s !== ST_RESTING) { this.itemOk[i] = 0; continue; }
+      if (magsHidden && (kindOf[i] === K_MAG9 || kindOf[i] === K_MAG762)) continue; // (its frozen record is kept)
       const k = i * 7;
       let same = s === ST_RESTING && this.itemOk[i] !== 0 && this.itemKind[i] === kindOf[i];
       if (same) for (let j = 0; j < 7; j++) if (C[k + j] !== cur[k + j]) { same = false; break; }
@@ -320,9 +334,11 @@ export class GroundShadows {
     Wv[W.NX] = 0; Wv[W.NY] = 1; Wv[W.NZ] = 0; Wv[W.AY] = 0;
     Wv[W.LX] = L[0]; Wv[W.LY] = L[1]; Wv[W.LZ] = L[2];
     Wv[W.PULL] = SHADOW.pullHard;
+    const rigs = E.pool && E.pool.rigs ? E.pool.rigs : null;
     for (let i = 0; i < E.max; i++) {
       const a = ag[i];
       if (!a.active) continue;
+      if (rigs !== null && rigs[i] && !shown(rigs[i].root)) continue; // hidden (the pause veil): no blob without a body
       const an = E.anims[i], hb = E.hitboxes[i];
       if (!hb || !hb.valid) continue;
       cp[1] = an.rootY;

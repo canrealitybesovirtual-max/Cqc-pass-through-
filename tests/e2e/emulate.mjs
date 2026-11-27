@@ -16,11 +16,25 @@ const report = {};
 
 const server = await serve(0);
 const port = server.address().port;
-const browser = await chromium.launch({ args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+// The diagnostics upload host resolves to localhost here: nothing the e2e does can ever reach the real table
+// (every upload below is intercepted by the route; one that slipped past would fail, and the checks would see it).
+const UPLOAD_HOST = 'ysxcottwabhpajhcnbqr.supabase.co';
+const browser = await chromium.launch({ args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', `--host-resolver-rules=MAP ${UPLOAD_HOST} 127.0.0.1`] });
 const mainContext = await browser.newContext(); // shared with the reload check (same localStorage)
+/** Uploads seen by the stub (the main context's pages: `?emulate&upload=1`); `failNext` answers 503 (the retry path). */
+const uploads = [];
+const uploadStub = { fail: false };
+await mainContext.route(`https://${UPLOAD_HOST}/**`, (route) => {
+  const r = route.request();
+  let body = null;
+  try { body = JSON.parse(r.postData() || 'null'); } catch { body = null; }
+  uploads.push({ method: r.method(), url: r.url(), headers: r.headers(), bytes: (r.postData() || '').length, body, answered: uploadStub.fail ? 503 : 201 });
+  return route.fulfill({ status: uploadStub.fail ? 503 : 201, headers: { 'access-control-allow-origin': '*' }, body: '' });
+});
 const page = await mainContext.newPage();
 const consoleErrors = [];
-page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
+// a deliberate 503 from the upload stub is logged by the browser as a failed resource; it is not an app error
+page.on('console', (m) => { if (m.type() === 'error' && !/status of 503/.test(m.text())) consoleErrors.push(m.text()); });
 page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
 
 // Every change of the load text, with the session buttons' state at that moment.
@@ -56,6 +70,21 @@ const resumeIfPaused = async (ms = 20000) => {
     await sleep(400);
   }
   return [...seen, 'still paused'];
+};
+
+/** Holster the Glock in the right hand: the grip at the holster, the bore along its axis (v0.4's rule), let go. */
+const holsterGlock = async () => {
+  await page.evaluate(() => window.__h.holsterAim());
+  await sleep(300);
+  for (let i = 0; i < 3; i++) { await page.evaluate(() => { window.__h.gripTo('right', Array.from(window.__app.play.weapons.body.holster.p)); window.__h.holsterAim(); }); await sleep(250); }
+  await button('right', 'squeeze', 0);
+};
+/** Draw the Glock from the holster (the grip at it, squeeze). */
+const drawGlock = async () => {
+  await button('right', 'squeeze', 0);
+  for (let i = 0; i < 3; i++) { await page.evaluate(() => window.__h.gripTo('right', Array.from(window.__app.play.weapons.body.holster.p))); await sleep(250); }
+  await button('right', 'squeeze', 1);
+  return !!(await waitFor(() => window.__app.play.weapons.held?.id === 'glock', null, 4000));
 };
 
 /**
@@ -116,6 +145,14 @@ const installHelpers = () => page.evaluate(async () => {
       dev.controllers[side].quaternion.set(q.x, q.y, q.z, q.w);
     },
     level(side) { dev.controllers[side].quaternion.set(0, 0, 0, 1); },
+    /** The Glock's bore along the holster's axis (v0.4's holster rule: muzzle within 60° of it). */
+    holsterAim() {
+      const w = app.play.weapons, g = app.input.right.grip;
+      const d = new THREE.Vector3(0, 0, -1).applyQuaternion(w.glock.slotQ);
+      this.aimAt('right', [g[12] + d.x, g[13] + d.y, g[14] + d.z]);
+    },
+    /** A lying (or held) gun's grip centre in the world. */
+    gripOf(id) { const v = app.play.weapons[id].view, p = new THREE.Vector3(); v.toWorld(v.gripCentre, p); return p.toArray(); },
     /**
      * A wrist check: the left controller posed so the watch's dial sits 35 cm from the eyes, 50° below
      * the horizon, facing them, and the head looking at it. Returns the dial target.
@@ -174,8 +211,8 @@ try {
   ok('no-WebXR: buttons disabled', await page.evaluate(() => document.getElementById('bPlay').disabled));
   ok('no-WebXR: game files not downloaded', await page.evaluate(() => window.__app?.preload?.state === 'idle'));
 
-  // ---- With the emulator
-  await page.goto(`http://localhost:${port}/?emulate`);
+  // ---- With the emulator (?upload=1: the automatic diagnostics upload runs, against the stub above)
+  await page.goto(`http://localhost:${port}/?emulate&upload=1`);
   await page.waitForFunction(() => window.__app?.game.state === 'menu', null, { timeout: 15000 });
   ok('emulator: AR supported', (await page.textContent('#support')) === 'Mixed reality is supported.', await page.textContent('#support'));
 
@@ -200,7 +237,15 @@ try {
         cloth: k && k.enemies.pool.rigs[0] ? k.enemies.pool.rigs[0].mesh.material.envMapIntensity : null },
       watchSounds: !!k && k.watchSounds && !!p.audio.buffers.watchTick && !!p.audio.buffers.watchAlert,
       diag: JSON.parse(a.diag.json()).preload, trace: window.__loadTrace,
-      grip: k && { ...k.gripReport } };
+      grip: k && { ...k.gripReport },
+      // v0.4: physics loaded and warmed before Enter; the look's pools and the mesh occluder in the warm-up; the world worker
+      physics: p.physics, physicsMs: p.times.physicsMs, physAttached: !!k && !!k.weapons.phys && k.weapons.physExternal,
+      lookWarmed: !!k && !!k.look && k.look.warmMeshes().every((m) => warmed.has(m)) && warmed.has(k.world.meshOccluder),
+      lookRestored: !!k && !!k.look && !k.look.warm && !k.look.shadows.mesh.visible && !k.look.impacts.decals.visible,
+      lookPrep: k && k.lookPrep, looseWarmed: !!k && ['glock', 'akm'].every((id) => warmed.has(k.weapons.fx.loose[id])),
+      atlas: !!k && !!k.look && k.look.textures().length > 0 && k.look.textures().every((t) => t.version > 0),
+      builder: k && k.builder ? { kind: k.builder.kind, ready: k.builder.ready, failed: k.builder.failed, warmMs: k.builder.warmMs } : null,
+      upload: { enabled: window.__upload.enabled, text: document.getElementById('upload').textContent } };
   });
   ok('preload: ready', pre.state === 'ready', pre.error || `${pre.times.totalMs} ms (assets ${pre.times.assetsMs}, audio ${pre.times.audioMs}, pools ${pre.times.poolsMs}, warm-up ${pre.times.warmMs})`);
   const pcts = pre.history.map((h) => h.pct);
@@ -222,9 +267,19 @@ try {
   ok('preload: programs count recorded', pre.warm && pre.warm.programs > 0 && pre.warm.textures > 0 && pre.warm.geometries > 0 && pre.diag && pre.diag.warm.programs === pre.warm.programs,
     pre.warm && `${pre.warm.programs} programs, ${pre.warm.textures} textures, ${pre.warm.geometries} geometries; ${pre.warm.drawables} drawables, ${pre.warm.calls} calls, ${pre.warm.textureCount} uploads`);
   ok('preload: asset scenes detached again', pre.detached);
+  ok('preload (v0.4): Rapier loaded, the item kinds defined and the contact warm-up run before Enter (its own share of the bar)',
+    pre.physics && pre.physics.ok && pre.physics.load && pre.physics.load.version === '0.20.0' && pre.physics.warm && pre.physics.warm.ok && pre.physics.warm.steps > 0
+      && pre.physAttached && pre.diag.physics && pre.diag.physics.ok && pcts.some((v) => v >= 80 && v <= 86) && pre.history.some((h) => /physics/.test(h.label)),
+    pre.physics && `import ${pre.physics.load && pre.physics.load.importMs} ms, init ${pre.physics.load && pre.physics.load.initMs} ms, warm-up ${pre.physics.warm && pre.physics.warm.ms} ms (${pre.physics.warm && pre.physics.warm.steps} steps, max ${pre.physics.warm && pre.physics.warm.maxStepMs} ms); stage ${pre.physicsMs} ms`);
+  ok('preload (v0.4): the look\'s pools (shadows, decals, puffs), the loose-magazine pools and the mesh occluder are in the warm-up draw, then hidden; the decal atlas uploaded',
+    pre.lookWarmed && pre.lookRestored && pre.looseWarmed && pre.atlas && pre.lookPrep && pre.lookPrep.matched > 0, JSON.stringify(pre.lookPrep));
+  ok('preload (v0.4): the world worker is up and warm before Enter', pre.builder && pre.builder.kind === 'worker' && pre.builder.ready && !pre.builder.failed, JSON.stringify(pre.builder));
+  ok('upload: on with ?upload=1 (dev and ?emulate never upload otherwise); nothing sent before a session', pre.upload.enabled && uploads.length === 0, JSON.stringify(pre.upload));
   ok('preload: no grip fit saved or in the URL: the default fit on both guns', pre.grip && pre.grip.fitVersion === 2 && pre.grip.source === 'default'
     && ['glock', 'akm'].every((id) => pre.grip[id].pitch === 0 && pre.grip[id].up === 0 && pre.grip[id].fwd === 0), pre.grip && JSON.stringify({ glock: pre.grip.glock.pos, akm: pre.grip.akm.pos }));
-  report.preload = { ...pre.times, programs: pre.warm.programs, textures: pre.warm.textures, geometries: pre.warm.geometries, drawables: pre.warm.drawables };
+  report.preload = { ...pre.times, programs: pre.warm.programs, textures: pre.warm.textures, geometries: pre.warm.geometries, drawables: pre.warm.drawables,
+    physics: pre.physics && { importMs: pre.physics.load && pre.physics.load.importMs, initMs: pre.physics.load && pre.physics.load.initMs, warmMs: pre.physics.warm && pre.physics.warm.ms, warmSteps: pre.physics.warm && pre.physics.warm.steps },
+    worldWorkerWarmMs: pre.builder && pre.builder.warmMs };
 
   // Fake GPU depth (IWER has none): XRWebGLBinding.getDepthInformation returns, while on, one of two
   // R32F 2-layer textures, a DIFFERENT texture object for "far room" and "hand at 0.4 m", the way a
@@ -361,6 +416,16 @@ try {
   const d1 = await page.evaluate(() => JSON.parse(window.__app.diag.json()));
   const last = d1.sessions.at(-1);
   ok('probe: session saved to diagnostics', last && last.mode === 'probe' && last.endedAt, last && last.endedAt);
+  // the automatic upload after the record is saved (outside the frame loop): one POST, the row, the PostgREST headers
+  const upProbe = await waitFor(() => /Sent ✓/.test(document.getElementById('upload').textContent) && document.getElementById('upload').textContent, null, 8000);
+  const u0 = uploads.find((u) => u.body && u.body.kind === 'session' && u.body.mode === 'probe');
+  ok('upload: the probe session is sent after it is saved (row: app, version, kind, mode, device, payload = the last session); "Sent ✓" on the page',
+    !!upProbe && !!u0 && u0.method === 'POST' && u0.url === `https://${UPLOAD_HOST}/rest/v1/diagnostics` && u0.headers.apikey === 'sb_publishable_YNOltLcjVFMzeljWuHbzdg_sWCdgrfh'
+      && u0.headers.authorization === 'Bearer sb_publishable_YNOltLcjVFMzeljWuHbzdg_sWCdgrfh' && /application\/json/.test(u0.headers['content-type'] || '') && u0.headers.prefer === 'return=minimal'
+      && u0.body.app === 'cqc-pass-through' && u0.body.version === 'v0.4' && /Chrome/.test(u0.body.device) && u0.body.device.length <= 120
+      && Object.keys(u0.body).sort().join() === 'app,device,kind,mode,payload,version'
+      && u0.body.payload.sessions.length === 1 && u0.body.payload.sessions[0].mode === 'probe' && u0.body.payload.app === 'cqc-pass-through' && !!u0.body.payload.preload,
+    `${upProbe}; ${u0 ? `${(u0.bytes / 1024).toFixed(0)} KB, device "${u0.body.device}"` : 'no upload'}`);
   ok('probe: live-depth summary saved', last && last.probes.liveDepth && last.probes.liveDepth.textureChanges > 0, last && JSON.stringify(last.probes.liveDepth));
   ok('probe: incomplete 60 s run recorded', last.perfRuns.some((r) => r.incomplete || /cancelled/.test(r.label)), JSON.stringify(last.perfRuns.map((r) => r.label)));
   ok('probe: hitch log exported', last.hitches && typeof last.hitches.total === 'number', last.hitches && `${last.hitches.total} hitches`);
@@ -400,12 +465,26 @@ try {
       snap: rec.spaceSnapshot && { planes: rec.spaceSnapshot.planes.length, meshes: rec.spaceSnapshot.meshes.length }, world: k.world.describe(), virtual: k.world.virtual,
       phase: g.phaseName, roam: g.roam, worldRoam: k.world.roamOn, rooms: k.world.stats.rooms, spotting: g.spotting, ring: g.ring.visible, msg: g.panel.mesh.visible ? g.panel.lines : null,
       programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone }, head: { x: k.player.head.x, z: k.player.head.z }, view: rec.view,
-      xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible, watchOn: k.watch.enabled, sink: g.warnSink === k.watch };
+      xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible, watchOn: k.watch.enabled, sink: g.warnSink === k.watch,
+      phys: k.weapons.phys ? k.weapons.physicsReport().build : null, physOn: k.weapons.physOn, physicsLoad: rec.physicsLoad,
+      gm: rec.spaceSnapshot && rec.spaceSnapshot.globalMesh ? { encoding: rec.spaceSnapshot.globalMesh.encoding, data: typeof rec.spaceSnapshot.globalMesh.data === 'string' ? rec.spaceSnapshot.globalMesh.data.length : 0,
+        tris: rec.spaceSnapshot.globalMesh.triangleCount } : null };
   });
   ok('play: whole house by default: `unbounded` requested (IWER grants it) and the Roam rules', g0.req.includes('unbounded') && ['unbounded', 'local-floor'].includes(g0.space) && g0.roam && g0.worldRoam
     && g0.play.mode === 'roam', `${g0.space}; ${g0.req.join(',')}; ${g0.rooms} rooms`);
   report.space = g0.space;
-  ok('play: systems in the contract order', g0.loop.join(',') === 'input,world,player,weapons,enemies,game,audio,ui' && g0.systems.join(',') === 'input,world,player,weapons,enemies,game,audio,ui,render', g0.systems.join(' → '));
+  ok('play: systems in the contract order (v0.4: physics after weapons, look after game)', g0.loop.join(',') === 'input,world,player,weapons,physics,enemies,game,look,audio,ui'
+    && g0.systems.join(',') === 'input,world,player,weapons,physics,enemies,game,look,audio,ui,render', g0.systems.join(' → '));
+  // v0.4: the build ran in the world worker; the main thread only copied, committed and uploaded in slices
+  const wb = g0.play.world.async, wr = g0.play.world.report;
+  ok('play (v0.4): the world was built in the worker (global mesh, BVH, statics); the main thread\'s world step stayed short during the build',
+    wb && wb.builder === 'worker' && wb.ok && wb.workerBuilds >= 1 && wb.worldMaxMs < 8 && wr.mesh && wr.mesh.tris > 10000 && wr.mesh.oneSided && wr.statics && wr.statics.tiles > 0 && wr.worker.builds >= 1,
+    wb && `worker ${wb.workerMs} ms, waited ${wb.waitMs} ms over ${wb.frames} frames; main thread: world step max ${wb.worldMaxMs} ms, all systems but render max ${wb.sysMaxMs} ms; apply ${wb.applyFrames} slices, max ${wb.applyMaxMs} ms ${JSON.stringify(wb.phaseMs)}; mesh ${wr.mesh && wr.mesh.tris} tris (${wr.mesh && wr.mesh.kept} kept, ${wr.mesh && wr.mesh.tiles} tiles)`);
+  report.worldBuild = wb && { workerMs: wb.workerMs, waitMs: wb.waitMs, frames: wb.frames, mainWorldMaxMs: wb.worldMaxMs, mainSysMaxMs: wb.sysMaxMs, applyMaxMs: wb.applyMaxMs, meshTris: wr.mesh && wr.mesh.tris };
+  ok('play (v0.4): the static colliders were built from the world build before the round (one-sided trimesh tiles + slabs + prisms)', g0.phys && g0.phys.ready && g0.phys.source === 'world'
+    && g0.phys.chunks > 0 && g0.phys.slabs > 0 && g0.phys.prisms > 0 && g0.physOn, JSON.stringify(g0.phys));
+  ok('play (v0.4): the session record carries the encoded global mesh (snapshot v2, cqc-mesh-1) and the physics load', g0.gm && g0.gm.encoding === 'cqc-mesh-1' && g0.gm.data > 1000
+    && g0.physicsLoad && g0.physicsLoad.ok, JSON.stringify(g0.gm));
   ok('play: Space Setup snapshot captured (house fixture) and stored in the session record', !!ready && g0.snap && g0.snap.planes === 19 && g0.snap.meshes === 4 && g0.play.source === 'fixture',
     g0.snap && `${g0.snap.planes} planes, ${g0.snap.meshes} meshes`);
   ok('play: world built from it behind the Get ready panel (Roam: rooms found)', !g0.virtual && /2 floors/.test(g0.world) && g0.play.world.buildMs >= 0 && g0.play.world.mode === 'roam' && g0.rooms >= 2,
@@ -506,8 +585,9 @@ try {
   await sleep(200);
   await press('right', 'a-button');
   await sleep(400);
-  const m1 = await page.evaluate(() => { const w = window.__app.play.weapons; return { seated: w.glock.inst.magSeated, dropped: w.fx.magPools.reduce((n, B) => n + B.count, 0) }; });
-  ok('play: A releases the magazine; it drops as a pooled object', !m1.seated && m1.dropped > 0, JSON.stringify(m1));
+  const m1 = await page.evaluate(() => { const w = window.__app.play.weapons; const loose = w.looseMags ? w.looseMags.glock.count : 0;
+    return { seated: w.glock.inst.magSeated, dropped: w.fx.magPools.reduce((n, B) => n + B.count, 0) + loose, loose }; });
+  ok('play: A releases the magazine; it drops (v0.4: a physics item with its rounds, in the loose-magazine pool)', !m1.seated && m1.dropped > 0 && m1.loose > 0, JSON.stringify(m1));
   await press('right', 'a-button', 150);
   const tapNoReload = await page.evaluate(() => { const w = window.__app.play.weapons; return !w.glock.inst.magSeated && w.glock.assistT < 0; });
   await press('right', 'a-button', 3500); // 0.8 s of game time (dt is clamped to 0.1 s per slow emulator frame)
@@ -515,9 +595,7 @@ try {
   ok('play: a second A tap does not reload; holding A with the magazine out = assisted reload (17 rounds)', tapNoReload && !!reloaded, await page.evaluate(() => JSON.stringify({ reloads: window.__app.play.weapons.stats.reloads, rounds: window.__app.play.weapons.glock.inst.magRounds })));
 
   // Holster the Glock (let go at the hip), then take the AKM from over the right shoulder
-  const hol2 = await page.evaluate(() => Array.from(window.__app.play.weapons.body.holster.p));
-  for (let i = 0; i < 3; i++) { await page.evaluate((p) => window.__h.gripTo('right', p), hol2); await sleep(150); }
-  await button('right', 'squeeze', 0);
+  await holsterGlock();
   const holstered = await waitFor(() => { const w = window.__app.play.weapons; return w.held === null && w.glock.carry.inSlot; }, null, 3000);
   ok('play: letting go at the hip holsters the Glock', !!holstered);
   const gloveOff = await waitFor(() => { const w = window.__app.play.weapons; return w.glock.carry.inSlot && !w.glock.view.handR.visible; }, null, 3000);
@@ -571,6 +649,136 @@ try {
   const causesW = await resumeIfPaused();
   ok('watch: RESUME closes the menu and the round resumes (3-2-1, no trigger pull needed)', !!resumed && !causesW.includes('still paused'), causesW.join(','));
   await waitFor(() => { const w = window.__app.play.weapons; return w.glock.carry.inSlot; }, null, 3000);
+
+  // ---- v0.4 real-surface physics (Rapier on the fixture's synthetic global mesh + slabs): the Glock laid on the table,
+  // dropped on the bed and thrown at a wall; it settles, stays, sleeps (no stepping) and is picked up again.
+  // SwiftShader runs ~4 frames a second and the physics takes at most 3 steps of 1/90 s a frame, so it runs in slow motion here.
+  const physC0 = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
+  const head0 = await page.evaluate(() => { const p = window.__iwer.position; return [p.x, p.y, p.z]; });
+  const furn = await page.evaluate(() => {
+    const W = window.__app.play.world, out = { y: 0, nx: 0, ny: 0, nz: 0, surface: '', dist: 0 }, r = {};
+    for (const b of W.layout.furniture) {
+      if (!['table', 'bed'].includes(b.label) || r[b.label]) continue;
+      const hit = W.surfaceBelow(b.cx, b.y1 + 0.5, b.cz, 2, out);
+      r[b.label] = { cx: b.cx, cz: b.cz, hx: b.hx, hz: b.hz, c: b.c, s: b.s, top: hit ? out.y : b.y1, surface: out.surface };
+    }
+    return r;
+  });
+  /** Where the gun lies now, against the surface below it and the furniture's footprint. */
+  const lying = (f) => page.evaluate((F) => {
+    const k = window.__app.play, w = k.weapons.glock, P = k.weapons.phys, W = k.world, r = w.view.root.position;
+    const out = { y: 0, nx: 0, ny: 0, nz: 0, surface: '', dist: 0 };
+    const hit = W.surfaceBelow(r.x, r.y + 0.3, r.z, 2, out);
+    let inside = null;
+    if (F) { const dx = r.x - F.cx, dz = r.z - F.cz, lx = dx * F.c + dz * F.s, lz = -dx * F.s + dz * F.c; inside = Math.abs(lx) <= F.hx + 0.01 && Math.abs(lz) <= F.hz + 0.01; }
+    return { x: r.x, y: r.y, z: r.z, state: P.state(w.physId), carry: w.carry.state, physId: w.physId, above: hit ? r.y - out.y : null, surface: hit ? out.surface : null, inside,
+      steps: P.stats.steps, skipped: P.stats.skipped, frames: P.stats.frames, shadows: Array.from(k.look.shadows.itemOk).filter((v) => v === 1).length };
+  }, f || null);
+  const waitRest = (ms = 45000) => waitFor(() => { const k = window.__app.play, w = k.weapons.glock, P = k.weapons.phys; return w.physId >= 0 && P.state(w.physId) === 2; }, null, ms, 250);
+  /** Stand beside a piece of furniture, draw (unless the Glock is in the hand), hold it `h` above its top (still), let go. */
+  const layOn = async (F, standX, standZ, h) => {
+    await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [standX, standZ]);
+    await sleep(800);
+    const drew = (await page.evaluate(() => window.__app.play.weapons.held?.id === 'glock')) || await drawGlock(); // still in hand after a pick-up
+    await page.evaluate(() => window.__h.level('right'));
+    for (let i = 0; i < 4; i++) { await page.evaluate((p) => window.__h.gripTo('right', p), [F.cx, F.top + h, F.cz]); await sleep(300); }
+    await sleep(900); // a still hand: a set-down
+    const sh0 = await page.evaluate(() => Array.from(window.__app.play.look.shadows.itemOk).filter((v) => v === 1).length);
+    await button('right', 'squeeze', 0);
+    const free = await waitFor(() => { const w = window.__app.play.weapons.glock; return w.physId >= 0 && w.carry.state === window.__CARRY_FREE; }, null, 4000);
+    const rest = await waitRest();
+    return { drew, free: !!free, rest: !!rest, sh0 };
+  };
+  const pickUp = async () => {
+    const g = await page.evaluate(() => window.__h.gripOf('glock'));
+    for (let i = 0; i < 3; i++) { await page.evaluate((p) => window.__h.gripTo('right', p), g); await sleep(250); }
+    const n0 = await page.evaluate(() => window.__app.play.weapons.physStats.pickedUp);
+    await button('right', 'squeeze', 1);
+    return !!(await waitFor((n) => { const w = window.__app.play.weapons; return w.held === w.glock && w.physStats.pickedUp > n && w.glock.physId < 0; }, n0, 5000));
+  };
+  await page.evaluate(async () => { window.__CARRY_FREE = (await import('/src/player/Slots.js')).CARRY_FREE; });
+  if (furn.table && furn.bed) {
+    // the table: laid down 12 cm above its top with a still hand
+    const T = furn.table;
+    const tl = await layOn(T, T.cx, T.cz + T.hz + 0.55, 0.12);
+    const t1 = await lying(T);
+    await sleep(2000);
+    const t2 = await lying(T);
+    const moved = Math.hypot(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z);
+    ok('physics: the Glock laid on the fixture table settles on top (resting on the table, inside its top) and stays there',
+      tl.drew && tl.free && tl.rest && t1.surface === 'table' && t1.above > -0.005 && t1.above < 0.06 && t1.inside && moved < 0.002,
+      `${JSON.stringify(tl)}; ${(t1.above * 100).toFixed(1)} cm above the ${t1.surface} at (${t1.x.toFixed(2)}, ${t1.y.toFixed(3)}, ${t1.z.toFixed(2)}); moved ${(moved * 1000).toFixed(1)} mm in 2 s`);
+    ok('physics: at rest nothing steps (step() is skipped, no Rapier call) and the lying gun casts a contact shadow',
+      t2.steps === t1.steps && t2.skipped > t1.skipped && t2.shadows > tl.sh0, `steps ${t1.steps} → ${t2.steps}, skipped frames ${t1.skipped} → ${t2.skipped}; item shadows ${tl.sh0} → ${t2.shadows}`);
+    ok('physics: the Glock is picked up again from the table (right grip at its grip, squeeze)', await pickUp());
+    // the bed: dropped from 0.4 m above it
+    const B = furn.bed;
+    const bl = await layOn(B, B.cx - B.hx - 0.5, B.cz, 0.4);
+    const b1 = await lying(B);
+    await sleep(2000);
+    const b2 = await lying(B);
+    const bm = Math.hypot(b2.x - b1.x, b2.y - b1.y, b2.z - b1.z);
+    ok('physics: the Glock dropped 0.4 m onto the fixture bed lands on it (the soft top, sunk at most 2.5 cm) and stays',
+      bl.drew && bl.free && bl.rest && b1.surface === 'bed' && b1.above > -0.025 && b1.above < 0.07 && b1.inside && bm < 0.002,
+      `${JSON.stringify(bl)}; ${(b1.above * 100).toFixed(1)} cm above the ${b1.surface} at (${b1.x.toFixed(2)}, ${b1.y.toFixed(3)}, ${b1.z.toFixed(2)}); moved ${(bm * 1000).toFixed(1)} mm in 2 s`);
+    ok('physics: the Glock is picked up again from the bed', await pickUp());
+    report.physicsDrops = { tableCm: +(t1.above * 100).toFixed(1), bedCm: +(b1.above * 100).toFixed(1) };
+    // a throw at the living room's north wall (z = −3) at 9 m/s: the hand history is synthesised at 90 Hz (at ~4 fps a real
+    // 9 m/s hand moves 2 m a frame, which the history rightly takes for a tracking jump); the release, the velocity estimate,
+    // the CCD flight and the wall contact are the real ones
+    await page.evaluate(() => window.__iwer.position.set(0.2, 1.6, -0.5));
+    await sleep(800);
+    const thDrew = (await page.evaluate(() => window.__app.play.weapons.held?.id === 'glock')) || await drawGlock();
+    await page.evaluate(() => window.__h.aimAt('right', [0.2, 1.3, -5]));
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.__h.gripTo('right', [0.2, 1.3, -1.0])); await sleep(250); }
+    await page.evaluate(() => {
+      const a = window.__app, k = a.play, sys = a.loop.systems.find((x) => x.name === 'weapons'), orig = sys.update, w = k.weapons.glock, V = [0, 1.0, -9];
+      const T = window.__throw = { injected: 0, released: false, rel: null };
+      sys.update = (dt, t, f, c) => {
+        if (!T.released && k.weapons.held === w) {
+          const r = w.view.root, q = r.quaternion, now = t / 1000;
+          w.hist.reset();
+          for (let i = 8; i >= 0; i--) { const age = i / 90; w.hist.pushPQ(now - 0.001 - age, r.position.x - V[0] * age, r.position.y - V[1] * age, r.position.z - V[2] * age, q.x, q.y, q.z, q.w); }
+          T.injected++;
+        }
+        orig(dt, t, f, c);
+        if (!T.released && k.weapons.held !== w) { T.released = true; T.rel = { ...k.weapons._rel }; }
+      };
+      window.__restoreWeapons = () => { sys.update = orig; };
+    });
+    await sleep(400);
+    await button('right', 'squeeze', 0);
+    const thrown = await waitFor(() => window.__throw.released && window.__throw.rel, null, 5000);
+    await page.evaluate(() => window.__restoreWeapons());
+    // the flight: never beyond the wall (sampled every quarter second)
+    let minZ = Infinity;
+    const tt = Date.now();
+    while (Date.now() - tt < 45000) {
+      const s = await page.evaluate(() => { const k = window.__app.play, w = k.weapons.glock, P = k.weapons.phys; return { z: w.view.root.position.z, st: w.physId >= 0 ? P.state(w.physId) : -1 }; });
+      if (s.z < minZ) minZ = s.z;
+      if (s.st === 2) break;
+      await sleep(250);
+    }
+    const th = await lying(null);
+    const floorY = await page.evaluate(([x, z]) => window.__app.play.world.floorY(x, z), [th.x, th.z]);
+    ok('physics: a throw at 9 m/s into a wall bounces off it and comes to rest on the floor of the same room (no tunnelling, not lost)',
+      thDrew && !!thrown && !thrown.setDown && thrown.lin > 6 && th.state === 2 && th.carry === (await page.evaluate(() => window.__CARRY_FREE)) && minZ > -3.0 && th.z > -3.0 && th.z < 1 && th.x > -2 && th.x < 3 && th.y > floorY - 0.02,
+      `${thrown ? `released at ${thrown.lin.toFixed(1)} m/s (${thrown.setDown ? 'set-down' : 'thrown'}, placement ${thrown.mode})` : 'no release'}; nearest the wall z ${minZ.toFixed(3)}; rests at (${th.x.toFixed(2)}, ${th.y.toFixed(3)}, ${th.z.toFixed(2)}), floor ${floorY.toFixed(3)}, ${th.surface}`);
+    ok('physics: the thrown Glock is picked up again from the floor', await pickUp());
+    await holsterGlock();
+    const holsteredAgain = await waitFor(() => window.__app.play.weapons.glock.carry.inSlot, null, 4000);
+    ok('physics: letting go at the hip with the muzzle along the holster still holsters (no surface below)', !!holsteredAgain);
+    const pr = await page.evaluate(() => { const k = window.__app.play, r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries,
+      rep: k.weapons.physicsReport() }; });
+    ok('physics: nothing compiled, uploaded or created by the first drops, landings, shadows and the throw',
+      pr.programs === physC0.programs && pr.textures === physC0.textures && pr.geometries === physC0.geometries,
+      `${pr.programs}/${pr.textures}/${pr.geometries} (before ${physC0.programs}/${physC0.textures}/${physC0.geometries}); steps ${pr.rep.running.steps}, step p95 ${pr.rep.running.stepMs.p95} ms, max ${pr.rep.running.stepMs.max} ms; ${JSON.stringify(pr.rep.items)}`);
+    report.physics = { running: pr.rep.running, items: pr.rep.items, weapons: pr.rep.weapons, build: pr.rep.build };
+  } else ok('physics: the fixture has a table and a bed', false, JSON.stringify(furn));
+  await page.evaluate((p) => window.__iwer.position.set(p[0], p[1], p[2]), head0);
+  await page.evaluate(() => window.__h.restorePose());
+  await sleep(800);
+  await resumeIfPaused();
   const back = await page.evaluate(() => { const B = window.__app.play.weapons.body; return [0, 1, 2].map((i) => B.back.p[i] + B.backAxis[i] * 0.08); });
   for (let i = 0; i < 3; i++) { await page.evaluate((p) => window.__h.gripTo('right', p), back); await sleep(200); }
   await button('right', 'squeeze', 1);
@@ -602,6 +810,14 @@ try {
   const a1 = await page.evaluate(() => { const k = window.__app.play, w = k.weapons; return { shots: w.stats.shots, mag: w.akm.inst.magRounds,
     why: { paused: w.paused, game: k.game.phaseName, gamePaused: k.game.paused, carry: w.akm.carry.state, gate: w.akm.gate.open, mode: w.akm.inst.mode, held: w.held && w.held.id } }; });
   ok('play: AKM full auto fires a burst while the trigger is held', a1.shots - a0 >= 3, `${a1.shots - a0} rounds in 0.7 s; ${a1.mag} left${a1.shots - a0 >= 3 ? '' : `; ${JSON.stringify(a1.why)}`}`);
+  // v0.4: the rounds that struck the wall went to the look's impacts (decal + puff + sound per real material), all pooled
+  await sleep(500);
+  const imp = await page.evaluate(() => { const k = window.__app.play, r = window.__app.gfx.renderer; return { ...k.look.impacts.report(), live: k.look.impacts.decals.count,
+    programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries, fxDecals: k.weapons.fx.decals ? k.weapons.fx.decals.count : null }; });
+  ok('play (v0.4): world hits are material impacts from the look (decals and puffs from pools; nothing compiled or uploaded)', imp.impacts > 0 && imp.decals > 0 && imp.live > 0
+    && imp.programs === physC0.programs && imp.textures === physC0.textures && imp.geometries === physC0.geometries,
+    `${imp.impacts} impacts (${JSON.stringify(imp.byKind)}), ${imp.particles} particles, ${imp.sounds} sounds; programs ${imp.programs}`);
+  report.impacts = { impacts: imp.impacts, byKind: imp.byKind, particles: imp.particles };
 
   // A 4-enemy scene in view: draw calls (both eyes, IWER renders two passes like the Quest)
   await page.evaluate(() => {
@@ -717,12 +933,23 @@ try {
   ok('play: the watch follows the left controller and redraws on change', perf.shown && perf.hudDraws > 0 && perf.menuDraws > 0, `${perf.hudDraws} dial redraws, ${perf.menuDraws} menu redraws`);
   report.cpu = { framesSampled: perf.recent.frames, cpuAvgMs: perf.recent.cpuAvg, intervalAvgMs: perf.recent.intervalAvg, fps: perf.recent.fps, perSystemAvgMs: perf.sys };
 
-  // Exit: hold Y for 2 s (the game ends the session from a timeout, never inside the frame callback)
+  // The look and the physics systems' cost per frame (desktop, SwiftShader; the render is the emulator's)
+  const lp = await page.evaluate(() => { const s = window.__app.perf.systemAverages(120); return { physics: s.physics, physicsMax: s.physicsMax, look: s.look, lookMax: s.lookMax, world: s.world, worldMax: s.worldMax }; });
+  report.systems = lp;
+  // Exit: hold Y for 2 s (the game ends the session from a timeout, never inside the frame callback).
+  // The upload of this session is answered 503 by the stub: it must wait in localStorage and go on the next load.
+  uploadStub.fail = true;
+  const upBefore = uploads.length;
   await page.evaluate(() => { window.__iwer.controllers.right.updateButtonValue('squeeze', 0); window.__iwer.controllers.right.updateButtonValue('trigger', 0); });
   await button('left', 'y-button', 1);
   const exited = await waitState('menu', 20000); // 2 s of game time: dt is clamped to 0.1 s per (slow) emulator frame
   await button('left', 'y-button', 0);
   ok('play: holding Y exits', exited);
+  const upRetry = await waitFor(() => /Will retry/.test(document.getElementById('upload').textContent) && { text: document.getElementById('upload').textContent,
+    pending: JSON.parse(localStorage.getItem('cqcpt.upload.v1') || '[]').map((p) => ({ kind: p.kind, mode: p.mode, bytes: p.body.length })) }, null, 10000);
+  uploadStub.fail = false;
+  ok('upload: a failed upload (HTTP 503) of the play session waits in localStorage and the page says "Will retry"', !!upRetry && upRetry.pending.length === 1
+    && upRetry.pending[0].mode === 'play' && uploads.length === upBefore + 1 && uploads.at(-1).answered === 503, JSON.stringify(upRetry));
   const d2 = await page.evaluate(() => JSON.parse(window.__app.diag.json()));
   const pl = d2.sessions.at(-1);
   ok('play: session saved with the snapshot and the round summary', pl && pl.mode === 'play' && pl.spaceSnapshot && pl.spaceSnapshot.planes.length === 19 && pl.play && pl.play.weapons && pl.play.enemies && pl.systemsMs,
@@ -737,6 +964,12 @@ try {
     R && R.grip && R.grip.fitVersion === 2 && R.grip.glock.pitch === 2 && R.grip.rayRel && R.grip.rayRel.right && R.fitSaves.some((f) => f.weapon === 'glock' && f.pitch === 2 && f.saved)
       && R.watch && R.watch.opens >= 1 && R.watch.wakes >= 1 && R.watch.actions.fitSave >= 1 && R.watch.actions.ammoLine === 2 && R.watch.actions.restart === 1 && R.hudDraws > 0,
     R && `grip ${JSON.stringify({ source: R.grip.source, glock: R.grip.glock.pitch, rayRel: R.grip.rayRel.right })}; watch ${JSON.stringify(R.watch)}`);
+  ok('play (v0.4): record has the physics (load, build, steps, releases), the look and the world worker',
+    pl && pl.physics && pl.physics.attached && pl.physics.load && pl.physics.load.version === '0.20.0' && pl.physics.build && pl.physics.build.ready && pl.physics.running.steps > 0
+      && pl.physics.items.spawned >= 4 && pl.physics.weapons.pickedUp >= 3 && pl.physics.releases.length >= 3 && pl.physicsLoad && pl.physicsLoad.ok
+      && R && R.look && R.look.impacts && R.look.impacts.impacts > 0 && R.look.light && R.world && R.world.async && R.world.async.builder === 'worker'
+      && R.roam && R.roam.realigns.every((x) => x.worker),
+    pl && pl.physics && `${JSON.stringify(pl.physics.running)}; items ${JSON.stringify(pl.physics.items)}; look ${R && R.look ? JSON.stringify({ impacts: R.look.impacts.impacts, shadows: R.look.shadows }) : 'none'}; realigns ${R && R.roam && JSON.stringify(R.roam.realigns.map((x) => ({ worker: x.worker, worldMaxMs: x.worldMaxMs, waitMs: x.buildWaitMs })))}`);
   ok('play: record has the Roam report (speeds, cues, rooms), the resets and realigns, the drift watch, the lighting',
     R && R.roam && R.roam.mode === 'roam' && R.roam.resets.length === 2 && R.roam.realigns.length === 2 && R.roam.drift && R.roam.world && R.roam.world.rooms >= 2
       && R.lighting && R.lighting.envMap && R.settings && R.settings.gloves === true && (report.space === 'unbounded' ? R.roam.spaceNote === null : /Whole-house tracking unavailable/.test(R.roam.spaceNote || '')),
@@ -744,8 +977,20 @@ try {
 
   // ---- A reload (same browser profile): the saved gun fit and settings come back at load, before the warm-up
   const re = await mainContext.newPage();
-  await re.goto(`http://localhost:${port}/?emulate`);
+  const upReload = uploads.length;
+  await re.goto(`http://localhost:${port}/?emulate&upload=1`);
   await re.waitForFunction(() => ['ready', 'failed'].includes(window.__app?.preload?.state), null, { timeout: 120000 });
+  // the next page load sends the waiting upload (after the preload), clears it, says "Sent ✓"
+  const reSent = await (async () => { const t = Date.now(); while (Date.now() - t < 10000) { const v = await re.evaluate(() => ({ text: document.getElementById('upload').textContent, pending: localStorage.getItem('cqcpt.upload.v1') }));
+    if (/Sent ✓/.test(v.text) && v.pending === null) return v; await sleep(200); } return null; })();
+  const ur = uploads.slice(upReload).find((u) => u.body && u.body.mode === 'play');
+  const urS = ur && ur.body.payload.sessions[0];
+  ok('upload: the next page load sends the waiting play session (the compact last session with the encoded global mesh, the physics, the world build) and clears it',
+    !!reSent && !!ur && ur.answered === 201 && ur.body.kind === 'session' && ur.body.version === 'v0.4' && urS && urS.mode === 'play'
+      && urS.spaceSnapshot && urS.spaceSnapshot.globalMesh && urS.spaceSnapshot.globalMesh.encoding === 'cqc-mesh-1' && typeof urS.spaceSnapshot.globalMesh.data === 'string' && urS.spaceSnapshot.globalMesh.data.length > 1000
+      && urS.physics && urS.physics.attached && urS.play && urS.play.world && urS.play.world.async && ur.bytes < 1.4 * 1024 * 1024 && ur.body.payload.sessionsKept >= 2,
+    `${reSent ? reSent.text : 'not sent'}; ${ur ? `${(ur.bytes / 1024).toFixed(0)} KB, mesh ${urS && urS.spaceSnapshot && urS.spaceSnapshot.globalMesh ? urS.spaceSnapshot.globalMesh.data.length : 0} chars of base64` : 'no request'}`);
+  report.upload = { playSessionKB: ur ? +(ur.bytes / 1024).toFixed(1) : null, requests: uploads.length };
   const reFit = await re.evaluate(() => { const k = window.__app.play; return { fit: k.weapons.getFit('glock'), akm: k.weapons.getFit('akm'), source: k.gripReport.source, watchFit: Array.from(k.watch.fitEdit.cur[0]),
     settings: k.settings, diff: k.enemies.diff.name }; });
   ok('gun fit: after a reload the saved Glock fit is applied (source "saved") and the watch\'s fit page starts from it', reFit.fit.pitch === 2 && reFit.akm.pitch === 0 && reFit.source === 'saved'
@@ -762,9 +1007,15 @@ try {
     && ['app', 'version', 'ua', 'support', 'preload', 'pageErrors'].every((k) => cp.keys.includes(k)) && cp.copyLen < cp.allLen,
     `copy ${(cp.copyLen / 1024).toFixed(0)} KB, all ${(cp.allLen / 1024).toFixed(0)} KB (${cp.allSessions} sessions)`);
   ok('diagnostics: export sizes shown on the page', /^Copy: the last session \(\d+ KB\)\. Download \/ Share: all \d+ kept sessions \(\d+ KB\)\.$/.test(cp.size), cp.size);
+  const upCopy = uploads.length;
   await page.click('#bCopy');
   const copyMsg = await waitFor(() => { const t = document.getElementById('msg').textContent; return /\d+ KB/.test(t) && t; }, null, 4000);
   ok('diagnostics: Copy says what it copied and its size', !!copyMsg && /last session/.test(copyMsg), copyMsg);
+  const upC = await waitFor(() => /Sent ✓ \(copy/.test(document.getElementById('upload').textContent) && document.getElementById('upload').textContent, null, 8000);
+  const uc = uploads.slice(upCopy).find((u) => u.body && u.body.kind === 'copy');
+  const copyMesh = await page.evaluate(() => { const c = JSON.parse(window.__app.diag.lastJson()).sessions[0]; return c && c.spaceSnapshot && c.spaceSnapshot.globalMesh ? { data: 'data' in c.spaceSnapshot.globalMesh, omitted: c.spaceSnapshot.globalMesh.dataOmitted } : null; });
+  ok('upload: Copy also uploads the last session (kind "copy", with the mesh); the clipboard text leaves the mesh blob out', !!upC && !!uc && uc.body.mode === 'play'
+    && typeof uc.body.payload.sessions[0].spaceSnapshot.globalMesh.data === 'string' && copyMesh && !copyMesh.data && copyMesh.omitted === true, `${upC}; ${JSON.stringify(copyMesh)}`);
 
   // ---- VR test scene
   await page.click('#bVR');
