@@ -432,7 +432,7 @@ try {
     return { rec, dmg: window.__pdmg.slice(), diff: k.enemies.brain.diff.name, puffWarm: new Set(window.__app.preload.warmed).has(k.enemies.puff.mesh), puffs: k.enemies.puff.spawned };
   });
   const efe = w1.en, tiered = efe.spawnBehind + efe.spawnHiddenRoom + efe.spawnHiddenDoor + efe.spawnInView;
-  ok('play: enemies on the "test" difficulty by default (half damage: torso 12, head 25)', efe.difficulty === 'test' && efx.diff === 'test' && efx.dmg.every((d) => d === 12 || d === 25),
+  ok('play: enemies on the "test" difficulty by default (torso 10, head 20)', efe.difficulty === 'test' && efx.diff === 'test' && efx.dmg.every((d) => d === 10 || d === 20),
     `${efe.difficulty}; rounds on the player ${efx.dmg.join(', ') || 'none yet'}`);
   ok('play: every spawn came from the world spawner with its tier, ≥ 3.5 m from the spot', efe.spawned > 0 && tiered === efe.spawned && efe.spawnDirect === 0 && efe.lastSpawnTier >= 1
     && efx.rec.length >= efe.spawned && efx.rec.every((r) => r.d >= 3.5 - 0.35), `${efe.spawned} spawns: behind ${efe.spawnBehind}, room ${efe.spawnHiddenRoom}, door ${efe.spawnHiddenDoor}, in view ${efe.spawnInView}; ${efx.rec.map((r) => r.d.toFixed(1)).join(' ')} m`);

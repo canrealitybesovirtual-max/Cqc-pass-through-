@@ -54,6 +54,8 @@ export const SPOT = Object.freeze({
   shrinkStep: 0.1,
   /** Hold the trigger this long to accept a TIGHT spot (s). */
   acceptTightS: 1.0,
+  /** Hold the trigger this long to accept a BLOCKED or off-map spot (s). */
+  acceptAnyS: 2.0,
   /** A TIGHT → TIGHT suggestion needs this much more room (m). */
   betterBy: 0.15,
   maxSuggest: 3.0,
@@ -213,7 +215,12 @@ export class SafeSpot {
     } else if (st === SPOT_STATUS.TIGHT) {
       this.holdT = triggerHeld ? this.holdT + dt : 0;
       ok = this.holdT >= SPOT.acceptTightS;
-    } else this.holdT = 0;
+    } else {
+      // The user wants no space limits (big house, rooms outside Space Setup): a BLOCKED or
+      // off-map spot is still accepted with a longer hold; the obstacle warnings stay on.
+      this.holdT = triggerHeld ? this.holdT + dt : 0;
+      ok = this.holdT >= SPOT.acceptAnyS;
+    }
     if (!ok) return false;
     this.confirmed = true;
     this.active = false;

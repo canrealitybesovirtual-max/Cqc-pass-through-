@@ -83,8 +83,9 @@ export const AI = Object.freeze({
 export const DIFFICULTY = Object.freeze({
   /** First headset tests: you can see the fight and survive a mistake. */
   test: /** @type {Readonly<Difficulty>} */ (Object.freeze({
-    name: 'test', aimErr1: 0.035, aimSettle: 1.6, react: Object.freeze([0.6, 1.1]), firstShot: 0.9, maxShooters: 2,
-    playerTorso: 12, playerHead: 25,
+    // v0.2.1 headset test: the v0.2 values killed a standing player ~8 s after contact.
+    name: 'test', aimErr1: 0.05, aimSettle: 2.5, react: Object.freeze([0.8, 1.4]), firstShot: 1.5, maxShooters: 1,
+    playerTorso: 10, playerHead: 20,
   })),
   /** PLAN §9's tested CQC values: nearly every settled round hits at 5 m. */
   realistic: /** @type {Readonly<Difficulty>} */ (Object.freeze({

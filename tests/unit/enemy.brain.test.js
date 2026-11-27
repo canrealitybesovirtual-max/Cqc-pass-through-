@@ -147,28 +147,28 @@ function firstShot(seed, difficulty) {
   return { sight, first, react: first - sight, errLate, brain };
 }
 
-test('test difficulty (the default): reaction 0.6–1.1 s, first shot never before 0.9 s, aim error 0.07 → 0.035 rad over 1.6 s', () => {
+test('test difficulty (the default): reaction 0.8–1.4 s, first shot never before 1.5 s, aim error 0.07 → 0.05 rad over 2.5 s', () => {
   assert.equal(new Brain().diff.name, 'test', 'the default for the first headset tests');
   const D = DIFFICULTY.test;
   assert.deepEqual([D.aimErr1, D.aimSettle, D.react[0], D.react[1], D.firstShot, D.maxShooters, D.playerTorso, D.playerHead],
-    [0.035, 1.6, 0.6, 1.1, 0.9, 2, 12, 25]);
+    [0.05, 2.5, 0.8, 1.4, 1.5, 1, 10, 20]);
   let minReact = Infinity;
   for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
     const r = firstShot(seed, 'test');
     assert.ok(r.sight >= 0 && r.first > 0, `seed ${seed}: saw and fired`);
     assert.ok(r.react >= D.firstShot - 1e-9, `seed ${seed}: first shot ${r.react.toFixed(3)} s after acquiring`);
-    assert.ok(r.react <= D.react[1] + 0.12, `seed ${seed}: reaction ${r.react.toFixed(3)} s`);
+    assert.ok(r.react <= Math.max(D.react[1], D.firstShot) + 0.12, `seed ${seed}: reaction ${r.react.toFixed(3)} s`);
     minReact = Math.min(minReact, r.react);
   }
-  assert.ok(minReact < DIFFICULTY.realistic.react[1] + 0.3, 'still a fight, not a pause');
+  assert.ok(minReact < Math.max(D.react[1], D.firstShot) + 0.3, 'still a fight, not a pause');
   // the settled error: aim held on the player (no shot of his own) for the settle time
   const b = field(1, 9, 'test');
   const a = b.agents[0];
   const p = player();
   for (let k = 0; k < 72 * 0.3; k++) b.update(DT, p);
   a.reactT = 1e9; // never fires: watch the error settle
-  for (let k = 0; k < 72 * 2.2; k++) b.update(DT, p);
-  assert.ok(a.los && a.aimT > 1.6, 'had the player in sight past the settle time');
+  for (let k = 0; k < 72 * (D.aimSettle + 0.6); k++) b.update(DT, p);
+  assert.ok(a.los && a.aimT > D.aimSettle, 'had the player in sight past the settle time');
   assert.ok(Math.abs(a.aimErr - D.aimErr1) < 0.002, `settled at ${a.aimErr.toFixed(4)} rad`);
   // halfway through the settle time the error is still between the two
   const b2 = field(1, 9, 'test');
@@ -176,11 +176,11 @@ test('test difficulty (the default): reaction 0.6–1.1 s, first shot never befo
   a2.reactT = 1e9;
   let mid = -1;
   for (let k = 0; k < 72 * 3 && mid < 0; k++) { b2.update(DT, p); if (a2.los) a2.reactT = 1e9; if (a2.aimT >= 0.8) mid = a2.aimErr; }
-  assert.ok(mid > D.aimErr1 + 0.01 && mid < AI.aimErr0, `halfway: ${mid.toFixed(4)} rad`);
+  assert.ok(mid > D.aimErr1 + 0.002 && mid < AI.aimErr0, `halfway: ${mid.toFixed(4)} rad`);
 });
 
 test('a quick re-acquire still waits for firstShot (test), not under realistic', () => {
-  for (const [diff, floor] of [['test', 0.9], ['realistic', 0]]) {
+  for (const [diff, floor] of [['test', DIFFICULTY.test.firstShot], ['realistic', 0]]) {
     const brain = field(1, 5, diff);
     const a = brain.agents[0];
     const p = player();
