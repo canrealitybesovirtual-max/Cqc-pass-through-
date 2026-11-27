@@ -1,0 +1,18 @@
+{
+  "name": "cqc-assets-bake",
+  "private": true,
+  "type": "module",
+  "description": "Offline asset bake for CQC Pass-Through (weapons, soldier, sounds). Not part of the runtime.",
+  "scripts": {
+    "bake": "node bake.mjs",
+    "check": "node check.mjs"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "4.5.1",
+    "@gltf-transform/extensions": "4.5.1",
+    "@gltf-transform/functions": "4.5.1",
+    "ktx2-encoder": "0.6.0",
+    "meshoptimizer": "1.3.0",
+    "sharp": "0.35.5"
+  }
+}
