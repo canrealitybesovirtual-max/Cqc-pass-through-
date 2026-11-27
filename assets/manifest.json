@@ -1,0 +1,674 @@
+{
+  "version": 1,
+  "generator": "tools/assets/bake.mjs",
+  "space": "metres; weapons: +Y up, -Z muzzle, origin on the bore at the breech face, +X right; soldier: feet at y = 0, facing +Z",
+  "models": {
+    "glock": "models/glock.glb",
+    "akm": "models/akm.glb",
+    "soldier": "models/soldier.glb"
+  },
+  "textures": "KTX2 (KHR_texture_basisu): load with KTX2Loader, transcoder in vendor/three/addons/libs/basis/",
+  "geometry": "EXT_meshopt_compression + KHR_mesh_quantization (normals, UVs, weights); positions float32",
+  "weapons": {
+    "glock": {
+      "muzzle": [
+        0,
+        0,
+        -0.11612
+      ],
+      "ejectionPort": [
+        0.01277,
+        0.004,
+        -0.00957
+      ],
+      "ejectDir": [
+        0.58835,
+        0.74524,
+        0.31379
+      ],
+      "grip": {
+        "pos": [
+          0,
+          -0.07273,
+          0.04399
+        ],
+        "up": [
+          0,
+          0.92971,
+          -0.3683
+        ],
+        "fwd": [
+          0,
+          -0.3683,
+          -0.92971
+        ]
+      },
+      "magWell": {
+        "pos": [
+          0,
+          -0.0081,
+          0.01901
+        ],
+        "axis": [
+          0,
+          0.94716,
+          -0.32075
+        ]
+      },
+      "magLocalSeat": [
+        0,
+        -0.0081,
+        0.01901
+      ],
+      "slide": {
+        "travel": 0.0358,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "rackPoint": [
+          0,
+          0.00606,
+          0.05893
+        ]
+      },
+      "trigger": {
+        "pivot": [
+          0,
+          -0.02273,
+          -0.01217
+        ],
+        "axis": [
+          -1,
+          0,
+          0
+        ],
+        "pullRad": 0.45
+      },
+      "sights": {
+        "rear": [
+          0,
+          0.01344,
+          0.06191
+        ],
+        "front": [
+          0,
+          0.01346,
+          -0.10324
+        ]
+      },
+      "bore": {
+        "radius": 0.0045
+      },
+      "slideStop": {
+        "pivot": [
+          0,
+          -0.01577,
+          0.02023
+        ],
+        "axis": [
+          -1,
+          0,
+          0
+        ],
+        "liftRad": 0.06,
+        "note": "part 3; rotates about its rear pin so the front rises into the slide notch when the slide locks open"
+      },
+      "magCatch": {
+        "pos": [
+          -0.00014,
+          -0.04599,
+          0.01573
+        ],
+        "axis": [
+          1,
+          0,
+          0
+        ],
+        "travel": 0.0025
+      },
+      "tris": 16451,
+      "parts": [
+        "static",
+        "slide",
+        "trigger",
+        "slideStop",
+        "magCatch"
+      ],
+      "textures": {
+        "base": {
+          "size": [
+            2048,
+            2048
+          ],
+          "format": "KTX2 ETC1S sRGB",
+          "bytes": 319039
+        },
+        "normal": {
+          "size": [
+            2048,
+            2048
+          ],
+          "format": "KTX2 UASTC linear",
+          "bytes": 2283378
+        },
+        "orm": {
+          "size": [
+            1024,
+            1024
+          ],
+          "format": "KTX2 UASTC linear",
+          "bytes": 739055,
+          "channels": "R occlusion, G roughness, B metalness"
+        },
+        "gpuBytes": 9786776
+      }
+    },
+    "akm": {
+      "muzzle": [
+        0,
+        0,
+        -0.4323
+      ],
+      "ejectionPort": [
+        0.02014,
+        0.004,
+        -0.0194
+      ],
+      "ejectDir": [
+        0.84788,
+        0.34913,
+        -0.399
+      ],
+      "grip": {
+        "pos": [
+          0,
+          -0.07731,
+          0.1885
+        ],
+        "up": [
+          0,
+          0.95824,
+          -0.28595
+        ],
+        "fwd": [
+          0,
+          -0.28595,
+          -0.95824
+        ]
+      },
+      "magWell": {
+        "pos": [
+          0,
+          -0.00429,
+          0.04731
+        ],
+        "axis": [
+          0,
+          0.99897,
+          0.04543
+        ]
+      },
+      "magLocalSeat": [
+        0,
+        -0.00429,
+        0.04731
+      ],
+      "slide": {
+        "travel": 0.07421,
+        "axis": [
+          0,
+          0,
+          1
+        ],
+        "rackPoint": [
+          0.03317,
+          0.01006,
+          -0.00986
+        ]
+      },
+      "trigger": {
+        "pivot": [
+          0,
+          -0.02892,
+          0.13839
+        ],
+        "axis": [
+          -1,
+          0,
+          0
+        ],
+        "pullRad": 0.293
+      },
+      "support": {
+        "pos": [
+          0,
+          -0.01134,
+          -0.11017
+        ]
+      },
+      "sights": {
+        "rear": [
+          0,
+          0.05057,
+          -0.00573
+        ],
+        "front": [
+          0,
+          0.05065,
+          -0.39118
+        ]
+      },
+      "bore": {
+        "radius": 0.00381
+      },
+      "selector": {
+        "pivot": [
+          0,
+          -0.01343,
+          0.16088
+        ],
+        "axis": [
+          -1,
+          0,
+          0
+        ],
+        "safe": 0,
+        "auto": 0.33,
+        "semi": 0.66,
+        "note": "positive angles move the lever down (safe -> auto -> semi); angles are typical values, not measured"
+      },
+      "magCatch": {
+        "pos": [
+          -0.00002,
+          -0.05519,
+          0.08853
+        ],
+        "axis": [
+          0,
+          0,
+          -1
+        ],
+        "travel": 0.004
+      },
+      "tris": 27991,
+      "parts": [
+        "static",
+        "carrier",
+        "trigger",
+        "selector",
+        "magCatch"
+      ],
+      "textures": {
+        "base": {
+          "size": [
+            2048,
+            2048
+          ],
+          "format": "KTX2 ETC1S sRGB",
+          "bytes": 658938
+        },
+        "normal": {
+          "size": [
+            2048,
+            2048
+          ],
+          "format": "KTX2 UASTC linear",
+          "bytes": 2713735
+        },
+        "orm": {
+          "size": [
+            1024,
+            1024
+          ],
+          "format": "KTX2 UASTC linear",
+          "bytes": 926934,
+          "channels": "R occlusion, G roughness, B metalness"
+        },
+        "gpuBytes": 9786776
+      }
+    }
+  },
+  "soldier": {
+    "height": 1.868,
+    "joints": {
+      "pelvis": "pelvis_02",
+      "spine": [
+        "spine_01_03",
+        "spine_02_04",
+        "spine_03_05"
+      ],
+      "neck": "neck_01_047",
+      "head": "head_048",
+      "clavL": "clavicle_l_06",
+      "upperArmL": "upperarm_l_07",
+      "lowerArmL": "lowerarm_l_08",
+      "handL": "hand_l_09",
+      "clavR": "clavicle_r_026",
+      "upperArmR": "upperarm_r_027",
+      "lowerArmR": "lowerarm_r_028",
+      "handR": "hand_r_029",
+      "thighL": "thigh_l_058",
+      "calfL": "calf_l_059",
+      "footL": "foot_l_061",
+      "thighR": "thigh_r_064",
+      "calfR": "calf_r_065",
+      "footR": "foot_r_067"
+    },
+    "jointCount": 62,
+    "rifleParent": "hand_r_029",
+    "rifleInHand": {
+      "pos": [
+        -0.21741,
+        -0.03387,
+        0.11971
+      ],
+      "quat": [
+        0.504357,
+        0.604568,
+        0.429436,
+        0.442388
+      ]
+    },
+    "rifleSupport": [
+      0,
+      -0.01134,
+      -0.11017
+    ],
+    "rifleMuzzle": [
+      0,
+      0,
+      -0.4323
+    ],
+    "rifleGrip": [
+      0,
+      -0.07731,
+      0.1885
+    ],
+    "bindPose": "A-pose; the rifle pose is fitted to the bind-pose right hand (fingers straight)",
+    "textures": {
+      "base": {
+        "size": [
+          1024,
+          1024
+        ],
+        "format": "KTX2 ETC1S sRGB",
+        "bytes": 194985
+      },
+      "normal": {
+        "size": [
+          1024,
+          1024
+        ],
+        "format": "KTX2 UASTC linear",
+        "bytes": 1142517
+      },
+      "orm": {
+        "size": [
+          1024,
+          1024
+        ],
+        "format": "KTX2 UASTC linear",
+        "bytes": 456527,
+        "channels": "G roughness, B metalness (no occlusion map)"
+      },
+      "rifleBase": {
+        "size": [
+          512,
+          512
+        ],
+        "format": "KTX2 ETC1S sRGB",
+        "bytes": 77549
+      },
+      "rifleOrm": {
+        "size": [
+          256,
+          256
+        ],
+        "format": "KTX2 UASTC linear",
+        "bytes": 66838
+      }
+    },
+    "tris": 13605,
+    "rifleTris": 3000
+  },
+  "sounds": {
+    "glockShot": [
+      "sounds/pistol1.mp3"
+    ],
+    "akShot": [
+      "sounds/ak1.mp3",
+      "sounds/ak2.mp3",
+      "sounds/ak3.mp3",
+      "sounds/ak4.mp3",
+      "sounds/ak5.mp3"
+    ],
+    "dry": [
+      "sounds/dry1.mp3",
+      "sounds/dry2.mp3",
+      "sounds/dry3.mp3",
+      "sounds/dry4.mp3",
+      "sounds/dry5.mp3",
+      "sounds/dry6.mp3",
+      "sounds/dry7.mp3",
+      "sounds/dry8.mp3"
+    ],
+    "dryReset": [
+      "sounds/dryReset1.mp3",
+      "sounds/dryReset2.mp3",
+      "sounds/dryReset3.mp3",
+      "sounds/dryReset4.mp3"
+    ],
+    "glockMagOut": [
+      "sounds/glkMagOut1.mp3",
+      "sounds/glkMagOut2.mp3"
+    ],
+    "glockMagIn": [
+      "sounds/glkMagIn1.mp3",
+      "sounds/glkMagIn2.mp3"
+    ],
+    "glockRackBack": [
+      "sounds/glkRackBack1.mp3",
+      "sounds/glkRackBack2.mp3"
+    ],
+    "glockRackFwd": [
+      "sounds/glkRackFwd1.mp3",
+      "sounds/glkRackFwd2.mp3"
+    ],
+    "glockSlideRel": [
+      "sounds/glkSlideRel.mp3"
+    ],
+    "akMagOut": [
+      "sounds/akMagOut1.mp3",
+      "sounds/akMagOut2.mp3",
+      "sounds/akMagOut3.mp3"
+    ],
+    "akMagIn": [
+      "sounds/akMagIn1.mp3"
+    ],
+    "akRackBack": [
+      "sounds/akRackBack1.mp3",
+      "sounds/akRackBack2.mp3",
+      "sounds/akRackBack3.mp3",
+      "sounds/akRackBack4.mp3"
+    ],
+    "akRackFwd": [
+      "sounds/akRackFwd1.mp3",
+      "sounds/akRackFwd2.mp3",
+      "sounds/akRackFwd3.mp3",
+      "sounds/akRackFwd4.mp3"
+    ],
+    "brassS": [
+      "sounds/brassS1.mp3",
+      "sounds/brassS2.mp3",
+      "sounds/brassS3.mp3",
+      "sounds/brassS4.mp3",
+      "sounds/brassS5.mp3"
+    ],
+    "brassM": [
+      "sounds/brassR1.mp3",
+      "sounds/brassR2.mp3",
+      "sounds/brassR3.mp3",
+      "sounds/brassR4.mp3"
+    ],
+    "holsterIn": [
+      "sounds/pickup2.mp3",
+      "sounds/pickup4.mp3",
+      "sounds/pickup6.mp3",
+      "sounds/pickup8.mp3"
+    ],
+    "holsterOut": [
+      "sounds/pickup1.mp3",
+      "sounds/pickup3.mp3",
+      "sounds/pickup5.mp3",
+      "sounds/pickup7.mp3",
+      "sounds/pickup9.mp3"
+    ],
+    "cloth": [
+      "sounds/cloth1.mp3",
+      "sounds/cloth2.mp3",
+      "sounds/cloth3.mp3",
+      "sounds/cloth4.mp3",
+      "sounds/cloth5.mp3",
+      "sounds/cloth6.mp3",
+      "sounds/cloth7.mp3"
+    ],
+    "enemyShot": [
+      "sounds/ak1.mp3",
+      "sounds/ak2.mp3",
+      "sounds/ak3.mp3",
+      "sounds/ak4.mp3",
+      "sounds/ak5.mp3"
+    ],
+    "impactWall": [
+      "sounds/impPla1.mp3",
+      "sounds/impPla2.mp3",
+      "sounds/impPla3.mp3",
+      "sounds/impPla4.mp3",
+      "sounds/impPla5.mp3"
+    ],
+    "impactFlesh": [
+      "sounds/impFle1.mp3",
+      "sounds/impFle2.mp3",
+      "sounds/impFle3.mp3",
+      "sounds/impFle4.mp3",
+      "sounds/impFle5.mp3"
+    ],
+    "grunt": [
+      "sounds/grunt1.mp3",
+      "sounds/grunt2.mp3",
+      "sounds/grunt3.mp3",
+      "sounds/grunt4.mp3",
+      "sounds/grunt5.mp3",
+      "sounds/grunt6.mp3",
+      "sounds/grunt7.mp3"
+    ],
+    "fall": [
+      "sounds/fall.mp3"
+    ],
+    "step": [
+      "sounds/step1.mp3",
+      "sounds/step2.mp3",
+      "sounds/step3.mp3"
+    ],
+    "magDrop": [
+      "sounds/magDrop1.mp3",
+      "sounds/magDrop2.mp3",
+      "sounds/magDrop3.mp3"
+    ]
+  },
+  "bytes": {
+    "models/glock.glb": 3570720,
+    "models/akm.glb": 4718912,
+    "models/soldier.glb": 2259104,
+    "sounds/pistol1.mp3": 9918,
+    "sounds/ak1.mp3": 15823,
+    "sounds/ak2.mp3": 15823,
+    "sounds/ak3.mp3": 15823,
+    "sounds/ak4.mp3": 15823,
+    "sounds/ak5.mp3": 15823,
+    "sounds/dry1.mp3": 2969,
+    "sounds/dry2.mp3": 3387,
+    "sounds/dry3.mp3": 4641,
+    "sounds/dry4.mp3": 3805,
+    "sounds/dry5.mp3": 5895,
+    "sounds/dry6.mp3": 3387,
+    "sounds/dry7.mp3": 2969,
+    "sounds/dry8.mp3": 2969,
+    "sounds/dryReset1.mp3": 2969,
+    "sounds/dryReset2.mp3": 2969,
+    "sounds/dryReset3.mp3": 2969,
+    "sounds/dryReset4.mp3": 2969,
+    "sounds/glkMagOut1.mp3": 5477,
+    "sounds/glkMagOut2.mp3": 5477,
+    "sounds/glkMagIn1.mp3": 4641,
+    "sounds/glkMagIn2.mp3": 4641,
+    "sounds/glkRackBack1.mp3": 4641,
+    "sounds/glkRackBack2.mp3": 3805,
+    "sounds/glkRackFwd1.mp3": 6313,
+    "sounds/glkRackFwd2.mp3": 5477,
+    "sounds/glkSlideRel.mp3": 6731,
+    "sounds/akMagOut1.mp3": 7985,
+    "sounds/akMagOut2.mp3": 7149,
+    "sounds/akMagOut3.mp3": 10493,
+    "sounds/akMagIn1.mp3": 8403,
+    "sounds/akRackBack1.mp3": 5477,
+    "sounds/akRackBack2.mp3": 4641,
+    "sounds/akRackBack3.mp3": 4641,
+    "sounds/akRackBack4.mp3": 9239,
+    "sounds/akRackFwd1.mp3": 5059,
+    "sounds/akRackFwd2.mp3": 7985,
+    "sounds/akRackFwd3.mp3": 8403,
+    "sounds/akRackFwd4.mp3": 9657,
+    "sounds/brassS1.mp3": 18852,
+    "sounds/brassS2.mp3": 15926,
+    "sounds/brassS3.mp3": 20524,
+    "sounds/brassS4.mp3": 14254,
+    "sounds/brassS5.mp3": 13000,
+    "sounds/brassR1.mp3": 20524,
+    "sounds/brassR2.mp3": 19270,
+    "sounds/brassR3.mp3": 18434,
+    "sounds/brassR4.mp3": 27211,
+    "sounds/pickup2.mp3": 9657,
+    "sounds/pickup4.mp3": 11746,
+    "sounds/pickup6.mp3": 10493,
+    "sounds/pickup8.mp3": 9239,
+    "sounds/pickup1.mp3": 7985,
+    "sounds/pickup3.mp3": 16344,
+    "sounds/pickup5.mp3": 12164,
+    "sounds/pickup7.mp3": 11328,
+    "sounds/pickup9.mp3": 9657,
+    "sounds/cloth1.mp3": 5895,
+    "sounds/cloth2.mp3": 5477,
+    "sounds/cloth3.mp3": 5895,
+    "sounds/cloth4.mp3": 5895,
+    "sounds/cloth5.mp3": 6313,
+    "sounds/cloth6.mp3": 6313,
+    "sounds/cloth7.mp3": 6731,
+    "sounds/impPla1.mp3": 7149,
+    "sounds/impPla2.mp3": 7985,
+    "sounds/impPla3.mp3": 6731,
+    "sounds/impPla4.mp3": 5059,
+    "sounds/impPla5.mp3": 7149,
+    "sounds/impFle1.mp3": 2969,
+    "sounds/impFle2.mp3": 2969,
+    "sounds/impFle3.mp3": 4641,
+    "sounds/impFle4.mp3": 4223,
+    "sounds/impFle5.mp3": 5895,
+    "sounds/grunt1.mp3": 5687,
+    "sounds/grunt2.mp3": 5687,
+    "sounds/grunt3.mp3": 5687,
+    "sounds/grunt4.mp3": 6941,
+    "sounds/grunt5.mp3": 5687,
+    "sounds/grunt6.mp3": 6000,
+    "sounds/grunt7.mp3": 11143,
+    "sounds/fall.mp3": 10076,
+    "sounds/step1.mp3": 3805,
+    "sounds/step2.mp3": 5477,
+    "sounds/step3.mp3": 3805,
+    "sounds/magDrop1.mp3": 10911,
+    "sounds/magDrop2.mp3": 6313,
+    "sounds/magDrop3.mp3": 10075
+  }
+}

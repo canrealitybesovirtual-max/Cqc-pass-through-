@@ -32,16 +32,6 @@ export function simplifyAbs(m, error, opt = {}) {
 }
 
 /**
- * Topology-free simplification (for distant LODs): reaches a triangle target
- * by clustering, ignoring seams. Used only when the regular simplifier stalls.
- * @param {MeshData} m @param {number} targetTris
- */
-export function simplifySloppy(m, targetTris) {
-  const [idx] = MeshoptSimplifier.simplifySloppy(m.idx, m.pos, 3, null, targetTris * 3, 1);
-  return compact({ ...m, idx: Uint32Array.from(idx) });
-}
-
-/**
  * Drop vertices no longer referenced.
  * @param {MeshData} m
  */

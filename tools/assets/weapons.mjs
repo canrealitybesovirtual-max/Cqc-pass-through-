@@ -10,7 +10,6 @@
  * models were authored: muzzle +Z, gun right = -X), measured with
  * tools/assets/inspect.mjs.
  */
-import { MeshoptSimplifier } from 'meshoptimizer';
 import {
   add, bounds, coneDirections, cross, dot, filterTriangles, fitCircle, fitLine, length, mat4Mul, normalize,
   rayTriangle, rot3FromFrames, roundVec, scale, sphereDirections, sub, weldByPosition,
@@ -18,7 +17,7 @@ import {
 import { markVisible, dilateVisible } from './lib/raster.mjs';
 import { packScaled, remapUV } from './lib/pack.mjs';
 import { concat, readDoc, readMaterials, readPieces } from './lib/source.mjs';
-import { weldAndSimplify, simplifySloppy } from './lib/simplify.mjs';
+import { weldAndSimplify } from './lib/simplify.mjs';
 import { composeAtlas, cropUV, encodeKTX2, gpuBytes, materialMaps, pixelWindow, resize, writePNG } from './lib/textures.mjs';
 import { atlasMaterial, finishGLB, meshFrom, newDoc } from './lib/output.mjs';
 
@@ -48,7 +47,7 @@ const set = (p, role, label) => { p.role = role; p.label = label; };
  * @property {(p: Piece, all: Piece[]) => void} classify
  * @property {number} triBudget          gun + magazine
  * @property {number} res                visibility raster resolution
- * @property {{ x: number, slideTravelMargin: number, ejectDir: V3, palmBelowGuard: number, magAxisTop?: number,
+ * @property {{ slideTravelMargin: number, ejectDir: V3, palmBelowGuard: number, triggerTravel: number, maxPullRad: number, magAxisTop?: number,
  *   catchAxis: V3, catchTravel: number }} tune
  * @property {string[]} partNames
  * @property {Record<string, number>} [errScale] simplification error factor per label (barely visible parts)
@@ -66,8 +65,9 @@ export const GLOCK = {
   triBudget: 26000,
   res: 1400,
   partNames: ['static', 'slide', 'trigger', 'slideStop', 'magCatch'],
-  errScale: { recoilSpring: 3 },
-  tune: { x: 0, slideTravelMargin: 0.0015, ejectDir: [1.5, 1.9, 0.8], palmBelowGuard: 0.02, catchAxis: [1, 0, 0], catchTravel: 0.0025 },
+  errScale: { recoilSpring: 3, innerCase: 5, innerBullet: 5 }, // rounds below the top one show only through the witness holes
+  // ejectDir: CQC's tested case velocity [1.5, 1.9, 0.8] m/s; triggerTravel: Glock factory spec 12.5 mm
+  tune: { slideTravelMargin: 0.0015, ejectDir: [1.5, 1.9, 0.8], palmBelowGuard: 0.015, triggerTravel: 0.0125, maxPullRad: 0.45, catchAxis: [1, 0, 0], catchTravel: 0.0025 },
   classify(p) {
     const [ex, ey, ez] = ext(p);
     const ax = Math.max(Math.abs(p.smin[0]), Math.abs(p.smax[0]));
@@ -89,7 +89,7 @@ export const GLOCK = {
     }
     if (p.src.startsWith('mag_full_')) {
       if (p.smin[1] > 119) return set(p, PART.DROP, 'chamberedRound');
-      if (p.idx.length / 3 === 540) return set(p, PART.MAG, ez < 13 ? 'bullet' : 'case');
+      if (p.idx.length / 3 === 540) return set(p, PART.MAG, `${p.smax[1] > 110 ? 'top' : 'inner'}${ez < 13 ? 'Bullet' : 'Case'}`);
       if (p.idx.length / 3 === 1284) return set(p, PART.MAG, 'magBody');
       return set(p, PART.MAG, 'magPart');
     }
@@ -108,7 +108,9 @@ export const AKM = {
   res: 2400,
   partNames: ['static', 'carrier', 'trigger', 'selector', 'magCatch'],
   errScale: { recoilSpring: 4, bolt: 2 },
-  tune: { x: 0, slideTravelMargin: 0.003, ejectDir: [0.85, 0.35, -0.4], palmBelowGuard: 0.02, magAxisTop: 0.045, catchAxis: [0, 0, -1], catchTravel: 0.004 },
+  // ejectDir: AKs throw cases hard to the right and slightly forward (not measurable from the model);
+  // triggerTravel: estimate (no factory figure for the AKM)
+  tune: { slideTravelMargin: 0.003, ejectDir: [0.85, 0.35, -0.4], palmBelowGuard: 0.015, triggerTravel: 0.006, maxPullRad: 0.3, magAxisTop: 0.045, catchAxis: [0, 0, -1], catchTravel: 0.004 },
   classify(p, all) {
     const [ex, , ez] = ext(p);
     const tris = p.idx.length / 3;
@@ -132,7 +134,7 @@ export const AKM = {
       case 'sel~0': return set(p, PART.SELECTOR, ex > 25 ? 'selectorAxle' : 'selector');
       case 'trig~0': return set(p, PART.TRIGGER, 'trigger');
       case 'mag~0': return set(p, PART.MAG, tris > 3000 ? 'magBody' : 'magPart');
-      case 'rounds~0': return set(p, PART.MAG, 'round');
+      case 'rounds~0': return set(p, PART.MAG, 'topRound');
       default: return set(p, PART.DROP, 'unknown');
     }
   },
@@ -268,27 +270,6 @@ export function measureBore(barrel) {
   return { fx, fy, zMuzzleEnd: z0, zBreechEnd: Number.isFinite(zb) ? zb : z1, sections: zs.length, span, radius: Math.min(...rr) };
 }
 
-/**
- * Distance from points moving along `dir` (or rotating) to the first obstacle
- * triangle; returns the minimum over points (Infinity when nothing is hit).
- * @param {V3[]} origins @param {(o: V3) => V3} dirOf
- * @param {Piece[]} obstacles @param {(hit: V3) => boolean} [accept]
- */
-function clearance(origins, dirOf, obstacles, accept = () => true) {
-  let best = Infinity;
-  for (const o of origins) {
-    const d = dirOf(o);
-    for (const p of obstacles) {
-      for (let t = 0; t < p.idx.length; t += 3) {
-        const a = p.pos.subarray(p.idx[t] * 3, p.idx[t] * 3 + 3), b = p.pos.subarray(p.idx[t + 1] * 3, p.idx[t + 1] * 3 + 3), c = p.pos.subarray(p.idx[t + 2] * 3, p.idx[t + 2] * 3 + 3);
-        const dist = rayTriangle(o, d, a, b, c);
-        if (dist > 0.0003 && dist < best && accept(add(o, scale(d, dist)))) best = dist;
-      }
-    }
-  }
-  return best;
-}
-
 /** Highest vertex of pieces near the centre plane: returns its y and the mean z of the top vertices. @param {Piece[]} ps @param {number} [halfWidth] */
 function sightTop(ps, halfWidth = 0.0035) {
   const pts = filterPts(points(ps), (x) => Math.abs(x) <= halfWidth);
@@ -297,6 +278,39 @@ function sightTop(ps, halfWidth = 0.0035) {
   let zs = 0, n = 0;
   for (let i = 0; i < pts.length; i += 3) if (pts[i + 1] > top - 0.0003) { zs += pts[i + 2]; n++; }
   return { y: top, z: zs / n };
+}
+
+/**
+ * First surface hit by a ray along +Z (from the front) or -Z (from the back) at (x, y).
+ * @param {Piece[]} ps @param {number} x @param {number} y @param {1 | -1} dz
+ */
+function castZ(ps, x, y, dz) {
+  const o = /** @type {V3} */ ([x, y, dz > 0 ? -2 : 2]), d = /** @type {V3} */ ([0, 0, dz]);
+  let best = Infinity;
+  for (const p of ps) {
+    for (let t = 0; t < p.idx.length; t += 3) {
+      const h = rayTriangle(o, d, p.pos.subarray(p.idx[t] * 3, p.idx[t] * 3 + 3), p.pos.subarray(p.idx[t + 1] * 3, p.idx[t + 1] * 3 + 3), p.pos.subarray(p.idx[t + 2] * 3, p.idx[t + 2] * 3 + 3));
+      if (h > 0 && h < best) best = h;
+    }
+  }
+  return best < Infinity ? o[2] + dz * best : NaN;
+}
+
+/**
+ * Centre line of an upright part (grip, magazine): midpoints of its front and
+ * back surfaces on the centre plane at n heights, fitted with a line.
+ * @param {Piece[]} ps @param {number} y0 @param {number} y1 @param {number} n
+ */
+function sectionLine(ps, y0, y1, n) {
+  /** @type {number[]} */
+  const c = [];
+  for (let i = 0; i < n; i++) {
+    const y = y0 + ((y1 - y0) * i) / (n - 1);
+    const zf = castZ(ps, 0, y, 1), zb = castZ(ps, 0, y, -1);
+    if (Number.isFinite(zf) && Number.isFinite(zb)) c.push(0, y, (zf + zb) / 2);
+  }
+  if (c.length < 6) throw new Error('sectionLine: the rays found too few sections');
+  return fitLine(Float32Array.from(c));
 }
 
 // --- the bake ----------------------------------------------------------------
@@ -409,20 +423,13 @@ function measure(def, ps) {
   for (let i = 2; i < near.length; i += 3) zm = Math.min(zm, near[i]);
   const muzzle = /** @type {V3} */ ([0, 0, zm]);
 
-  // magazine: insertion axis from slab centres of the body, origin at its top along the axis
+  // magazine: insertion axis through the body's front/back wall midpoints (the top section of a
+  // curved AK magazine), origin at the body's top along that axis
   const body = byLabel(mags, 'magBody');
   const bodyPts = points(body);
   const bb = bounds(bodyPts);
   const yTop = bb.max[1], yLow = def.tune.magAxisTop ? yTop - def.tune.magAxisTop : bb.min[1] + 0.012;
-  /** @type {number[]} */
-  const centres = [];
-  for (let y = yLow; y < yTop - 0.006; y += 0.003) {
-    const sl = filterPts(bodyPts, (_x, yy) => yy >= y && yy < y + 0.003);
-    if (sl.length < 9) continue;
-    const b = bounds(sl);
-    centres.push((b.min[0] + b.max[0]) / 2, y + 0.0015, (b.min[2] + b.max[2]) / 2);
-  }
-  const ml = fitLine(Float32Array.from(centres));
+  const ml = sectionLine(body, yLow, yTop - 0.008, 12);
   let magAxis = ml.dir[1] < 0 ? scale(ml.dir, -1) : ml.dir;
   magAxis = normalize([0, magAxis[1], magAxis[2]]); // the well is on the centre plane
   let proj = -Infinity;
@@ -445,20 +452,16 @@ function measure(def, ps) {
   } else {
     pivot = /** @type {V3} */ ([0, tb.max[1] - 0.003, (tb.min[2] + tb.max[2]) / 2]);
   }
-  // pull: how far the blade can rotate rearwards before it meets the frame (90 % of it)
+  // pull: the trigger travel at the finger's contact point (the blade's front face, 65 % of the
+  // way down from the pivot) turned into a rotation about the pivot. The models' trigger slots are
+  // closed shells, so the stop cannot be found by collision; the travel is a spec value (tune).
   const axis = /** @type {V3} */ ([-1, 0, 0]);
-  /** @type {V3[]} */
-  const blade = [];
-  for (const p of trigger) for (let i = 0; i < p.pos.length; i += 3) if (p.pos[i + 1] < pivot[1] - 0.008) blade.push([p.pos[i], p.pos[i + 1], p.pos[i + 2]]);
-  const rotDir = (/** @type {V3} */ q) => normalize(cross(axis, sub(q, pivot)));
-  const guardAndGrip = statics.filter((p) => !/Pin|Spring/.test(p.label || ''));
-  let minAngle = Infinity;
-  for (const q of blade.filter((_, i) => i % 3 === 0)) {
-    const r = Math.hypot(q[1] - pivot[1], q[2] - pivot[2]);
-    const d = clearance([q], rotDir, guardAndGrip, (h) => h[1] < pivot[1] - 0.004);
-    if (d < Infinity) minAngle = Math.min(minAngle, d / r);
-  }
-  const pullRad = Math.min(0.6, Math.max(0.12, Number.isFinite(minAngle) ? 0.9 * minAngle : 0.35));
+  const tPts = points(trigger);
+  const yc = pivot[1] - 0.65 * (pivot[1] - tb.min[1]);
+  let zc = Infinity;
+  for (let i = 0; i < tPts.length; i += 3) if (Math.abs(tPts[i + 1] - yc) < 0.003) zc = Math.min(zc, tPts[i + 2]);
+  const rContact = Math.hypot(yc - pivot[1], zc - pivot[2]);
+  const pullRad = Math.min(def.tune.maxPullRad, def.tune.triggerTravel / rContact);
 
   // trigger guard bottom: lowest static point directly under the trigger
   const under = filterPts(points(statics), (x, y, z) => Math.abs(x) < 0.005 && y < tb.min[1] && z > tb.min[2] && z < tb.max[2]);
@@ -466,23 +469,11 @@ function measure(def, ps) {
   for (let i = 1; i < under.length; i += 3) guardBottom = Math.min(guardBottom, under[i]);
   if (!Number.isFinite(guardBottom)) guardBottom = tb.min[1] - 0.008;
 
-  // grip axis: Glock = slab centres of the frame below the guard; AKM = principal axis of the pistol grip
-  let gripLine;
-  if (isAk) {
-    gripLine = fitLine(points(byLabel(statics, 'grip')));
-  } else {
-    const frame = points(byLabel(statics, 'frame'));
-    const fb = bounds(frame);
-    /** @type {number[]} */
-    const gc = [];
-    for (let y = fb.min[1] + 0.012; y < guardBottom - 0.004; y += 0.003) {
-      const sl = filterPts(frame, (x, yy) => yy >= y && yy < y + 0.003 && Math.abs(x) < 0.02);
-      if (sl.length < 9) continue;
-      const b = bounds(sl);
-      gc.push(0, y + 0.0015, (b.min[2] + b.max[2]) / 2);
-    }
-    gripLine = fitLine(Float32Array.from(gc));
-  }
+  // grip axis: midpoints between the front and back strap surfaces (rays on the centre plane)
+  // from just above the butt to just under the guard
+  const gripPieces = byLabel(statics, isAk ? 'grip' : 'frame');
+  const gb = bounds(points(gripPieces));
+  const gripLine = sectionLine(gripPieces, gb.min[1] + 0.012, Math.min(guardBottom, gb.max[1]) - 0.006, 10);
   let up = gripLine.dir[1] < 0 ? scale(gripLine.dir, -1) : gripLine.dir;
   up = normalize([0, up[1], up[2]]);
   const palmY = guardBottom - def.tune.palmBelowGuard;
@@ -491,7 +482,7 @@ function measure(def, ps) {
   const fwd = normalize(sub([0, 0, -1], scale(up, dot([0, 0, -1], up))));
 
   // slide / carrier travel: the breech face must pass the rear of the top round (+ overtravel)
-  const rounds = mags.filter((p) => /round|case/.test(p.label || ''));
+  const rounds = mags.filter((p) => /Case$|Round$/.test(p.label || ''));
   let topRound = rounds[0];
   for (const r of rounds) if (bounds(r.pos).max[1] > bounds(topRound.pos).max[1]) topRound = r;
   const topY = bounds(topRound.pos).max[1];
@@ -515,7 +506,8 @@ function measure(def, ps) {
   // ejection port: where the case sits when the extractor pulls it out (half a case ahead of the breech face)
   const caseLen = isAk ? 0.0388 : 0.01915; // 7.62x39 / 9x19 case lengths
   const portZ = -caseLen / 2, portY = isAk ? 0.004 : 0.004;
-  const side = filterPts(points(isAk ? [...byLabel(statics, 'receiver'), ...byLabel(statics, 'dustCover')] : slide), (_x, y, z) => Math.abs(y - portY) < 0.004 && Math.abs(z - portZ) < 0.006);
+  // x: the outer right side of the slide / receiver at that height (the port itself is an opening)
+  const side = filterPts(points(isAk ? [...byLabel(statics, 'receiver'), ...byLabel(statics, 'dustCover')] : slide), (_x, y) => Math.abs(y - portY) < 0.006);
   const portX = bounds(side).max[0];
   const ejectionPort = /** @type {V3} */ ([portX, portY, portZ]);
 
@@ -539,11 +531,8 @@ function measure(def, ps) {
   // support hand (AKM): centre of the lower handguard's section at mid-length
   let support;
   if (isAk) {
-    const hg = points(byLabel(statics, 'handguardLower'));
-    const hb = bounds(hg);
-    const zMid = (hb.min[2] + hb.max[2]) / 2;
-    const sl = bounds(filterPts(hg, (_x, _y, z) => Math.abs(z - zMid) < 0.005));
-    support = { pos: roundVec([0, (sl.min[1] + sl.max[1]) / 2, zMid]) };
+    const hb = bounds(points(byLabel(statics, 'handguardLower')));
+    support = { pos: roundVec([0, (hb.min[1] + hb.max[1]) / 2, (hb.min[2] + hb.max[2]) / 2]) };
   }
 
   // extras for the moving parts that the contract leaves to the view
@@ -577,7 +566,7 @@ function measure(def, ps) {
   };
   return {
     manifest, magWell: { pos: magOrigin, axis: magAxis }, slide: { travel },
-    debug: { guardBottom, palmY, caseHead, minAngle, pins: pins.map((p) => p.label) },
+    debug: { guardBottom, palmY, caseHead, rContact, pins: pins.map((p) => p.label) },
   };
 }
 
@@ -795,4 +784,3 @@ export function rifleMesh(src, budget) {
   return concat(r.pieces);
 }
 
-export { MeshoptSimplifier };

@@ -74,7 +74,7 @@ export async function finishGLB(doc) {
   await MeshoptEncoder.ready;
   await doc.transform(
     reorder({ encoder: MeshoptEncoder, target: 'size' }),
-    quantize({ pattern: /^(NORMAL|TANGENT|TEXCOORD_0|WEIGHTS_0)$/, quantizeNormal: 12, quantizeTexcoord: 16, quantizeWeight: 16, normalizeWeights: true }),
+    quantize({ pattern: /^(NORMAL|TANGENT|TEXCOORD_0|WEIGHTS_0|JOINTS_0)$/, quantizeNormal: 12, quantizeTexcoord: 16, quantizeWeight: 16, normalizeWeights: true }),
   );
   doc.createExtension(KHRMeshQuantization).setRequired(true);
   doc.createExtension(EXTMeshoptCompression).setRequired(true).setEncoderOptions({ method: EXTMeshoptCompression.EncoderMethod.FILTER });

@@ -23,7 +23,12 @@ scene.add(holder);
 
 const assets = new Assets({ renderer, base: '../../assets/', transcoderPath: '../../vendor/three/addons/libs/basis/' });
 /** @type {any} */ (window).__progress = [];
-await assets.load((f, l) => /** @type {any} */ (window).__progress.push([+f.toFixed(3), l]));
+try {
+  await assets.load((f, l) => /** @type {any} */ (window).__progress.push([+f.toFixed(3), l]));
+} catch (e) {
+  /** @type {any} */ (window).__failed = String(e);
+  throw e;
+}
 const M = assets.manifest;
 
 /** Info about the loaded textures (format chosen by the KTX2 transcoder). */
@@ -48,14 +53,14 @@ function frame(obj, dir, fit = 1.15, focus) {
 
 /** @param {number[]} p @param {number} color @param {number} r */
 function dot(p, color, r) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true }));
   m.position.fromArray(p); m.renderOrder = 10;
   return m;
 }
 /** @param {number[]} a @param {number[]} dir @param {number} len @param {number} color */
 function ray(a, dir, len, color) {
   const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3().fromArray(a), new THREE.Vector3().fromArray(a).addScaledVector(new THREE.Vector3().fromArray(dir), len)]);
-  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color, depthTest: false })); l.renderOrder = 10;
+  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true })); l.renderOrder = 10;
   return l;
 }
 
@@ -126,8 +131,9 @@ function weaponView(id, view) {
   } else if (view === 'markers') {
     const g = m.scene.clone(true);
     g.traverse((/** @type {any} */ o) => { if (o.isMesh) { o.material = o.material.clone(); o.material.transparent = true; o.material.opacity = 0.45; o.material.depthWrite = false; } });
-    root.add(g, markers(w, r));
+    root.add(g);
     frame(root, right);
+    root.add(markers(w, r));
   } else if (view === 'muzzle') {
     root.add(m.scene);
     frame(root, new THREE.Vector3(0.05, 0.02, -1), 0.5, new THREE.Vector3().fromArray(w.muzzle));

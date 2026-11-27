@@ -8,10 +8,10 @@
  * decimated AKM) is parented to the right hand joint.
  */
 import {
-  add, cross, mat4Compose, mat4Decompose, mat4Invert, mat4Mul, normalize, quatFromRot3, rot3FromFrames, roundVec, scale, sub, dot,
+  add, cross, mat4Compose, mat4Decompose, mat4Invert, mat4Mul, normalize, rot3FromFrames, roundVec, scale, sub, dot,
 } from './lib/geom.mjs';
 import { readDoc, readMaterials } from './lib/source.mjs';
-import { decodeRGBA, encodeKTX2, gpuBytes, materialMaps, resize } from './lib/textures.mjs';
+import { encodeKTX2, gpuBytes, materialMaps, resize } from './lib/textures.mjs';
 import { atlasMaterial, finishGLB, meshFrom, newDoc } from './lib/output.mjs';
 
 /** @typedef {[number, number, number]} V3 */
@@ -192,4 +192,3 @@ export async function bakeSoldier(env, rifle) {
   return { glb, manifest, report };
 }
 
-export { quatFromRot3, decodeRGBA };

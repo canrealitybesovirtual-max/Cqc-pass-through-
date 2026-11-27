@@ -28,6 +28,8 @@ let code = 0;
 try {
   await page.goto(`http://localhost:${port}/tools/assets/check.html`);
   await page.waitForFunction(() => window.__ready || window.__failed, null, { timeout: 120000 });
+  const failed = await page.evaluate(() => window.__failed);
+  if (failed) throw new Error(failed);
   const report = await page.evaluate(() => window.__report);
   const progress = await page.evaluate(() => window.__progress);
   const views = {};

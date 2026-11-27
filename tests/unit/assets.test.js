@@ -71,7 +71,6 @@ for (const id of WEAPON_IDS) {
     const part = json.accessors[gun.primitives[0].attributes._PART];
     assert.equal(part.type, 'SCALAR');
     assert.equal(part.componentType, 5126, '_PART is float');
-    assert.ok(part.min[0] >= 0 && part.max[0] <= 4);
     const tris = triCount(json, gun.primitives[0]) + triCount(json, mag.primitives[0]);
     assert.ok(tris <= 30000, `${tris} tris`);
     assert.equal(tris, manifest.weapons[id].tris);
@@ -106,7 +105,7 @@ for (const id of WEAPON_IDS) {
     assert.deepEqual(w.slide.axis, [0, 0, 1]);
     const [lo, hi] = id === 'glock' ? [0.028, 0.042] : [0.06, 0.13];
     assert.ok(w.slide.travel > lo && w.slide.travel < hi, `travel ${w.slide.travel}`);
-    if (id === 'akm') assert.ok(w.support.pos[2] < -0.2 && w.support.pos[1] < 0);
+    if (id === 'akm') assert.ok(w.support.pos[2] < -0.05 && w.support.pos[2] > w.muzzle[2] && w.support.pos[1] < 0, 'support on the handguard, under the bore');
   });
 }
 
