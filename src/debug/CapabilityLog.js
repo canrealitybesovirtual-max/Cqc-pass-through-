@@ -55,10 +55,13 @@ export function collectSession(rec, session, renderer, gl, att) {
   g.supportedFrameRates = frameRates(session);
   g.frameRate = s.frameRate ?? null;
   const depthOn = att.enabled.includes('depth-sensing');
-  g.depthUsage = depthOn ? s.depthUsage ?? null : null;
-  g.depthDataFormat = depthOn ? s.depthDataFormat ?? null : null;
-  g.depthType = depthOn ? s.depthType ?? null : null;
-  g.depthAttributesWithoutFeature = !depthOn && s.depthUsage != null; // Quest exposes them regardless
+  // The spec (and upstream Chromium) throw InvalidStateError on these when depth is not enabled.
+  /** @param {string} k */
+  const read = (k) => { try { return s[k] ?? null; } catch (e) { return `throws ${e && /** @type {any} */ (e).name ? /** @type {any} */ (e).name : e}`; } };
+  g.depthUsage = depthOn ? read('depthUsage') : null;
+  g.depthDataFormat = depthOn ? read('depthDataFormat') : null;
+  g.depthType = depthOn ? read('depthType') : null;
+  g.depthAttributesWithoutFeature = depthOn ? null : read('depthUsage'); // what the attribute says without the feature
   g.initiateRoomCapture = typeof s.initiateRoomCapture === 'function';
   g.persistentAnchors = 'persistentAnchors' in s;
   g.requestLightProbe = typeof s.requestLightProbe === 'function';

@@ -12,6 +12,7 @@ import { errText, frameRates, nextRate } from '../xr/XRSession.js';
  *   A                     60 s frame-timing run at the current rate
  *   B                     next refresh rate
  *   X (left)              toggle explicit clear (depth sessions)
+ *   Y (left)              show / hide the depth picture (depth sessions)
  *   both grips 1 s        end the session
  */
 
@@ -29,9 +30,10 @@ export class Probes {
   /**
    * @param {{ rec: SessionRecord, mode: string, input: import('../xr/Input.js').Input,
    *   draw: import('./DebugDraw.js').DebugDraw, perf: import('./PerfMonitor.js').PerfMonitor,
-   *   loop: import('../app/Loop.js').Loop, renderer: any, session: XRSession, space: XRReferenceSpace }} o
+   *   loop: import('../app/Loop.js').Loop, renderer: any, session: XRSession, space: XRReferenceSpace,
+   *   liveDepth?: import('../xr/LiveDepth.js').LiveDepth|null, depthView?: import('./DepthView.js').DepthView|null }} o
    */
-  constructor({ rec, mode, input, draw, perf, loop, renderer, session, space }) {
+  constructor({ rec, mode, input, draw, perf, loop, renderer, session, space, liveDepth = null, depthView = null }) {
     this.rec = rec;
     this.mode = mode;
     this.input = input;
@@ -41,6 +43,8 @@ export class Probes {
     this.renderer = renderer;
     this.session = session;
     this.space = space;
+    this.liveDepth = liveDepth;
+    this.depthView = depthView;
     this.enabled = /** @type {string[]} */ (rec.granted.enabledFeatures || []);
     /** Bumped whenever something shown on the HUD changes. */
     this.rev = 1;
@@ -179,6 +183,7 @@ export class Probes {
     if (inp.right.aDown) this.toggleRun();
     if (inp.right.bDown) this.cycleRate();
     if (inp.left.aDown) this.toggleClear();
+    if (inp.left.bDown) this.toggleDepthView();
     if (inp.left.squeeze > 0.8 && inp.right.squeeze > 0.8) {
       this.gripHold += dt;
       if (this.gripHold > 1 && !this.ended) {
@@ -423,6 +428,11 @@ export class Probes {
     const m = di.normDepthBufferFromNormView && di.normDepthBufferFromNormView.matrix;
     let identity = null;
     if (m) { identity = true; for (let i = 0; i < 16; i++) if (Math.abs(m[i] - (i % 5 === 0 ? 1 : 0)) > 1e-4) identity = false; }
+    // three samples layer 0 for the left eye and layer 1 for the right: check the second view's layer
+    let imageIndex1 = null;
+    if (vp.views.length > 1) {
+      try { const d1 = this.renderer.xr.getBinding().getDepthInformation(vp.views[1]); imageIndex1 = d1 && d1.imageIndex !== undefined ? d1.imageIndex : null; } catch { imageIndex1 = 'threw'; }
+    }
     this.rec.probes.depth = {
       state: 'ok',
       atFrame: this.depthTries,
@@ -434,7 +444,11 @@ export class Probes {
       depthNear: di.depthNear ?? null,
       depthFar: di.depthFar === Infinity ? 'Infinity' : di.depthFar ?? null,
       normDepthBufferFromNormViewIdentity: identity,
+      views: vp.views.length,
+      imageIndex1,
       threeHasDepthSensing: this.renderer.xr.hasDepthSensing(),
+      cameraNear: this.renderer.xr.getCamera().near,
+      cameraFar: this.renderer.xr.getCamera().far === Infinity ? 'Infinity' : this.renderer.xr.getCamera().far,
     };
     this.depthDone = true;
     this.rev++;
@@ -507,8 +521,20 @@ export class Probes {
   toggleClear() {
     this.loop.explicitClear = !this.loop.explicitClear;
     this.rec.probes.clear.explicit = this.loop.explicitClear;
-    this.rec.probes.clear.toggles.push({ atMs: Math.round(performance.now()), explicit: this.loop.explicitClear });
+    const xr = this.renderer.xr;
+    if (this.rec.probes.clear.toggles.length < 40) {
+      this.rec.probes.clear.toggles.push({ atMs: this.t0 >= 0 ? Math.round(performance.now() - this.t0) : 0, explicit: this.loop.explicitClear,
+        hasDepthSensing: xr.hasDepthSensing(), depthQuad: xr.hasDepthSensing() && !!xr.getDepthSensingMesh() });
+    }
     this.event(`explicit clear ${this.loop.explicitClear ? 'on' : 'off'}`);
+  }
+
+  toggleDepthView() {
+    const v = this.depthView;
+    if (!v) return;
+    if (!this.renderer.xr.hasDepthSensing()) { this.event('depth picture: no depth data yet'); return; }
+    v.toggle(!v.on, this.renderer.xr.getCamera());
+    this.event(`depth picture ${v.on ? 'on' : 'off'}`);
   }
 
   /** @param {string} msg */
@@ -548,9 +574,11 @@ export class Probes {
     const A = P.anchor;
     out.push(`${A.state === 'ok' ? '✓' : A.state === 'pending' || A.state === 'created' ? '•' : '!'} Anchor in ${g.referenceSpace}: ${A.state}${A.framesToPose ? ` (pose after ${A.framesToPose} frames)` : ''}`);
     if (r.mode === 'probe') {
-      const D = P.depth;
+      const D = P.depth, LD = this.liveDepth;
       const dOn = (g.enabledFeatures || []).includes('depth-sensing');
-      out.push(D ? `${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear} · clear ${this.loop.explicitClear ? 'ON' : 'OFF'} [X]` : D.state}` : `• Depth: ${dOn ? 'waiting…' : 'not granted'}`);
+      if (LD && LD.active && LD.valid > 0) out.push(`✓ ${LD.line()} · clear ${this.loop.explicitClear ? 'ON' : 'OFF'} [X] · picture [Y]`);
+      else if (LD && !LD.active && dOn) out.push(`! ${LD.line()}`);
+      else out.push(D ? `${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear}` : D.state}` : `• Depth: ${dOn ? (LD ? LD.line() : 'waiting…') : 'not granted'}`);
       const L = P.light, B = P.body;
       out.push(`• Light: ${L ? (L.estimate ? (typeof L.estimate === 'string' ? L.estimate : 'estimate ✓') : L.probe) : '-'} · Body: ${B ? (B.firstBody ? `✓ ${B.firstBody.joints} joints` : B.granted ? 'waiting…' : 'not granted') : '-'}`);
     }
@@ -568,7 +596,10 @@ export class Probes {
     if (this.perf.running) out.push(`• Timing run: ${Math.floor(this.perf.runElapsed())}/60 s at ${Math.round(this.perf.hz)} Hz — stay still`);
     else if (L) out.push(`${L.pass ? '✓' : '!'} Last run ${L.label}: CPU p99 ${L.cpu.p99} ms (${L.cpuP99PctOfPeriod}%) · missed ${L.missedPct}% · ${L.pass ? 'PASS' : 'FAIL'}`);
     else out.push('• Timing run: press A (60 s)');
-    out.push(`[A] 60 s timing  [B] next rate  [X] clear  [both grips 1 s] exit`);
+    if (this.input.hands > 0 && !this.input.left.present && !this.input.right.present) {
+      out.push('! Hands only: pick up the controllers (or open the Meta menu to exit)');
+    }
+    out.push(`[A] 60 s timing  [B] next rate  [X] clear${this.mode === 'probe' ? '  [Y] depth picture' : ''}  [both grips 1 s] exit`);
     return out;
   }
 }

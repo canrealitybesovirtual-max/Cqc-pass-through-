@@ -6,21 +6,25 @@
  * (once per distinct message) and never stops the loop.
  */
 
-/** @typedef {{ name: string, update: (dt: number, t: number, frame: XRFrame) => void }} System */
+/** @typedef {{ name: string, update: (dt: number, t: number, frame: XRFrame, ctx: any) => void }} System */
 
 export class Loop {
   /**
    * Start the loop BEFORE `renderer.xr.setSession`: three.js stops its window
    * rAF loop on 'sessionstart', so the callback then runs only from XR frames.
    * @param {{ renderer: any, scene: any, camera: any, perf: import('../debug/PerfMonitor.js').PerfMonitor,
-   *   onError: (msg: string) => void }} o
+   *   onError: (msg: string) => void, ctx?: any, liveDepth?: import('../xr/LiveDepth.js').LiveDepth|null }} o
+   *   ctx: the shared runtime context passed to every system (CONTRACTS "Ctx"; null in probe sessions);
+   *   liveDepth: keeps three's depth texture current, updated just before each render.
    */
-  constructor({ renderer, scene, camera, perf, onError }) {
+  constructor({ renderer, scene, camera, perf, onError, ctx = null, liveDepth = null }) {
     this.renderer = renderer;
     this.scene = scene;
     this.camera = camera;
     this.perf = perf;
     this.onError = onError;
+    this.ctx = ctx;
+    this.liveDepth = liveDepth;
     /** @type {System[]} */ this.systems = [];
     /** @type {number[]} */ this.sysIdx = [];
     this.renderIdx = perf.systems.indexOf('render');
@@ -80,12 +84,13 @@ export class Loop {
     for (let i = 0; i < this.systems.length; i++) {
       if (!this.active) return; // session ended during this frame: the XRFrame is dead
       p.begin(this.sysIdx[i]);
-      try { this.systems[i].update(dt, t, frame); } catch (e) { this.fail(this.systems[i].name, e); }
+      try { this.systems[i].update(dt, t, frame, this.ctx); } catch (e) { this.fail(this.systems[i].name, e); }
       p.end(this.sysIdx[i]);
     }
     if (!this.active) return;
     p.begin(this.renderIdx);
     try {
+      if (this.liveDepth !== null) this.liveDepth.update(r);
       if (this.explicitClear && r.xr.isPresenting && r.xr.hasDepthSensing()) r.clear();
       r.render(this.scene, this.camera);
     } catch (e) { this.fail('render', e); }

@@ -11,6 +11,22 @@ import * as THREE from 'three';
 export class CanvasPanel {
   /** @param {{ width?: number, height?: number, worldWidth?: number }} [o] */
   constructor({ width = 1024, height = 640, worldWidth = 0.56 } = {}) {
+    /**
+     * Turn the panel's spot this far (radians, + = left) from straight ahead, so it
+     * never sits between the eyes and what is straight ahead (the probe cube).
+     */
+    this.yawOffset = 0;
+    /**
+     * Hide while the head moves faster than 0.35 m/s (walking: the panel must not
+     * cover door jambs and furniture); shown again after 0.5 s slower. The caller
+     * then shows/hides the panel with `shown`, not `mesh.visible`.
+     */
+    this.autoHide = false;
+    this.shown = true;
+    this._speed = 0;
+    this._still = 0;
+    this._lastX = NaN;
+    this._lastZ = NaN;
     this.canvas = document.createElement('canvas');
     this.canvas.width = width;
     this.canvas.height = height;
@@ -34,6 +50,16 @@ export class CanvasPanel {
     this._fwd = new THREE.Vector3();
     this._target = new THREE.Vector3();
     this._look = new THREE.Vector3();
+  }
+
+  /** New session: place it afresh in front of the head, shown at once. */
+  restart() {
+    this.placed = false;
+    this._moving = false;
+    this._speed = 0;
+    this._still = 0.5;
+    this._lastX = NaN;
+    this._lastZ = NaN;
   }
 
   /** @param {string[]} lines */
@@ -78,10 +104,12 @@ export class CanvasPanel {
    * @param {number} dt
    */
   follow(cam, dt) {
+    if (this.autoHide) this._walkHide(cam, dt);
     const f = this._fwd.set(0, 0, -1).applyQuaternion(cam.quaternion);
     f.y = 0;
     if (f.lengthSq() < 1e-6) return;
     f.normalize();
+    if (this.yawOffset !== 0) f.applyAxisAngle(UP, this.yawOffset);
     const t = this._target.copy(cam.position).addScaledVector(f, 0.8);
     t.y = cam.position.y - 0.22;
     const p = this.mesh.position;
@@ -93,7 +121,28 @@ export class CanvasPanel {
     }
     this.mesh.lookAt(this._look.copy(cam.position));
   }
+
+  /**
+   * @param {THREE.Camera} cam
+   * @param {number} dt
+   */
+  _walkHide(cam, dt) {
+    const x = cam.position.x, z = cam.position.z;
+    if (dt > 0 && this._lastX === this._lastX) {
+      const v = Math.hypot(x - this._lastX, z - this._lastZ) / dt;
+      this._speed += (Math.min(v, 5) - this._speed) * (1 - Math.exp(-dt * 6));
+    }
+    this._lastX = x;
+    this._lastZ = z;
+    if (this._speed > 0.35) this._still = 0;
+    else this._still += dt;
+    const vis = this.shown && this._still >= 0.5;
+    if (vis && !this.mesh.visible) this.placed = false; // re-place in front, no slide across the room
+    this.mesh.visible = vis;
+  }
 }
+
+const UP = new THREE.Vector3(0, 1, 0);
 
 /**
  * Shrinks a line horizontally when it is too wide instead of cutting it off.

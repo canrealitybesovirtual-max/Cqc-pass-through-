@@ -18,6 +18,7 @@ export class Diagnostics {
       if (raw) {
         const old = JSON.parse(raw);
         if (old && Array.isArray(old.sessions)) this.data.sessions = old.sessions.slice(-MAX_SESSIONS);
+        if (old && Array.isArray(old.pageErrors)) this.data.pageErrors = old.pageErrors.slice(-50);
       }
     } catch { /* storage blocked or corrupt: start fresh */ }
   }
@@ -31,11 +32,13 @@ export class Diagnostics {
 
   /** @param {string} msg */
   pageError(msg) {
-    if (this.data.pageErrors.length < 50) this.data.pageErrors.push(`${new Date().toISOString()} ${msg}`);
+    const E = this.data.pageErrors;
+    E.push(`${new Date().toISOString()} ${this.data.version} ${msg}`);
+    if (E.length > 50) E.shift(); // keep the latest (older builds' errors drop out first)
   }
 
   save() {
-    try { localStorage.setItem(KEY, JSON.stringify({ sessions: this.data.sessions })); } catch { /* quota or blocked */ }
+    try { localStorage.setItem(KEY, JSON.stringify({ sessions: this.data.sessions, pageErrors: this.data.pageErrors })); } catch { /* quota or blocked */ }
   }
 
   clear() {
