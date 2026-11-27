@@ -4,7 +4,7 @@ import { getDef } from './WeaponDefs.js';
 import { WeaponInstance, CHAMBER_LIVE, HOME_RACK, HOME_RELEASE } from './WeaponInstance.js';
 import { Recoil } from './Recoil.js';
 import { WeaponView } from './WeaponView.js';
-import { WeaponFX } from './WeaponFX.js';
+import { WeaponFX, Rng } from './WeaponFX.js';
 import { BodyEstimator } from '../player/BodyEstimator.js';
 import {
   Carry, GrabSense, SLOTS, arcPoint, pointDist, segmentDist,
@@ -207,7 +207,7 @@ export class WeaponSystem {
     this.now = 0;
     /** @type {any} */
     this.ctx = ctx;
-    this.rand = (opts.seed ?? 0x51ed2701) | 0 || 1;
+    this.rng = new Rng(opts.seed ?? 0x51ed2701);
 
     /** One reused hit record (CONTRACTS "Hit"). */
     this.hit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, kind: 'none', surface: '', enemy: -1, part: '' };
@@ -240,10 +240,10 @@ export class WeaponSystem {
     this._readHand(this.R, I ? I.right : null, dt);
 
     const P = ctx.player || null, body = this.body;
-    if (P && P.eye && P.quat && P.valid !== false) body.setHead(P.eye.x, P.eye.y, P.eye.z, P.quat.x, P.quat.y, P.quat.z, P.quat.w);
-    body.setHand(LEFT, this.L.ok, this.L.pos.x, this.L.pos.y, this.L.pos.z, false);
-    body.setHand(RIGHT, this.R.ok, this.R.pos.x, this.R.pos.y, this.R.pos.z, this.held !== null);
-    body.update(dt, P && Number.isFinite(P.floorY) ? P.floorY : 0, P && P.standEye > 0 ? P.standEye : 1.65);
+    if (P && P.eye && P.quat && P.valid !== false) body.setHead(P.eye, P.quat);
+    body.setHand(LEFT, this.L.ok, this.L.pos, false);
+    body.setHand(RIGHT, this.R.ok, this.R.pos, this.held !== null);
+    body.update(dt, P);
     this._slotFrames();
 
     for (let i = 0; i < this.weapons.length; i++) {
@@ -335,15 +335,16 @@ export class WeaponSystem {
     if (!w) {
       if (!R.ok || !this.body.valid) { R.sense.inside = 0; return; }
       /** @type {Weapon|null} */
-      let best = null, bestD = Infinity;
+      let best = null, bestD = Infinity, entered = false;
       for (let i = 0; i < this.weapons.length; i++) {
         const x = this.weapons[i];
         const d = x.carry.grabbable ? this._grabDist(x, R.pos) : Infinity;
         const near = d <= SLOTS.grabReach;
-        if (R.sense.enter(x.bit, near)) this._pulse(RIGHT, SLOTS.tick);
+        if (R.sense.enter(x.bit, near)) entered = true;
         if (near && d < bestD) { best = x; bestD = d; }
       }
-      if (best && R.sense.wantsGrab) this._draw(best);
+      if (best && R.sense.wantsGrab) this._draw(best);   // the draw's own pulse, not the entry tick
+      else if (entered) this._pulse(RIGHT, SLOTS.tick);
       return;
     }
     if (!w.carry.inHand) { this.held = null; return; }
@@ -584,7 +585,7 @@ export class WeaponSystem {
     const trig = s ? s.trigger : 0;
     v.toWorld(v.muzzle, _v);
     v.dirWorld(_ZN, _v2);
-    const atThigh = this.body.valid && boreAtThighs(_v.x, _v.y, _v.z, _v2.x, _v2.y, _v2.z, this.body.thighs);
+    const atThigh = this.body.valid && boreAtThighs(_v, _v2, this.body.thighs);
     _v3.copy(v.muzzle).applyQuaternion(w.sq).add(w.sp);
     const open = w.gate.update(trig, _v.distanceTo(_v3), atThigh);
     inst.setTrigger(open && w.carry.state === CARRY_HAND && !this.paused ? trig : 0);
@@ -662,7 +663,7 @@ export class WeaponSystem {
     const v = w.view, ctx = this.ctx, fit = w.fit;
     // muzzle and shot direction (zeroed bore line plus mechanical dispersion)
     v.toWorld(v.muzzle, _v);
-    const r = fit.spread * Math.sqrt(this.random()), a = this.random() * Math.PI * 2;
+    const R = this.rng.fill(2), r = fit.spread * Math.sqrt(R[0]), a = R[1] * Math.PI * 2;
     _v2.copy(v.shotDir).addScaledVector(_XA, r * Math.cos(a)).addScaledVector(_YA, r * Math.sin(a)).normalize();
     v.dirWorld(_v2, _v2);
     const E = this.shotEv;
@@ -705,7 +706,7 @@ export class WeaponSystem {
   _eject(w, _live) {
     const v = w.view, fit = w.fit;
     v.toWorld(v.port, _v);
-    v.dirWorld(v.ejectDir, _v2).multiplyScalar(fit.brassSpeed * (0.85 + 0.3 * this.random())).add(w.vel);
+    v.dirWorld(v.ejectDir, _v2).multiplyScalar(fit.brassSpeed * (0.85 + 0.3 * this.rng.fill(1)[0])).add(w.vel);
     this.fx.eject(_v.x, _v.y, _v.z, _v2.x, _v2.y, _v2.z, v.root.quaternion, fit.caseRL, w.def.sounds.brass);
   }
 
@@ -724,14 +725,6 @@ export class WeaponSystem {
   }
 
   // ======================================================================= helpers
-
-  /** Uniform [0, 1) from a private xorshift32. */
-  random() {
-    let x = this.rand;
-    x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
-    this.rand = x;
-    return (x >>> 0) / 4294967296;
-  }
 
   /**
    * @param {number} hand LEFT | RIGHT @param {readonly number[]} hp [strength, ms]

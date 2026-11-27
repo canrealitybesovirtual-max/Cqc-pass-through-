@@ -109,6 +109,11 @@ export class Animator {
     /** @type {Q[]} */ this.lq = mk(CORE_COUNT, () => new Q());
     this.pelvisLocal = new V3();
     /** @type {Q[]} */ this.fingerQ = def.fingers.map((f) => new Q().copy(f.restQ));
+    // finger curls (local rotations: rest · curl about the joint's local Z)
+    const curl = (/** @type {number[][]} */ right, /** @type {number[][]} */ left) => def.fingers.map((f) =>
+      new Q().setAxisAngle(0, 0, 1, (f.hand === 0 ? left : right)[f.finger][f.seg]).preMul(f.restQ));
+    this.curlHold = curl(CURL_R, CURL_L);
+    this.curlDead = curl(CURL_D, CURL_D);
     /** @type {Q[]} */ this.twistQ = def.twists.map((t) => new Q().copy(t.restQ));
     /** Rifle transform in model space. */
     this.rifleP = new V3().copy(def.rifleRestP);
@@ -130,7 +135,7 @@ export class Animator {
     /** @type {Foot[]} */
     this.feet = [0, 1].map(() => ({ px: 0, pz: 0, yaw: 0, planted: true, swingT: 0, fromX: 0, fromZ: 0, fromYaw: 0, fromPitch: 0, pitch: 0, landT: 1, err: 0 }));
     this.stepLen = ANIM.stepLen[0];
-    this.period = ANIM.shufflePeriod;
+    /** @type {number} */ this.period = ANIM.shufflePeriod;
     this.moveAmt = 0; // 0 standing … 1 walking (smoothed)
     this.reachDrop = 0;
     /** Bit 0/1: left/right foot landed during the last update (footstep sounds). */
@@ -177,6 +182,10 @@ export class Animator {
     this._tgt = new V3(); // aim target (model)
     this._ankle = [new V3(), new V3()];
     this._dq = new Q();
+    /** Euler angles for euler(): pitch, yaw, roll (a typed array, so no double is boxed on the call). */
+    this.E = new Float64Array(3);
+    // per-update values shared by the pose passes (fields, not arguments: see euler())
+    this.dt = 0; this.cosY = 1; this.sinY = 0; this.raiseE = 0;
     this.reset(0, 0, 0, 0);
   }
 
@@ -305,18 +314,31 @@ export class Animator {
 
   /** @param {number} dt seconds */
   update(dt) {
+    this.dt = dt;
+    this.tick();
+  }
+
+  /**
+   * Advance by `this.dt` seconds (owners in a hot loop set the field and call
+   * this: a double passed to a method V8 does not inline is boxed).
+   */
+  tick() {
+    let dt = this.dt;
     if (!(dt >= 0)) dt = 0;
     if (dt > 0.25) dt = 0.25;
+    this.dt = dt;
+    this.cosY = Math.cos(this.rootYaw);
+    this.sinY = Math.sin(this.rootYaw);
     this.stepEvents = 0;
     this.landEvent = false;
-    this.springs(dt);
-    if (this.dead) this.updateDeath(dt);
-    else this.updateAlive(dt);
+    this.springs();
+    if (this.dead) this.updateDeath();
+    else this.updateAlive();
     this.writeLocals();
   }
 
-  /** @param {number} dt */
-  springs(dt) {
+  springs() {
+    const dt = this.dt;
     const X = this.spr, V = this.sprV, k = ANIM.hitK, c = ANIM.hitC, rk = ANIM.recoilK, rc = ANIM.recoilC;
     let t = dt;
     while (t > 1e-6) {
@@ -337,7 +359,7 @@ export class Animator {
    * @param {number} f @param {V3} out
    */
   neutral(f, out) {
-    const r = this.raise, still = 1 - clamp(this.speed / 0.6, 0, 1);
+    const sv = this.speed / 0.6, r = this.raise, still = sv >= 1 ? 0 : 1 - sv;
     const blade = r * still; // bladed stance while aiming in place
     const side = (f === 0 ? 1 : -1) * (ANIM.stanceHalfWidth + 0.02 * blade);
     const fwd = this.def.ankleZ + (f === 0 ? 0.1 : -0.1) * blade;
@@ -348,25 +370,28 @@ export class Animator {
     return out;
   }
 
-  /** @param {number} dt */
-  updateAlive(dt) {
-    const d = this.def, A = ANIM;
+  updateAlive() {
+    const d = this.def, A = ANIM, dt = this.dt;
     // inputs
     const rs = dt / A.mountS;
     this.raise = this.raise < this.raiseTarget ? Math.min(this.raiseTarget, this.raise + rs) : Math.max(this.raiseTarget, this.raise - rs * 0.8);
     const ka = dt > 0 ? 1 - Math.exp(-dt / A.aimLagS) : 1;
     this.sx += (this.aimX - this.sx) * ka; this.sy += (this.aimY - this.sy) * ka; this.sz += (this.aimZ - this.sz) * ka;
-    const speed = Math.hypot(this.vx, this.vz);
+    const speed = Math.sqrt(this.vx * this.vx + this.vz * this.vz);
     this.speed = speed;
     const km = dt > 0 ? 1 - Math.exp(-dt / 0.25) : 1;
-    this.moveAmt += (clamp(speed / 1.1, 0, 1) - this.moveAmt) * km;
+    const mt = speed / 1.1;
+    this.moveAmt += ((mt > 1 ? 1 : mt) - this.moveAmt) * km;
 
-    this.gait(dt, speed);
-    const c = Math.cos(this.rootYaw), s = Math.sin(this.rootYaw);
-    const raiseE = smooth(this.raise);
+    this.gait();
+    const c = this.cosY, s = this.sinY;
+    const rr = this.raise;
+    const raiseE = rr <= 0 ? 0 : rr >= 1 ? 1 : rr * rr * (3 - 2 * rr);
+    this.raiseE = raiseE;
 
     // ankle targets (model space) from the feet
-    for (let f = 0; f < 2; f++) this.ankleModel(f, c, s, this._ankle[f]);
+    this.ankleModel(0, this._ankle[0]);
+    this.ankleModel(1, this._ankle[1]);
 
     // ── pelvis
     const mv = this.moveAmt, ph = Math.PI * this.phi;
@@ -398,7 +423,9 @@ export class Animator {
     const pRoll = -A.pelvisRoll * mv * sw;
     const pPitch = 0.05 + 0.03 * raiseE + 0.04 * mv;
     const D = this._dq;
-    this.euler(D, pPitch, pYaw, pRoll);
+    const E = this.E;
+    E[0] = pPitch; E[1] = pYaw; E[2] = pRoll;
+    this.euler(D);
     this.mq[B.pelvis].mul(D, d.restModelQ[B.pelvis]);
 
     // ── aim (model space)
@@ -409,51 +436,52 @@ export class Animator {
     }
     const chestY = d.restModelP[B.spine3].y;
     let yawAim = Math.atan2(T.x, T.z);
-    const hd = Math.hypot(T.x, T.z);
+    const hd = Math.sqrt(T.x * T.x + T.z * T.z);
     let pitchAim = Math.atan2(T.y - (chestY + 0.3), Math.max(hd, 0.3));
-    yawAim = clamp(yawAim, -1.35, 1.35);
-    pitchAim = clamp(pitchAim, -1.0, 0.9);
+    if (!(yawAim > -1.35)) yawAim = -1.35; else if (yawAim > 1.35) yawAim = 1.35;
+    if (!(pitchAim > -1.0)) pitchAim = -1.0; else if (pitchAim > 0.9) pitchAim = 0.9;
     const blade = A.blade * raiseE;
     const sYaw = yawAim - pYaw + blade + this.spr[1];
     const sPitch = -pitchAim * 0.65 + A.lean + A.leanAim * raiseE + 0.04 * mv - pPitch + this.spr[0];
     const sRoll = -pRoll * 0.8 + this.spr[2];
     for (let i = 0; i < 3; i++) {
-      this.euler(D, sPitch * A.spinePitchW[i], sYaw * A.spineYawW[i], sRoll * (i === 0 ? 0.5 : 0.25));
+      E[0] = sPitch * A.spinePitchW[i]; E[1] = sYaw * A.spineYawW[i]; E[2] = sRoll * (i === 0 ? 0.5 : 0.25);
+      this.euler(D);
       this.fkDelta(B.spine1 + i, D);
     }
     // neck and head: the rest of the look, cheek on the stock while aiming
     const hYaw = yawAim - (pYaw + sYaw) + this.spr[4] * 0.5;
     const hPitch = -pitchAim * 0.35 - (A.lean + A.leanAim * raiseE) * 0.8 + A.headDown * raiseE + this.spr[3];
     const hRoll = A.headRoll * raiseE;
-    this.euler(D, hPitch * 0.45, hYaw * 0.4, hRoll * 0.4);
-    this.fkDelta(B.neck, D);
-    this.euler(D, hPitch * 0.55 + this.spr[3] * 0.5, hYaw * 0.6 + this.spr[4], hRoll * 0.6);
-    this.fkDelta(B.head, D);
+    E[0] = hPitch * 0.45; E[1] = hYaw * 0.4; E[2] = hRoll * 0.4;
+    this.fkDelta(B.neck, this.euler(D));
+    E[0] = hPitch * 0.55 + this.spr[3] * 0.5; E[1] = hYaw * 0.6 + this.spr[4]; E[2] = hRoll * 0.6;
+    this.fkDelta(B.head, this.euler(D));
     // clavicles: right shoulder forward and up into the stock while aiming
-    this.euler(D, 0, 0.12 * raiseE, -0.06 * raiseE);
-    this.fkDelta(B.clavR, D);
-    this.euler(D, 0, -0.08 * raiseE - 0.06, 0);
-    this.fkDelta(B.clavL, D);
+    E[0] = 0; E[1] = 0.12 * raiseE; E[2] = -0.06 * raiseE;
+    this.fkDelta(B.clavR, this.euler(D));
+    E[0] = 0; E[1] = -0.08 * raiseE - 0.06; E[2] = 0;
+    this.fkDelta(B.clavL, this.euler(D));
 
     // ── rifle
-    this.placeRifle(raiseE, T);
+    this.placeRifle(T);
     // ── arms
     this.armsOnRifle();
     // ── legs
-    this.legs(c, s);
-    this.fingersHold(dt);
+    this.legs();
+    this.fingersHold();
     this.twists();
   }
 
-  /**
-   * Stepping gait (world space).
-   * @param {number} dt @param {number} speed
-   */
-  gait(dt, speed) {
-    const A = ANIM;
+  /** Stepping gait (world space). */
+  gait() {
+    const A = ANIM, dt = this.dt, speed = this.speed;
     const moving = speed > 0.1;
-    this.stepLen = clamp(A.stepLen[0] + A.stepLen[1] * speed, A.stepLen[0], A.stepLen[2]);
-    const T = moving ? clamp(this.stepLen / speed, A.stepPeriod[0], A.stepPeriod[1]) : A.shufflePeriod;
+    let sl = A.stepLen[0] + A.stepLen[1] * speed;
+    if (sl > A.stepLen[2]) sl = A.stepLen[2];
+    this.stepLen = sl;
+    let T = A.shufflePeriod;
+    if (moving) { T = sl / speed; if (T < A.stepPeriod[0]) T = A.stepPeriod[0]; else if (T > A.stepPeriod[1]) T = A.stepPeriod[1]; }
     this.period = T;
     const nv = this._v[20];
     let maxErr = 0;
@@ -461,7 +489,10 @@ export class Animator {
       const ft = this.feet[f];
       if (!ft.planted) { ft.err = 0; continue; }
       this.neutral(f, nv);
-      ft.err = Math.hypot(ft.px - nv.x, ft.pz - nv.z) + 0.25 * Math.abs(wrapAngle(ft.yaw - nv.y));
+      const ex = ft.px - nv.x, ez = ft.pz - nv.z;
+      let ey = (ft.yaw - nv.y) % TAU;
+      if (ey > Math.PI) ey -= TAU; else if (ey < -Math.PI) ey += TAU;
+      ft.err = Math.sqrt(ex * ex + ez * ez) + 0.25 * Math.abs(ey);
       if (ft.err > maxErr) maxErr = ft.err;
     }
     if (!this.gaitOn) {
@@ -496,22 +527,30 @@ export class Animator {
       const tx = nv.x + this.vx * remain + ivx * lead, tz = nv.z + this.vz * remain + ivz * lead;
       if (ft.swingT >= 1) {
         ft.planted = true; ft.px = tx; ft.pz = tz; ft.yaw = nv.y; ft.landT = 0; ft.swingT = 1;
-        ft.pitch = moving ? A.heelStrike * clamp(speed / 1.0, 0.3, 1) : 0;
+        const ks = speed < 0.3 ? 0.3 : speed > 1 ? 1 : speed;
+        ft.pitch = moving ? A.heelStrike * ks : 0;
         this.stepEvents |= 1 << f;
-        this.stepGain = clamp(0.35 + speed * 0.5, 0.35, 1);
+        this.stepGain = 0.35 + 0.65 * ks;
       } else {
         // the target is tracked to the end, so turns and speed changes land true
-        const e = smooth(ft.swingT);
+        const u = ft.swingT, e = u * u * (3 - 2 * u);
         ft.px = ft.fromX + (tx - ft.fromX) * e;
         ft.pz = ft.fromZ + (tz - ft.fromZ) * e;
-        ft.yaw = ft.fromYaw + wrapAngle(nv.y - ft.fromYaw) * e;
-        const e2 = smooth(ft.swingT / 0.85);
-        ft.pitch = ft.fromPitch * (1 - e2) + (moving ? A.heelStrike * clamp(speed, 0.3, 1) : 0) * e2;
+        let dy = (nv.y - ft.fromYaw) % TAU;
+        if (dy > Math.PI) dy -= TAU; else if (dy < -Math.PI) dy += TAU;
+        ft.yaw = ft.fromYaw + dy * e;
+        const u2 = u / 0.85 > 1 ? 1 : u / 0.85, e2 = u2 * u2 * (3 - 2 * u2);
+        const ks = speed < 0.3 ? 0.3 : speed > 1 ? 1 : speed;
+        ft.pitch = ft.fromPitch * (1 - e2) + (moving ? A.heelStrike * ks : 0) * e2;
       }
     }
     if (this.gaitOn && !moving && this.feet[0].planted && this.feet[1].planted) {
       let e = 0;
-      for (let f = 0; f < 2; f++) { this.neutral(f, nv); const ft = this.feet[f]; e = Math.max(e, Math.hypot(ft.px - nv.x, ft.pz - nv.z)); }
+      for (let f = 0; f < 2; f++) {
+        this.neutral(f, nv);
+        const ft = this.feet[f], ex = ft.px - nv.x, ez = ft.pz - nv.z, el = Math.sqrt(ex * ex + ez * ez);
+        if (el > e) e = el;
+      }
       if (e < 0.06) this.gaitOn = false;
     }
   }
@@ -527,10 +566,10 @@ export class Animator {
   /**
    * Ankle joint target in model space for foot f (heel strike about the heel,
    * heel rise about the ball, swing lift).
-   * @param {number} f @param {number} c @param {number} s @param {V3} out
+   * @param {number} f @param {V3} out
    */
-  ankleModel(f, c, s, out) {
-    const d = this.def, ft = this.feet[f], A = ANIM;
+  ankleModel(f, out) {
+    const d = this.def, ft = this.feet[f], A = ANIM, c = this.cosY, s = this.sinY;
     // stance pitch: roll flat after the heel strike, then rise onto the ball when trailing
     if (ft.planted) {
       let p = ft.landT < 0.12 ? ft.pitch * (1 - ft.landT / 0.12) : 0;
@@ -539,7 +578,8 @@ export class Animator {
         // trailing distance behind the hips along the walk direction
         const ivx = this.vx / this.speed, ivz = this.vz / this.speed;
         const trail = -((ft.px - this.rootX) * ivx + (ft.pz - this.rootZ) * ivz);
-        const hr = clamp((trail - 0.06) / 0.3, 0, 1) * A.heelRise;
+        let hr = (trail - 0.06) / 0.3;
+        hr = (hr < 0 ? 0 : hr > 1 ? 1 : hr) * A.heelRise;
         if (hr > p) p = hr;
       }
       ft.fromPitch = p;
@@ -561,7 +601,8 @@ export class Animator {
     }
     if (!ft.planted) {
       const sp = this.speed > 0.1 ? A.lift[0] + A.lift[1] * Math.min(this.speed, 1.5) : A.lift[2];
-      ly += sp * Math.sin(Math.PI * clamp(ft.swingT, 0, 1));
+      const u = ft.swingT < 0 ? 0 : ft.swingT > 1 ? 1 : ft.swingT;
+      ly += sp * Math.sin(Math.PI * u);
     }
     const wx = ft.px + lx * fc + lz * fs - this.rootX, wz = ft.pz - lx * fs + lz * fc - this.rootZ;
     out.set(wx * c - wz * s, ly, wx * s + wz * c);
@@ -570,18 +611,19 @@ export class Animator {
 
   /**
    * Rifle transform in model space: low ready from the shoulder pocket, aimed
-   * from the right eye, blended by raise; then recoil.
-   * @param {number} r eased raise @param {V3} T aim target (model)
+   * from the right eye, blended by the eased raise; then recoil.
+   * @param {V3} T aim target (model)
    */
-  placeRifle(r, T) {
-    const d = this.def, v = this._v, q = this._q;
+  placeRifle(T) {
+    const d = this.def, v = this._v, q = this._q, r = this.raiseE;
     const chestD = q[0].mulConj(this.mq[B.spine3], d.restModelQ[B.spine3]);
     // shoulder pocket now
     const pocket = v[0].subVectors(POCKET, d.restModelP[B.spine3]).applyQ(chestD).add(this.mp[B.spine3]);
     // low ready: the chest's heading only (stays low when he leans or looks up)
     const fwd = v[1].set(0, 0, 1).applyQ(chestD);
-    const hy = Math.atan2(fwd.x, fwd.z);
-    const qy = q[1].setAxisAngle(0, 1, 0, hy);
+    const hy = Math.atan2(fwd.x, fwd.z) * 0.5;
+    const qy = q[1];
+    qy.x = 0; qy.y = Math.sin(hy); qy.z = 0; qy.w = Math.cos(hy);
     const lf = v[2].copy(LOW_FWD).applyQ(qy), lu = v[3].copy(LOW_UP).applyQ(qy);
     const Zr = v[4].copy(lf).scale(-1), Xr = v[5].cross(lu, Zr).normalize(), Yr = v[6].cross(Zr, Xr);
     const qLow = q[2].setFromBasis(Xr, Yr, Zr);
@@ -593,15 +635,23 @@ export class Animator {
     const Za = v[9].copy(dir).scale(-1), Xa = v[10].cross(UP, Za).normalize(), Ya = v[11].cross(Za, Xa);
     const qAim = q[4].setFromBasis(Xa, Ya, Za);
     const pAim = v[12].copy(d.rifle.eye).applyQ(qAim).scale(-1).add(eye);
-    // blend
-    this.rifleQ.slerp(qLow, qAim, r);
-    this.rifleP.lerpVectors(pLow, pAim, r);
+    // blend (nlerp: the two are never far apart, and no double crosses a call)
+    const dq = qLow.x * qAim.x + qLow.y * qAim.y + qLow.z * qAim.z + qLow.w * qAim.w;
+    const RQ = this.rifleQ, r0 = 1 - r, r1 = dq < 0 ? -r : r;
+    RQ.x = qLow.x * r0 + qAim.x * r1; RQ.y = qLow.y * r0 + qAim.y * r1; RQ.z = qLow.z * r0 + qAim.z * r1; RQ.w = qLow.w * r0 + qAim.w * r1;
+    RQ.normalize();
+    const RP = this.rifleP;
+    RP.x = pLow.x * r0 + pAim.x * r; RP.y = pLow.y * r0 + pAim.y * r; RP.z = pLow.z * r0 + pAim.z * r;
     // recoil: back along the bore, muzzle up about the rifle's X at the butt
-    const rise = q[5].setAxisAngle(1, 0, 0, this.spr[7]);
-    const butt = v[13].copy(d.rifle.butt).applyQ(this.rifleQ).add(this.rifleP);
-    this.rifleQ.postMul(rise);
-    this.rifleP.copy(d.rifle.butt).applyQ(this.rifleQ).scale(-1).add(butt);
-    this.rifleP.add(v[14].set(0, 0, this.spr[6]).applyQ(this.rifleQ));
+    const hr = this.spr[7] * 0.5;
+    const rise = q[5];
+    rise.x = Math.sin(hr); rise.y = 0; rise.z = 0; rise.w = Math.cos(hr);
+    const butt = v[13].copy(d.rifle.butt).applyQ(RQ).add(RP);
+    RQ.postMul(rise);
+    RP.copy(d.rifle.butt).applyQ(RQ).scale(-1).add(butt);
+    const kick = v[14];
+    kick.x = 0; kick.y = 0; kick.z = this.spr[6];
+    RP.add(kick.applyQ(RQ));
   }
 
   /** Right hand to the grip, rifle re-derived from the hand, left hand to the support. */
@@ -643,16 +693,20 @@ export class Animator {
     S.copy(this.def.restLocalT[ch.upper]).applyQ(this.mq[p]).add(this.mp[p]);
     const a = ch.a, b = ch.b;
     const w = v[20].subVectors(target, S);
-    let dl = w.length();
+    let dl = Math.sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
     const maxD = (a + b) * 0.999, minD = Math.abs(a - b) + 1e-3;
-    if (dl < 1e-6) { w.set(0, -1, 0); dl = minD; } else w.scale(1 / dl);
+    if (dl < 1e-6) { w.set(0, -1, 0); dl = minD; } else { const k = 1 / dl; w.x *= k; w.y *= k; w.z *= k; }
     if (dl > maxD) dl = maxD; else if (dl < minD) dl = minD;
     const pp = v[21].copy(pole).rejectFrom(w);
-    if (pp.lengthSq() < 1e-8) pp.set(0, 0, 1).rejectFrom(w);
+    if (pp.x * pp.x + pp.y * pp.y + pp.z * pp.z < 1e-8) pp.set(0, 0, 1).rejectFrom(w);
     pp.normalize();
-    const ca = clamp((a * a + dl * dl - b * b) / (2 * a * dl), -1, 1), sa = Math.sqrt(1 - ca * ca);
-    const E = this._ikE.copy(S).addScaled(w, a * ca).addScaled(pp, a * sa);
-    const end = v[22].copy(S).addScaled(w, dl);
+    let ca = (a * a + dl * dl - b * b) / (2 * a * dl);
+    if (ca > 1) ca = 1; else if (ca < -1) ca = -1;
+    const sa = Math.sqrt(1 - ca * ca);
+    // (written out: a double passed to a method that is not inlined here would be boxed)
+    const ka = a * ca, kp = a * sa;
+    const E = this._ikE.set(S.x + w.x * ka + pp.x * kp, S.y + w.y * ka + pp.y * kp, S.z + w.z * ka + pp.z * kp);
+    const end = v[22].set(S.x + w.x * dl, S.y + w.y * dl, S.z + w.z * dl);
     const au = v[23].subVectors(E, S).normalize();
     const hinge = v[19].cross(pp, w).normalize();
     const R = q[7];
@@ -665,47 +719,51 @@ export class Animator {
     this.mp[ch.end].copy(this.def.restLocalT[ch.end]).applyQ(this.mq[ch.lower]).add(this.mp[ch.lower]);
   }
 
-  /** Legs to the ankle targets, feet yawed and pitched, toes flat. @param {number} c @param {number} s */
-  legs(c, s) {
+  /** Legs to the ankle targets, feet yawed and pitched, toes flat. */
+  legs() {
     const d = this.def, v = this._v, q = this._q;
     for (let f = 0; f < 2; f++) {
       const ft = this.feet[f];
-      const fy = wrapAngle(ft.yaw - this.rootYaw);
+      let fy = (ft.yaw - this.rootYaw) % TAU;
+      if (fy > Math.PI) fy -= TAU; else if (fy < -Math.PI) fy += TAU;
       const pole = v[14].set(Math.sin(fy) + (f === 0 ? 0.12 : -0.12), 0.1, Math.cos(fy));
       this.ik(f === 0 ? 2 : 3, this._ankle[f], pole);
       const p = this.footPitch[f];
-      const qy = q[8].setAxisAngle(0, 1, 0, fy), qp = q[9].setAxisAngle(1, 0, 0, p);
+      const qy = q[8], qp = q[9];
+      qy.x = 0; qy.y = Math.sin(fy * 0.5); qy.z = 0; qy.w = Math.cos(fy * 0.5);
+      qp.x = Math.sin(p * 0.5); qp.y = 0; qp.z = 0; qp.w = Math.cos(p * 0.5);
       const fb = f === 0 ? B.footL : B.footR, tb = f === 0 ? B.ballL : B.ballR;
       this._dq.mul(qy, qp).postMul(d.restModelQ[fb]);
       this.fkAbs(fb, this._dq);
       // toes stay flat while the heel is up; follow the foot otherwise
       const tp = ft.planted && p > 0 ? 0 : p;
-      qp.setAxisAngle(1, 0, 0, tp);
+      qp.x = Math.sin(tp * 0.5); qp.w = Math.cos(tp * 0.5);
       this._dq.mul(qy, qp).postMul(d.restModelQ[tb]);
       this.fkAbs(tb, this._dq);
     }
   }
 
-  /** @param {number} dt */
-  fingersHold(dt) {
-    const k = dt > 0 ? 1 - Math.exp(-dt / 0.08) : 1;
-    this.curlFingers(this.dead ? CURL_D : CURL_R, this.dead ? CURL_D : CURL_L, k);
-  }
-
   /**
-   * @param {number[][]} right @param {number[][]} left @param {number} k blend toward the curls
+   * Fingers curl round the grip and the handguard (or open, dead): an
+   * exponential approach to precomputed local rotations (normalised lerp,
+   * written out so no double crosses a call).
    */
-  curlFingers(right, left, k) {
-    const F = this.def.fingers, q = this._q[8];
-    for (let i = 0; i < F.length; i++) {
-      const fd = F[i];
-      const a = (fd.hand === 0 ? left : right)[fd.finger][fd.seg];
-      q.setAxisAngle(0, 0, 1, a).preMul(fd.restQ);
-      this.fingerQ[i].slerp(this.fingerQ[i], q, k);
+  fingersHold() {
+    const dt = this.dt;
+    const k = dt > 0 ? 1 - Math.exp(-dt / 0.08) : 1;
+    const target = this.dead ? this.curlDead : this.curlHold;
+    for (let i = 0; i < target.length; i++) {
+      const c = this.fingerQ[i], t = target[i];
+      const sg = c.x * t.x + c.y * t.y + c.z * t.z + c.w * t.w < 0 ? -k : k;
+      c.x += (t.x * sg - c.x) * k; c.y += (t.y * sg - c.y) * k; c.z += (t.z * sg - c.z) * k; c.w += (t.w * sg - c.w) * k;
+      c.normalize();
     }
   }
 
-  /** Twist joints take a share of the roll of their bone (or of the hand / foot below). */
+  /**
+   * Twist joints take a share of the roll of their bone (or of the hand / foot
+   * below). Written out inline: a helper returning a double would be boxed here.
+   */
   twists() {
     const d = this.def, T = d.twists, q = this._q[8], r = this._q[9];
     for (let i = 0; i < T.length; i++) {
@@ -714,17 +772,19 @@ export class Animator {
       const db = t.distal;
       q.conjMul(this.mq[d.parent[db]], this.mq[db]); // current local L
       r.conjMul(d.restLocalQ[db], q); // Δ = L0⁻¹ · L, in the bone's rest frame
-      const ang = clamp(r.twistAngle(1, 0, 0), -2.5, 2.5) * t.k;
-      q.setAxisAngle(1, 0, 0, ang);
+      let ang = 2 * Math.atan2(r.x, r.w);
+      if (ang > Math.PI) ang -= 2 * Math.PI; else if (ang < -Math.PI) ang += 2 * Math.PI;
+      if (ang > 2.5) ang = 2.5; else if (ang < -2.5) ang = -2.5;
+      const h = ang * t.k * 0.5;
+      q.x = Math.sin(h); q.y = 0; q.z = 0; q.w = Math.cos(h);
       this.twistQ[i].mul(t.restQ, q);
     }
   }
 
   // ───────────────────────────────────────────────────────────── death
 
-  /** @param {number} dt */
-  updateDeath(dt) {
-    const d = this.def, v = this._v, q = this._q, A = ANIM;
+  updateDeath() {
+    const d = this.def, v = this._v, q = this._q, A = ANIM, dt = this.dt, E = this.E;
     this.deathT += dt;
     const t = this.deathT;
     // torso topples about the hips: θ'' = (g / L)·sin θ (an inverted pendulum)
@@ -775,15 +835,15 @@ export class Animator {
     const D = this._dq;
     const lag = clamp(-this.om * 0.08, -0.25, 0.25);
     for (let i = 0; i < 3; i++) {
-      this.euler(D, lag * 0.33 + this.spr[0] * 0.3, this.spr[1] * 0.3, this.spr[2] * 0.3);
-      this.fkDelta(B.spine1 + i, D);
+      E[0] = lag * 0.33 + this.spr[0] * 0.3; E[1] = this.spr[1] * 0.3; E[2] = this.spr[2] * 0.3;
+      this.fkDelta(B.spine1 + i, this.euler(D));
     }
     const roll = this.landed ? smooth((t - 0.9) / 0.6) * (this.extendToL > this.extendToR ? 0.6 : -0.6) : 0;
-    this.euler(D, lag * 0.5, roll * 0.5, 0);
-    this.fkDelta(B.neck, D);
-    this.euler(D, lag * 0.5 + this.spr[3], roll, 0);
-    this.fkDelta(B.head, D);
-    this.euler(D, 0, 0, 0);
+    E[0] = lag * 0.5; E[1] = roll * 0.5; E[2] = 0;
+    this.fkDelta(B.neck, this.euler(D));
+    E[0] = lag * 0.5 + this.spr[3]; E[1] = roll; E[2] = 0;
+    this.fkDelta(B.head, this.euler(D));
+    D.identity();
     this.fkDelta(B.clavL, D);
     this.fkDelta(B.clavR, D);
     // arms: limp, swinging out with the fall, then lying
@@ -793,13 +853,13 @@ export class Animator {
     for (let side = 0; side < 2; side++) {
       const ua = side === 0 ? B.upperArmL : B.upperArmR, la = side === 0 ? B.lowerArmL : B.lowerArmR, ha = side === 0 ? B.handL : B.handR;
       const sg = side === 0 ? 1 : -1;
-      this.euler(D, -0.1 - swing * 0.4, 0, sg * abd);
-      this.fkDelta(ua, D);
+      E[0] = -0.1 - swing * 0.4; E[1] = 0; E[2] = sg * abd;
+      this.fkDelta(ua, this.euler(D));
       const ch = d.chains[side];
       D.setAxisAngle(ch.hinge.x, ch.hinge.y, ch.hinge.z, 0.35 + swing * 0.3);
       this.fkDelta(la, D);
-      this.euler(D, 0.2, 0, 0);
-      this.fkDelta(ha, D);
+      E[0] = 0.2; E[1] = 0; E[2] = 0;
+      this.fkDelta(ha, this.euler(D));
     }
     // blend out of the pose he died in (everything above the hips) over 0.2 s
     const bo = smooth(t / 0.22);
@@ -822,7 +882,7 @@ export class Animator {
     } else if (lift < 0) lift = 0;
     if (lift !== 0) for (let b = B.pelvis; b <= B.handR; b++) this.mp[b].y += lift;
     if (this.landed) this.headToFloor();
-    this.armsToFloor(dt);
+    this.armsToFloor();
     // legs: to the feet he stood on, sliding out straight once down
     for (let f = 0; f < 2; f++) {
       const ft = f === 0 ? this.footDL : this.footDR, ex = f === 0 ? this.extendL : this.extendR;
@@ -850,10 +910,10 @@ export class Animator {
       const lying = q[5].mul(qf, qt).postMul(q[6].setAxisAngle(1, 0, 0, 0.45 + (f === 0 ? 0.15 : -0.1)));
       this._dq.slerp(flat, lying, smooth(ex)).postMul(d.restModelQ[fb]);
       this.fkAbs(fb, this._dq);
-      this.fkDelta(tb, this.euler(D, 0, 0, 0));
+      this.fkDelta(tb, D.identity());
     }
-    this.updateRifleDrop(dt);
-    this.fingersHold(dt);
+    this.updateRifleDrop();
+    this.fingersHold();
     this.twists();
   }
 
@@ -871,9 +931,8 @@ export class Animator {
   /**
    * Limp arms lie on the floor: a hand that would go through it, or (once he is
    * down) floats above it, is solved back onto it with the elbow up and out.
-   * @param {number} dt
    */
-  armsToFloor(dt) {
+  armsToFloor() {
     const v = this._v, q = this._q;
     const k = this.landed ? smooth((this.deathT - (this.dropT * 0.5)) / 0.6) : 0;
     for (let side = 0; side < 2; side++) {
@@ -902,11 +961,11 @@ export class Animator {
     if (gap < 0.01) return;
     const nk = this.mp[B.neck];
     const arm = v[8].subVectors(hc, nk);
-    const L = arm.length();
+    const L = Math.sqrt(arm.x * arm.x + arm.y * arm.y + arm.z * arm.z);
     if (L < 1e-3) return;
     // rotate about the horizontal axis perpendicular to the neck→head direction
     const axis = v[9].cross(arm, UP).normalize();
-    if (axis.lengthSq() < 1e-6) return;
+    if (axis.x * axis.x + axis.y * axis.y + axis.z * axis.z < 1e-6) return;
     const ang = -clamp(Math.asin(clamp(gap / L, 0, 1)), 0, 0.5);
     const r = q[4].setAxisAngle(axis.x, axis.y, axis.z, ang);
     this.mq[B.neck].preMul(r);
@@ -914,9 +973,9 @@ export class Animator {
     this.mp[B.head].subVectors(this.mp[B.head], nk).applyQ(r).add(nk);
   }
 
-  /** @param {number} dt */
-  updateRifleDrop(dt) {
+  updateRifleDrop() {
     if (!this.rifleFree) return;
+    const dt = this.dt;
     this.rifleT += dt;
     const t = this.rifleT, rv = this.rV;
     // ballistic until the lowest end reaches the floor, rotating toward lying flat
@@ -942,14 +1001,21 @@ export class Animator {
   // ───────────────────────────────────────────────────────────── FK helpers
 
   /**
-   * Rotation pitch (about +X), then roll (about +Z), then yaw (about +Y): D = Y·Z·X.
-   * @param {Q} out @param {number} pitch @param {number} yaw @param {number} roll
+   * Rotation from the angles in this.E = [pitch about +X, yaw about +Y, roll
+   * about +Z]: pitch first, then roll, then yaw (D = Y·Z·X). Angles come in a
+   * typed array because doubles passed to a method V8 does not inline are boxed.
+   * @param {Q} out
    */
-  euler(out, pitch, yaw, roll) {
-    const q = this._q[9];
-    out.setAxisAngle(0, 1, 0, yaw);
-    if (roll !== 0) out.postMul(q.setAxisAngle(0, 0, 1, roll));
-    if (pitch !== 0) out.postMul(q.setAxisAngle(1, 0, 0, pitch));
+  euler(out) {
+    const hp = this.E[0] * 0.5, hy = this.E[1] * 0.5, hr = this.E[2] * 0.5;
+    const cp = Math.cos(hp), sp = Math.sin(hp), cy = Math.cos(hy), sy = Math.sin(hy), cr = Math.cos(hr), sr = Math.sin(hr);
+    // Y·Z = (0, sy, 0, cy)·(0, 0, sr, cr)
+    const ax = sy * sr, ay = sy * cr, az = cy * sr, aw = cy * cr;
+    // (Y·Z)·X with X = (sp, 0, 0, cp)
+    out.x = ax * cp + aw * sp;
+    out.y = ay * cp + az * sp;
+    out.z = az * cp - ay * sp;
+    out.w = aw * cp - ax * sp;
     return out;
   }
 

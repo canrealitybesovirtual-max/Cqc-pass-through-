@@ -54,11 +54,11 @@ void main() {
 }`;
 
 const FLASH_FRAG = /* glsl */`
-uniform float uBright;
-uniform float uSeed;
+uniform vec2 uFlash;   // x brightness, y seed
 varying vec2 vUv;
 varying float vKind;
 void main() {
+  float uBright = uFlash.x, uSeed = uFlash.y;
   float b;
   if ( vKind < 0.5 ) {
     vec2 c = vUv * 2.0 - 1.0;
@@ -130,6 +130,36 @@ const _c = new THREE.Color();
 const _ZP = new THREE.Vector3(0, 0, 1);
 const _ZN = new THREE.Vector3(0, 0, -1);
 const _XA = new THREE.Vector3(1, 0, 0);
+
+/**
+ * xorshift32 that never boxes a number: the state lives in a Uint32Array and
+ * draws are written into `out` (a method returning a double that V8 does not
+ * inline allocates a HeapNumber per call; Math.random allocates when it refills).
+ */
+export class Rng {
+  /** @param {number} seed */
+  constructor(seed) {
+    this.s = new Uint32Array(1);
+    this.s[0] = (seed >>> 0) || 0x9e3779b9;
+    this.out = new Float64Array(8);
+  }
+
+  /**
+   * Fill out[0 .. n−1] (n ≤ 8) with uniforms in [0, 1).
+   * @param {number} n
+   */
+  fill(n) {
+    const o = this.out;
+    let x = this.s[0];
+    for (let i = 0; i < n; i++) {
+      x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+      x >>>= 0;
+      o[i] = x / 4294967296;
+    }
+    this.s[0] = x;
+    return o;
+  }
+}
 
 /** Pool body states. */
 const FREE = 0, FLY = 1, SETTLE = 2, REST = 3;
@@ -292,7 +322,7 @@ export class WeaponFX {
   constructor({ worldRoot, fpRoot, light = null, views }) {
     this.light = light;
     if (light) light.intensity = 0;
-    this.rand = 0x9e3779b9 | 0;
+    this.rng = new Rng(0x9e3779b9);
 
     // --- muzzle flash
     const fg = new THREE.BufferGeometry();
@@ -314,7 +344,8 @@ export class WeaponFX {
     fg.computeBoundingSphere();
     this.flashMat = new THREE.ShaderMaterial({
       name: 'w2-flash', vertexShader: FLASH_VERT, fragmentShader: FLASH_FRAG,
-      uniforms: { uBright: { value: 1 }, uSeed: { value: 0 } },
+      // one vec2 (a number uniform's `value` would box a double on every write)
+      uniforms: { uFlash: { value: new THREE.Vector2(1, 0) } },
       transparent: true, premultipliedAlpha: true, depthWrite: false, side: THREE.DoubleSide,
     });
     this.flashMesh = new THREE.Mesh(fg, this.flashMat);
@@ -372,28 +403,19 @@ export class WeaponFX {
     this._warmCounts = new Array(1 + this.magPools.length).fill(0);
   }
 
-  /** Uniform [0, 1) from a private xorshift32 (Math.random can allocate). */
-  random() {
-    let x = this.rand;
-    x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
-    this.rand = x;
-    return (x >>> 0) / 4294967296;
-  }
-
   /**
    * A muzzle flash at the view's muzzle (it follows the gun for its life).
    * @param {import('./WeaponView.js').WeaponView} view
    * @param {number} now seconds
    */
   flash(view, now) {
-    const f = view.fit, ms = FX.flashMs[0] + (FX.flashMs[1] - FX.flashMs[0]) * this.random();
+    const f = view.fit, r = this.rng.fill(5), ms = FX.flashMs[0] + (FX.flashMs[1] - FX.flashMs[0]) * r[0];
     this.flashView = view;
     this.flashDur = ms / 1000;
     this.flashEnd = now + this.flashDur;
-    this.flashSize = f.flash[0] + (f.flash[1] - f.flash[0]) * this.random();
-    this.flashRoll = this.random() * Math.PI * 2;
-    this.flashMat.uniforms.uSeed.value = this.random() * 6.283;
-    this.flashMat.uniforms.uBright.value = 0.85 + 0.15 * this.random();
+    this.flashSize = f.flash[0] + (f.flash[1] - f.flash[0]) * r[1];
+    this.flashRoll = r[2] * Math.PI * 2;
+    this.flashMat.uniforms.uFlash.value.set(0.85 + 0.15 * r[3], r[4] * 6.283);
     this.lightEnd = now + FX.lightMs / 1000;
     this.lightI = f.flashLight;
   }
@@ -414,13 +436,13 @@ export class WeaponFX {
     _q.setFromAxisAngle(_XA, Math.PI / 2);
     _q2.copy(gunQuat).multiply(_q);
     B.quat[o4] = _q2.x; B.quat[o4 + 1] = _q2.y; B.quat[o4 + 2] = _q2.z; B.quat[o4 + 3] = _q2.w;
-    const spin = 18 + 14 * this.random();
-    _v.set(this.random() - 0.5, this.random() - 0.5, 1).normalize().applyQuaternion(gunQuat).multiplyScalar(spin);
+    const r = this.rng.fill(4), spin = 18 + 14 * r[0];
+    _v.set(r[1] - 0.5, r[2] - 0.5, 1).normalize().applyQuaternion(gunQuat).multiplyScalar(spin);
     B.ang[o] = _v.x; B.ang[o + 1] = _v.y; B.ang[o + 2] = _v.z;
     B.scl[o] = caseRL[0]; B.scl[o + 1] = caseRL[1]; B.scl[o + 2] = caseRL[0];
     B.rh[i] = caseRL[0];
     B.state[i] = FLY; B.bounces[i] = 0; B.sounded[i] = 0;
-    B.sound[i] = sound; B.gain[i] = 0.6 + 0.3 * this.random();
+    B.sound[i] = sound; B.gain[i] = 0.6 + 0.3 * r[3];
     B.write(i);
   }
 
@@ -440,7 +462,8 @@ export class WeaponFX {
     B.pos[o] = _v.x; B.pos[o + 1] = _v.y; B.pos[o + 2] = _v.z;
     B.vel[o] = vel.x; B.vel[o + 1] = vel.y; B.vel[o + 2] = vel.z;
     B.quat[o4] = q.x; B.quat[o4 + 1] = q.y; B.quat[o4 + 2] = q.z; B.quat[o4 + 3] = q.w;
-    _v.set(this.random() - 0.5, this.random() - 0.5, this.random() - 0.5).normalize().multiplyScalar(spin * (0.5 + this.random()));
+    const r = this.rng.fill(4);
+    _v.set(r[0] - 0.5, r[1] - 0.5, r[2] - 0.5).normalize().multiplyScalar(spin * (0.5 + r[3]));
     B.ang[o] = _v.x; B.ang[o + 1] = _v.y; B.ang[o + 2] = _v.z;
     B.rh[i] = Math.min(B.half.x, B.half.y, B.half.z);
     B.state[i] = FLY; B.bounces[i] = 0; B.sounded[i] = 0;
@@ -461,15 +484,16 @@ export class WeaponFX {
     if (!(_v.lengthSq() > 1e-8)) _v.set(0, 0, 1);
     _v.normalize();
     _q.setFromUnitVectors(_ZP, _v);
-    _q2.setFromAxisAngle(_ZP, this.random() * Math.PI * 2);
+    const r = this.rng.fill(4);
+    _q2.setFromAxisAngle(_ZP, r[0] * Math.PI * 2);
     _q.multiply(_q2);
     _p.set(hit.x + _v.x * FX.decalLift, hit.y + _v.y * FX.decalLift, hit.z + _v.z * FX.decalLift);
-    const s = size * (0.9 + 0.2 * this.random());
+    const s = size * (0.9 + 0.2 * r[1]);
     _s.set(s, s, s);
     _m.compose(_p, _q, _s);
     D.setMatrixAt(i, _m);
     const k = /** @type {Record<string, number>} */ (KIND)[hit.surface];
-    _c.setRGB(this.random(), (hole / (s / 2)) * (0.9 + 0.2 * this.random()), k === undefined ? 0 : k);
+    _c.setRGB(r[2], (hole / (s / 2)) * (0.9 + 0.2 * r[3]), k === undefined ? 0 : k);
     D.setColorAt(i, _c);
     D.instanceMatrix.needsUpdate = true;
     if (D.instanceColor) D.instanceColor.needsUpdate = true;

@@ -27,10 +27,11 @@
  *   shoulder);
  * - `thighs`: hip and knee points of both thighs (the draw's trigger gate).
  *
- * Usage, once per frame (allocation-free):
- *   est.setHead(px, py, pz, qx, qy, qz, qw);
- *   est.setHand(0, ok, x, y, z, false); est.setHand(1, ok, x, y, z, holdsGun);
- *   est.update(dt, floorY, standEye);
+ * Usage, once per frame (allocation-free; inputs are objects, so no double is
+ * boxed at the call):
+ *   est.setHead(eye, quat);                   // { x, y, z }, { x, y, z, w }
+ *   est.setHand(0, ok, leftPos, false); est.setHand(1, ok, rightPos, holdsGun);
+ *   est.update(dt, player);                   // { floorY, standEye }
  */
 
 /** Tuning (CQC values unless marked design). Lengths are × body scale. */
@@ -164,27 +165,6 @@ export function qBasis(X, Y, Z, out) {
 /** A world pose: position and orientation. */
 function pose() { return { p: new Float64Array(3), q: new Float64Array([0, 0, 0, 1]) }; }
 
-/** Critically damped follower for one value (x, v), ω fixed. */
-class Damped {
-  constructor() { this.x = 0; this.v = 0; }
-  /** @param {number} x */
-  snap(x) { this.x = x; this.v = 0; }
-  /**
-   * @param {number} target @param {number} dt @param {number} w @param {number} n sub-steps @param {boolean} angle
-   */
-  step(target, dt, w, n, angle) {
-    const h = dt / n, w2 = w * w, c = 2 * w;
-    let x = this.x, v = this.v;
-    for (let i = 0; i < n; i++) {
-      const e = angle ? wrap(target - x) : target - x;
-      v += (w2 * e - c * v) * h;
-      x += v * h;
-    }
-    this.x = angle ? wrap(x) : x;
-    this.v = v;
-  }
-}
-
 export class BodyEstimator {
   /**
    * @param {{ holsterUp?: number, holsterFwd?: number, holsterOut?: number }} [o]
@@ -219,11 +199,10 @@ export class BodyEstimator {
     this._lastP = new Float64Array(3);
     this._vel = new Float64Array(2);
 
-    // smoothed outputs
-    this._sp = [new Damped(), new Damped(), new Damped()];
-    this._sc = [new Damped(), new Damped(), new Damped()];
-    this._sy = new Damped();
-    this._scy = new Damped();
+    // smoothed frame (critically damped): pelvis xyz, C7 xyz, hip yaw, chest yaw
+    this._ft = new Float64Array(8);   // targets
+    this._fx = new Float64Array(8);   // values
+    this._fv = new Float64Array(8);   // rates
     this.holster = pose();
     this.pouch = pose();
     this.back = pose();
@@ -234,7 +213,10 @@ export class BodyEstimator {
     this.pelvisS = new Float64Array(3);
     this.yawS = 0;
 
-    // scratch
+    // scratch: working scalars (dt, floor, stand eye, scale, pitch down, pitch, forward xyz, up x z,
+    // hip and chest targets) and vectors
+    this._w = new Float64Array(16);
+    this._first = true;
     this._v = new Float64Array(6);
     this._q = new Float64Array(4);
     this._q2 = new Float64Array(4);
@@ -266,10 +248,10 @@ export class BodyEstimator {
 
   /**
    * Head pose this frame: eye midpoint and orientation.
-   * @param {number} px @param {number} py @param {number} pz
-   * @param {number} qx @param {number} qy @param {number} qz @param {number} qw
+   * @param {{ x: number, y: number, z: number }} p @param {{ x: number, y: number, z: number, w: number }} r
    */
-  setHead(px, py, pz, qx, qy, qz, qw) {
+  setHead(p, r) {
+    const px = p.x, py = p.y, pz = p.z, qx = r.x, qy = r.y, qz = r.z, qw = r.w;
     const h = this._head;
     h[0] = px; h[1] = py; h[2] = pz; h[3] = qx; h[4] = qy; h[5] = qz; h[6] = qw;
     const q = this._hq;
@@ -280,56 +262,83 @@ export class BodyEstimator {
   /**
    * @param {number} i 0 = left, 1 = right
    * @param {boolean} ok tracked this frame
-   * @param {number} x @param {number} y @param {number} z grip position
+   * @param {{ x: number, y: number, z: number } | null} p grip position
    * @param {boolean} holdsGun
    */
-  setHand(i, ok, x, y, z, holdsGun) {
+  setHand(i, ok, p, holdsGun) {
     const o = i * 4, h = this._hand;
-    const good = ok && Number.isFinite(x + y + z);
+    const x = p ? p.x : 0, y = p ? p.y : 0, z = p ? p.z : 0;
+    const good = ok && !!p && Number.isFinite(x + y + z);
     h[o] = good ? x : 0; h[o + 1] = good ? y : 0; h[o + 2] = good ? z : 0; h[o + 3] = good ? 1 : 0;
     this._gun[i] = holdsGun;
   }
 
   /**
    * @param {number} dt seconds
-   * @param {number} floorY
-   * @param {number} standEye calibrated standing eye height above the floor
+   * @param {{ floorY: number, standEye: number } | null} ref floor height and calibrated standing
+   *   eye height above it (the Player has both)
    */
-  update(dt, floorY, standEye) {
+  update(dt, ref) {
     if (!this._headSet) return;
-    if (!(dt >= 0) || dt > 0.25) dt = dt > 0.25 ? 0.25 : 0;
-    if (!Number.isFinite(floorY)) floorY = 0;
-    if (!(standEye > 0.5 && standEye < 2.5)) standEye = 1.65;
-    const B = BODY_EST, H = this._head, v = this._v;
-    const s = this.scale = standEye / B.refEye;
-    const first = !this.valid;
+    // Every step below is a small method that reads and writes fields and typed arrays only:
+    // no double crosses a call, so nothing is boxed even where V8 does not inline.
+    const W = this._w;
+    W[0] = dt >= 0 ? (dt > 0.25 ? 0.25 : dt) : 0;
+    const fy = ref ? ref.floorY : 0, se = ref ? ref.standEye : 1.65;
+    W[1] = Number.isFinite(fy) ? fy : 0;
+    W[2] = se > 0.5 && se < 2.5 ? se : 1.65;
+    W[3] = W[2] / BODY_EST.refEye;
+    this.scale = W[3];
+    this._first = !this.valid;
+    this._axes();
+    this._headingStep();
+    this._vote();
+    this._hips();
+    this._chain();
+    this._speedStep();
+    this._frame();
+    this._sockets();
+    this.valid = true;
+  }
 
-    // Head axes: forward (0,0,-1) and up (0,1,0) rotated by the head quaternion.
+  /** Head axes: forward (0,0,−1) and up (0,1,0) rotated by the head quaternion; pitch. */
+  _axes() {
+    const H = this._head, W = this._w;
     const qx = H[3], qy = H[4], qz = H[5], qw = H[6];
-    const fx = -2 * (qx * qz + qw * qy), fy = 2 * (qw * qx - qy * qz), fz = -(1 - 2 * (qx * qx + qy * qy));
-    const ux = 2 * (qx * qy - qw * qz), uz = 2 * (qy * qz + qw * qx);
-    const sp = clamp(-fy, -1, 1), pitchDown = Math.asin(sp), hPitch = -pitchDown;
+    W[6] = -2 * (qx * qz + qw * qy);
+    W[7] = 2 * (qw * qx - qy * qz);
+    W[8] = -(1 - 2 * (qx * qx + qy * qy));
+    W[9] = 2 * (qx * qy - qw * qz);
+    W[10] = 2 * (qy * qz + qw * qx);
+    const sp = clamp(-W[7], -1, 1);
+    W[4] = Math.asin(sp);       // pitch down
+    W[5] = -W[4];               // pitch (+ up)
+  }
 
-    // 1. Heading that holds while looking down: forward + up · sign(pitch down), flattened.
-    const k = B.upWeight * (sp > 0 ? 1 : sp < 0 ? -1 : 0);
-    const hx = fx + ux * k, hz = fz + uz * k;
+  /** 1. A heading that holds while looking down: forward + up · sign(pitch down), flattened; the freeze. */
+  _headingStep() {
+    const B = BODY_EST, W = this._w, dt = W[0];
+    const sp = -W[7], k = B.upWeight * (sp > 0 ? 1 : sp < 0 ? -1 : 0);
+    const hx = W[6] + W[9] * k, hz = W[8] + W[10] * k;
     const raw = hx * hx + hz * hz > 1e-12 ? Math.atan2(-hx, -hz) : this.heading;
-    let frz = smooth(B.freezeFrom, B.freezeTo, pitchDown);
+    let frz = smooth(B.freezeFrom, B.freezeTo, W[4]);
     frz *= 1 - B.walkFreezeK * clamp(this.speed / B.walkFreezeSpeed, 0, 1);
     this.freeze = frz;
-    if (first) this.heading = raw;
+    if (this._first) this.heading = raw;
     const tau = B.tauAhead + (B.tauDown - B.tauAhead) * frz;
     this.heading = wrap(this.heading + wrap(raw - this.heading) * (1 - Math.exp(-dt / tau)));
-    const hh = this.heading;
+  }
 
-    // 2. Raised hands in front say where the chest faces (never while looking down or reaching low).
+  /** 2. Raised hands in front say where the chest faces (never while looking down or reaching low). */
+  _vote() {
+    const B = BODY_EST, W = this._w, H = this._head, h = this._hand, dt = W[0], s = W[3], hh = this.heading, frz = this.freeze;
     let sx = 0, cx = 0, wt = 0;
     for (let i = 0; i < 2; i++) {
-      const o = i * 4, h = this._hand;
+      const o = i * 4;
       if (!h[o + 3]) continue;
       const dx = h[o] - H[0], dz = h[o + 2] - H[2], drop = H[1] - h[o + 1];
       const d = wrap(Math.atan2(-dx, -dz) - hh);
-      let w = smooth(B.voteDropOut * s, B.voteDropIn * s, drop) * smooth(B.voteNear * s, B.voteFar * s, Math.hypot(dx, dz))
+      let w = smooth(B.voteDropOut * s, B.voteDropIn * s, drop) * smooth(B.voteNear * s, B.voteFar * s, Math.sqrt(dx * dx + dz * dz))
         * smooth(B.voteAngOut, B.voteAngIn, Math.abs(d));
       w *= (1 - frz) * smooth(B.reachDropOut * s, B.reachDropIn * s, drop);
       if (!(w > 0)) continue;
@@ -337,15 +346,19 @@ export class BodyEstimator {
       sx += w * Math.sin(d); cx += w * Math.cos(d); wt += w;
     }
     const kh = 1 - Math.exp(-dt * B.handsRate);
-    if (first) { this.handConf = 0; this.handYaw = hh; }
+    if (this._first) { this.handConf = 0; this.handYaw = hh; }
     this.handConf += (Math.min(1, wt / B.voteSum) - this.handConf) * kh;
     const haT = wt > 1e-3 ? hh + Math.atan2(sx, cx) : hh;
     this.handYaw = wrap(this.handYaw + wrap(haT - this.handYaw) * kh);
     const hOff = wrap(this.handYaw - hh) * this.handConf;
-    const fYaw = hh + hOff * B.handsGain, chT = hh + hOff * Math.min(1, B.handsGain + B.chestGain);
+    W[11] = hh + hOff * B.handsGain;                                   // where the hips aim
+    W[12] = hh + hOff * Math.min(1, B.handsGain + B.chestGain);        // where the chest aims
+  }
 
-    // 3. Hips: dead zone, capped catch-up, slow settle; nearly frozen while looking down.
-    if (first) this.yaw = wrap(fYaw);
+  /** 3. Hips: dead zone, capped catch-up, slow settle; nearly frozen while looking down. */
+  _hips() {
+    const B = BODY_EST, W = this._w, dt = W[0], frz = this.freeze, fYaw = W[11];
+    if (this._first) this.yaw = wrap(fYaw);
     let dYaw = wrap(fYaw - this.yaw);
     const dead = B.dead + B.deadFrozenAdd * frz, ex = Math.abs(dYaw) - dead;
     if (ex > 0) {
@@ -357,52 +370,68 @@ export class BodyEstimator {
     const rate = (B.settle + this.speed * B.settleWalk) * (1 - (1 - B.settleFrozenK) * frz);
     this.yaw = wrap(this.yaw + dYaw * (1 - Math.exp(-dt * rate)));
     const yaw = this.yaw;
-    this.chestYaw = wrap(yaw + clamp(wrap(chT - yaw), -B.chestMax, B.chestMax) * (B.chestFollow + B.chestGain * this.handConf));
+    this.chestYaw = wrap(yaw + clamp(wrap(W[12] - yaw), -B.chestMax, B.chestMax) * (B.chestFollow + B.chestGain * this.handConf));
+  }
 
-    // 4. Neck chain: eyes → atlas → C7 (half the nod), body 8 cm forward, torso down to the pelvis.
+  /** 4. Neck chain: eyes → atlas → C7 (half the nod), body 8 cm forward, torso down to the pelvis. */
+  _chain() {
+    const B = BODY_EST, W = this._w, H = this._head, v = this._v, dt = W[0], s = W[3], floorY = W[1], hPitch = W[5];
     qRotate(this._hq, B.atlas[0] * s, B.atlas[1] * s, B.atlas[2] * s, v, 0);
     const ax = H[0] + v[0], ay = H[1] + v[1], az = H[2] + v[2];
     const npT = clamp(hPitch * B.neckPitchK, B.neckPitchMin, B.neckPitchMax);
-    this.neckPitch = first ? npT : this.neckPitch + (npT - this.neckPitch) * (1 - Math.exp(-dt * B.neckRate));
+    this.neckPitch = this._first ? npT : this.neckPitch + (npT - this.neckPitch) * (1 - Math.exp(-dt * B.neckRate));
     qEulerYXZ(this.neckPitch, this.chestYaw, 0, this._q);
     qRotate(this._q, B.c7[0] * s, B.c7[1] * s, B.c7[2] * s, v, 0);
-    const bfx = -Math.sin(yaw) * B.bodyFwd * s, bfz = -Math.cos(yaw) * B.bodyFwd * s;
+    const yaw = this.yaw, cy = Math.cos(yaw), sy = Math.sin(yaw);
     const C = this.c7;
-    C[0] = ax + v[0] + bfx; C[1] = ay + v[1]; C[2] = az + v[2] + bfz;
-    const eyeH = H[1] - floorY;
-    const drop = Math.max(0, standEye - eyeH);
+    C[0] = ax + v[0] - sy * B.bodyFwd * s; C[1] = ay + v[1]; C[2] = az + v[2] - cy * B.bodyFwd * s;
+    const drop = Math.max(0, W[2] - (H[1] - floorY));
     const leanT = clamp(drop * B.leanCrouchK, 0, B.leanCrouchMax) + clamp(-hPitch - B.leanLookFrom, 0, B.leanLookMax) * B.leanLookK;
-    this.lean = first ? leanT : this.lean + (leanT - this.lean) * (1 - Math.exp(-dt * B.leanRate));
+    this.lean = this._first ? leanT : this.lean + (leanT - this.lean) * (1 - Math.exp(-dt * B.leanRate));
     const Lt = B.torso * s, ly = -Lt * Math.cos(this.lean), lz = Lt * Math.sin(this.lean) - B.pelvisBack * s;
-    const P = this.pelvis, cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const P = this.pelvis;
     P[0] = C[0] + sy * lz; P[1] = Math.max(C[1] + ly, floorY + B.pelvisMinAboveFloor); P[2] = C[2] + cy * lz;
-
-    // Pelvis speed (walking eases the freeze and speeds the settle).
-    if (!first && dt > 0) {
-      let vx = (P[0] - this._lastP[0]) / dt, vz = (P[2] - this._lastP[2]) / dt;
-      if (Math.hypot(vx, vz) > 6) vx = vz = 0;               // a jump in tracking, not a walk
-      const kv = 1 - Math.exp(-dt * 8);
-      this._vel[0] += (vx - this._vel[0]) * kv; this._vel[1] += (vz - this._vel[1]) * kv;
-      this.speed = Math.hypot(this._vel[0], this._vel[1]);
-    }
-    this._lastP[0] = P[0]; this._lastP[1] = P[1]; this._lastP[2] = P[2];
-
-    // 5. Smoothed frame the sockets hang from (critically damped).
-    const n = Math.max(1, Math.ceil(dt / B.maxStep)), w = B.omega;
-    for (let i = 0; i < 3; i++) {
-      if (first) { this._sp[i].snap(P[i]); this._sc[i].snap(C[i]); } else { this._sp[i].step(P[i], dt, w, n, false); this._sc[i].step(C[i], dt, w, n, false); }
-    }
-    if (first) { this._sy.snap(yaw); this._scy.snap(this.chestYaw); } else { this._sy.step(yaw, dt, w, n, true); this._scy.step(this.chestYaw, dt, w, n, true); }
-    const pS = this.pelvisS;
-    pS[0] = this._sp[0].x; pS[1] = this._sp[1].x; pS[2] = this._sp[2].x;
-    this.yawS = this._sy.x;
-    this._sockets(s);
-    this.valid = true;
   }
 
-  /** @param {number} s body scale */
-  _sockets(s) {
-    const B = BODY_EST, pS = this.pelvisS, q = this._q, v = this._v;
+  /** Pelvis speed (walking eases the freeze and speeds the settle). */
+  _speedStep() {
+    const P = this.pelvis, L = this._lastP, V = this._vel, dt = this._w[0];
+    if (!this._first && dt > 0) {
+      let vx = (P[0] - L[0]) / dt, vz = (P[2] - L[2]) / dt;
+      if (vx * vx + vz * vz > 36) vx = vz = 0;               // a jump in tracking, not a walk
+      const kv = 1 - Math.exp(-dt * 8);
+      V[0] += (vx - V[0]) * kv; V[1] += (vz - V[1]) * kv;
+      this.speed = Math.sqrt(V[0] * V[0] + V[1] * V[1]);
+    }
+    L[0] = P[0]; L[1] = P[1]; L[2] = P[2];
+  }
+
+  /** 5. The smoothed frame the sockets hang from: critically damped pelvis, C7, hip and chest yaw. */
+  _frame() {
+    const T = this._ft, X = this._fx, V = this._fv, P = this.pelvis, C = this.c7, dt = this._w[0];
+    T[0] = P[0]; T[1] = P[1]; T[2] = P[2]; T[3] = C[0]; T[4] = C[1]; T[5] = C[2]; T[6] = this.yaw; T[7] = this.chestYaw;
+    if (this._first) { for (let i = 0; i < 8; i++) { X[i] = T[i]; V[i] = 0; } } else {
+      const w = BODY_EST.omega, w2 = w * w, c = 2 * w;
+      const n = Math.max(1, Math.ceil(dt / BODY_EST.maxStep)), h = dt / n;
+      for (let k = 0; k < n; k++) {
+        for (let i = 0; i < 8; i++) {
+          let e = T[i] - X[i];
+          if (i >= 6) e = wrap(e);
+          V[i] += (w2 * e - c * V[i]) * h;
+          X[i] += V[i] * h;
+        }
+      }
+      X[6] = wrap(X[6]);
+      X[7] = wrap(X[7]);
+    }
+    const pS = this.pelvisS;
+    pS[0] = X[0]; pS[1] = X[1]; pS[2] = X[2];
+    this.yawS = X[6];
+  }
+
+  /** Holster, pouch, thighs and back from the smoothed frame. */
+  _sockets() {
+    const B = BODY_EST, pS = this.pelvisS, q = this._q, v = this._v, s = this._w[3];
     qYaw(this.yawS, q);
     // holster (palm point + pistol orientation)
     const hp = B.holster;
@@ -424,10 +453,11 @@ export class BodyEstimator {
       T[o + 3] = T[o] - sy * B.kneeFwd * s; T[o + 4] = pS[1] - B.thigh * s; T[o + 5] = T[o + 2] - cy * B.kneeFwd * s;
     }
     // back (rifle palm point behind the right shoulder; chest frame)
-    qYaw(this._scy.x, this._q2);
+    const fx = this._fx;
+    qYaw(fx[7], this._q2);
     const bp = B.back, Bk = this.back;
     qRotate(this._q2, bp[0] * s, bp[1] * s, bp[2] * s, v, 0);
-    Bk.p[0] = this._sc[0].x + v[0]; Bk.p[1] = this._sc[1].x + v[1]; Bk.p[2] = this._sc[2].x + v[2];
+    Bk.p[0] = fx[3] + v[0]; Bk.p[1] = fx[4] + v[1]; Bk.p[2] = fx[5] + v[2];
     qMul(this._q2, this._qBack, Bk.q);
     qRotate(Bk.q, 0, 0, 1, this.backAxis, 0);
   }

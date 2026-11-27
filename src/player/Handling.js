@@ -134,47 +134,64 @@ export class TriggerGate {
   }
 }
 
+const _ss = new Float64Array(1);
+const _o = { x: 0, y: 0, z: 0 }, _d = { x: 0, y: 0, z: 0 };
+
+/**
+ * Squared shortest distance between the segment o + d·t (t ∈ [0, len], d unit)
+ * and the segment s[k..k+2]–s[k+3..k+5], written to _ss[0] (objects in, nothing
+ * returned: no number is boxed across the call).
+ * @param {{ x: number, y: number, z: number }} O @param {{ x: number, y: number, z: number }} D
+ * @param {number} len @param {ArrayLike<number>} s @param {number} k
+ */
+function segSeg2(O, D, len, s, k) {
+  const ox = O.x, oy = O.y, oz = O.z;
+  const ax = s[k], ay = s[k + 1], az = s[k + 2];
+  const ex = s[k + 3] - ax, ey = s[k + 4] - ay, ez = s[k + 5] - az;
+  const ux = D.x * len, uy = D.y * len, uz = D.z * len;
+  const rx = ox - ax, ry = oy - ay, rz = oz - az;
+  const a = ux * ux + uy * uy + uz * uz, e = ex * ex + ey * ey + ez * ez, f = ex * rx + ey * ry + ez * rz;
+  let t = 0, u = 0;
+  if (a < 1e-12 && e < 1e-12) { t = 0; u = 0; } else if (a < 1e-12) { t = 0; u = f / e; u = u < 0 ? 0 : u > 1 ? 1 : u; } else {
+    const c = ux * rx + uy * ry + uz * rz;
+    if (e < 1e-12) { u = 0; t = -c / a; t = t < 0 ? 0 : t > 1 ? 1 : t; } else {
+      const b = ux * ex + uy * ey + uz * ez, den = a * e - b * b;
+      t = den > 1e-12 ? (b * f - c * e) / den : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      u = (b * t + f) / e;
+      if (u < 0) { u = 0; t = -c / a; t = t < 0 ? 0 : t > 1 ? 1 : t; } else if (u > 1) { u = 1; t = (b - c) / a; t = t < 0 ? 0 : t > 1 ? 1 : t; }
+    }
+  }
+  const px = ox + ux * t - (ax + ex * u), py = oy + uy * t - (ay + ey * u), pz = oz + uz * t - (az + ez * u);
+  _ss[0] = px * px + py * py + pz * pz;
+}
+
 /**
  * Shortest distance between the segment o + d·t (t ∈ [0, len], d unit) and
- * the segment a–b.
+ * the segment a–b (at s[o..o+5]).
  * @param {number} ox @param {number} oy @param {number} oz
  * @param {number} dx @param {number} dy @param {number} dz @param {number} len
  * @param {ArrayLike<number>} s segment points [ax, ay, az, bx, by, bz] at offset `o`
  * @param {number} o
  */
 export function segSegDist(ox, oy, oz, dx, dy, dz, len, s, o) {
-  const ax = s[o], ay = s[o + 1], az = s[o + 2];
-  const ex = s[o + 3] - ax, ey = s[o + 4] - ay, ez = s[o + 5] - az;
-  const ux = dx * len, uy = dy * len, uz = dz * len;
-  const rx = ox - ax, ry = oy - ay, rz = oz - az;
-  const a = ux * ux + uy * uy + uz * uz, e = ex * ex + ey * ey + ez * ez, f = ex * rx + ey * ry + ez * rz;
-  let t, u;
-  if (a < 1e-12 && e < 1e-12) { t = 0; u = 0; } else if (a < 1e-12) { t = 0; u = clamp01(f / e); } else {
-    const c = ux * rx + uy * ry + uz * rz;
-    if (e < 1e-12) { u = 0; t = clamp01(-c / a); } else {
-      const b = ux * ex + uy * ey + uz * ez, den = a * e - b * b;
-      t = den > 1e-12 ? clamp01((b * f - c * e) / den) : 0;
-      u = (b * t + f) / e;
-      if (u < 0) { u = 0; t = clamp01(-c / a); } else if (u > 1) { u = 1; t = clamp01((b - c) / a); }
-    }
-  }
-  const px = ox + ux * t - (ax + ex * u), py = oy + uy * t - (ay + ey * u), pz = oz + uz * t - (az + ez * u);
-  return Math.sqrt(px * px + py * py + pz * pz);
+  _o.x = ox; _o.y = oy; _o.z = oz; _d.x = dx; _d.y = dy; _d.z = dz;
+  segSeg2(_o, _d, len, s, o);
+  return Math.sqrt(_ss[0]);
 }
-
-/** @param {number} x */
-function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 
 /**
  * Does the bore line point at either estimated thigh?
- * @param {number} ox @param {number} oy @param {number} oz muzzle
- * @param {number} dx @param {number} dy @param {number} dz bore (unit)
+ * @param {{ x: number, y: number, z: number }} muzzle
+ * @param {{ x: number, y: number, z: number }} bore unit direction
  * @param {ArrayLike<number>} thighs hip L, knee L, hip R, knee R (BodyEstimator.thighs)
  */
-export function boreAtThighs(ox, oy, oz, dx, dy, dz, thighs) {
-  const H = HANDLING;
-  return segSegDist(ox, oy, oz, dx, dy, dz, H.gateRay, thighs, 0) < H.gateThigh
-    || segSegDist(ox, oy, oz, dx, dy, dz, H.gateRay, thighs, 6) < H.gateThigh;
+export function boreAtThighs(muzzle, bore, thighs) {
+  const H = HANDLING, r2 = H.gateThigh * H.gateThigh;
+  segSeg2(muzzle, bore, H.gateRay, thighs, 0);
+  if (_ss[0] < r2) return true;
+  segSeg2(muzzle, bore, H.gateRay, thighs, 6);
+  return _ss[0] < r2;
 }
 
 /**
