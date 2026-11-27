@@ -23,14 +23,17 @@ import { EDGE_VERTS_PER_BOX, OCC_INDICES_PER_BOX, OCC_VERTS_PER_BOX, writeOcclud
 export { captureSnapshot, loadFixture, normalizeSnapshot, CaptureGate } from './Snapshot.js';
 export { NavGrid } from './NavGrid.js';
 export { PathPlanner, PATH_PENDING, PATH_FAILED } from './PathPlanner.js';
+export { DriftWatch, transformSnapshot, pickReferencePlanes, rigidFromPoses, resetTransform } from './Realign.js';
 
 export class World extends WorldCore {
   /**
-   * @param {{ navCapacity?: number, maxShapes?: number, seed?: number, agentClearance?: number, maxOccluderBoxes?: number }} [o]
+   * @param {{ navCapacity?: number, maxShapes?: number, seed?: number, agentClearance?: number, maxOccluderBoxes?: number,
+   *   roam?: boolean, bakeBudgetMs?: number, spawnBudgetMs?: number }} [o]
+   *   roam defaults to true here: Roam (the whole house) is the default play mode (v0.3)
    */
   constructor(o = {}) {
-    super(o);
-    this.maxOccluderBoxes = o.maxOccluderBoxes ?? 256;
+    super({ roam: true, ...o });
+    this.maxOccluderBoxes = o.maxOccluderBoxes ?? 512;
     const pos = new Float32Array(this.maxOccluderBoxes * OCC_VERTS_PER_BOX * 3);
     const idx = new Uint16Array(this.maxOccluderBoxes * OCC_INDICES_PER_BOX);
     const geo = new THREE.BufferGeometry();
@@ -115,10 +118,11 @@ export class World extends WorldCore {
   /**
    * @param {import('./Layout.js').SpaceSnapshot|null} snapshot
    * @param {{ x: number, z: number, r?: number }} playerStart
-   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null }} [opts] see WorldCore.build
+   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null, roam?: boolean }} [opts] see WorldCore.build
+   * @returns {boolean} false when a Roam build was skipped (nothing rewritten, nothing to upload)
    */
   build(snapshot, playerStart, opts) {
-    super.build(snapshot, playerStart, opts);
+    if (!super.build(snapshot, playerStart, opts)) return false;
     const boxes = this.layout ? this.layout.boxes : [];
     const pos = /** @type {Float32Array} */ (this.occPos.array), idx = /** @type {Uint16Array} */ (this.occIdx.array);
     const n = writeOccluderBoxes(boxes, pos, idx, this.maxOccluderBoxes);
@@ -146,6 +150,7 @@ export class World extends WorldCore {
     this.ovPos.needsUpdate = true;
     this.ovCol.needsUpdate = true;
     this.overlay.visible = this.overlayOn && nv > 0;
+    return true;
   }
 
   /** WorldCore.report plus the meshes' fill. */

@@ -59,14 +59,14 @@ test('every listed file exists with the recorded size; total under 12 MB', () =>
 });
 
 for (const id of WEAPON_IDS) {
-  test(`${id}.glb: one 'gun' primitive with _PART, one 'mag' primitive, one material, KTX2 <= 2048, <= 30k tris`, () => {
+  test(`${id}.glb: one 'gun' primitive with _PART, one 'mag' primitive, one gun material (+ the glove's), KTX2 <= 2048, <= 30k tris`, () => {
     const { json, bin } = readGlb(join(assetsDir, manifest.models[id]));
     for (const ext of ['EXT_meshopt_compression', 'KHR_texture_basisu', 'KHR_mesh_quantization']) assert.ok(json.extensionsRequired.includes(ext), ext);
     const node = (n) => json.nodes.find((x) => x.name === n);
     const gun = json.meshes[node('gun').mesh], mag = json.meshes[node('mag').mesh];
     assert.equal(gun.primitives.length, 1);
     assert.equal(mag.primitives.length, 1);
-    assert.equal(json.materials.length, 1);
+    assert.equal(json.materials.filter((m) => m.name !== 'hand').length, 1, 'one gun material');
     assert.equal(gun.primitives[0].material, mag.primitives[0].material);
     const part = json.accessors[gun.primitives[0].attributes._PART];
     assert.equal(part.type, 'SCALAR');
@@ -76,7 +76,7 @@ for (const id of WEAPON_IDS) {
     assert.equal(tris, manifest.weapons[id].tris);
     assert.ok(!node('gun').translation && !node('gun').rotation && !node('gun').scale, 'gun node at identity');
     assert.deepEqual(node('mag').translation.map((x) => +x.toFixed(5)), manifest.weapons[id].magLocalSeat);
-    assert.equal(json.images.length, 3);
+    assert.equal(json.images.length, manifest.weapons[id].hands ? 6 : 3, 'gun base / normal / ORM (+ glove base / normal / ORM)');
     for (const img of json.images) {
       assert.equal(img.mimeType, 'image/ktx2');
       const bv = json.bufferViews[img.bufferView];
@@ -87,6 +87,36 @@ for (const id of WEAPON_IDS) {
     const pos = json.accessors[gun.primitives[0].attributes.POSITION];
     assert.equal(pos.componentType, 5126, 'float positions (no dequantisation transform)');
     assert.ok(pos.min[2] <= manifest.weapons[id].muzzle[2] + 1e-4);
+  });
+
+  test(`${id}.glb: gloved hands (v0.3): one primitive each with float _PART, the glove material, ≤ 4k tris a hand, around the grip`, () => {
+    const H = manifest.weapons[id].hands;
+    assert.ok(H, 'manifest weapons.' + id + '.hands');
+    const { json } = readGlb(join(assetsDir, manifest.models[id]));
+    const node = (n) => json.nodes.find((x) => x.name === n);
+    const want = id === 'akm' ? ['hand_r', 'hand_l'] : ['hand_r'];
+    assert.deepEqual(H.nodes, want);
+    let tris = 0;
+    for (const n of want) {
+      const nd = node(n);
+      assert.ok(nd && !nd.translation && !nd.rotation && !nd.scale, `${n} at identity (gun space)`);
+      const mesh = json.meshes[nd.mesh];
+      assert.equal(mesh.primitives.length, 1);
+      const prim = mesh.primitives[0];
+      assert.equal(json.materials[prim.material].name, 'hand');
+      assert.equal(json.accessors[prim.attributes._PART].componentType, 5126);
+      const t = triCount(json, prim);
+      assert.ok(t > 1500 && t <= 4000, `${n}: ${t} tris`);
+      tris += t;
+      const pos = json.accessors[prim.attributes.POSITION];
+      if (n === 'hand_r') {
+        const g = manifest.weapons[id].grip.pos;
+        for (let k = 0; k < 3; k++) assert.ok(pos.min[k] < g[k] && pos.max[k] > g[k], `${n} wraps the grip centre (axis ${k}: ${pos.min[k]}…${pos.max[k]})`);
+      } else {
+        assert.ok(pos.max[2] < manifest.weapons.akm.grip.pos[2] - 0.15 && pos.min[2] > manifest.weapons.akm.muzzle[2], 'left hand on the handguard');
+      }
+    }
+    assert.equal(tris, H.tris);
   });
 
   test(`${id} manifest points are consistent with gun space`, () => {

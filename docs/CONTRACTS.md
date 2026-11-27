@@ -8,12 +8,19 @@
 
 Read first: `CLAUDE.md`, `docs/PLAN.md` (§5, §8–10, §14), `docs/ARCHITECTURE.md`, `docs/DEVICE_LOG.md` (real Quest facts).
 
+**v0.3 changes to these contracts** (the user's v0.2 headset test; details in DECISIONS.md and the sections below):
+- **Play is Roam** (the whole house) by default: it requests `unbounded` and uses it when granted, else `local-floor` (the Quest boundary then applies; `spaceNote`). There is no fixed safe zone. The stationary v0.2 mode is the page's second button, `spot`.
+- **The Watch** (`src/ui/Watch.js`, builder U) replaces `WristHud`: status dial on the left wrist and the game's only menu. Warnings are diegetic (`watch.warn(kind, level)`: vibration + a dial icon); no head-locked panels during play.
+- **Guns are held in grip space** (`src/weapons/GunFit.js`); the player's per-gun nudges are saved in `localStorage['cqcpt.gunfit.v1']`. CQC's face-button map (A / X magazine release, B / Y slide release or fire mode, on either hand that is on the gun). Gloved hands come inside the gun GLBs.
+- **`scene.environment`** is a PMREM room made in `createRenderer`, before the warm-up, and never replaced.
+- **Reference-space resets and drift** realign the world behind a held pause (`src/world/Realign.js`).
+
 ## Rules for every module
 
 - **Ownership.** Each builder writes **only its own directories** (see "Ownership" at the end). You may read anything. If you need something from another module, code against the interface in this file. Never edit another module's files.
 - **Code style.** Plain ES modules, `// @ts-check`, JSDoc. three.js comes from `import * as THREE from 'three'`. Add-ons come from `'three/addons/…'`, which the import map points at `./vendor/three/addons/` (vendored by the Assets builder).
 - **Units and axes.** Metres and seconds. Right-handed, +Y up.
-    - World = the XR reference space (`local-floor` in play), with y = 0 at the floor.
+    - World = the XR reference space (Roam: `unbounded` when granted, else `local-floor`; spot: `local-floor`). Under `unbounded` the floor is not at y = 0: read `world.floorY(x, z)`.
     - XR pose matrices are column-major `Float32Array(16)`. Use `matrix.fromArray()`.
 - **Zero allocations per frame.**
     - No `new`, closures, array literals, spread, `forEach` or template strings in `update()` paths.
@@ -43,6 +50,7 @@ Built by the integration layer and passed to every system:
  * @property {Assets} assets
  * @property {{ flashLights: import('three').PointLight[] }} gfx
  * @property {Player} player
+ * @property {BodyEstimator} body   // v0.3: weapons.body (holster sockets, `seated`): one seated decision for everyone
  * @property {(ox:number,oy:number,oz:number,dx:number,dy:number,dz:number,max:number,out:Hit,ignoreEnemy?:number)=>boolean} raycast  // world + enemies, nearest
  */
 ```
@@ -204,15 +212,16 @@ export class PathPlanner { /* pure, time-sliced A*: */ request(id, sx,sz, gx,gz)
 - `src/weapons/WeaponSystem.js` (the system that registers): owns both weapons.
     - Right trigger fires using `ctx.raycast` from the muzzle along the bore (the hit uses the bore at the moment the trigger breaks).
     - Hits emit `enemyHit` or world FX.
-    - **A** = magazine release: the magazine drops as a pooled ballistic object.
+    - **A** (or **X** with the left hand on the gun) = magazine release (v0.3, CQC): the magazine leaves the well at 1.1 m/s as a pooled ballistic object.
     - **Left grip at the pouch** takes a fresh magazine in the left hand. It seats when within 3 cm laterally, aligned (dot > 0.7), and pushed in.
     - **Rack:** the left grip within 0.085 m of the rack point, pulled back past 90 %.
-    - **B** = slide release.
+    - **B** (or **Y** with the left hand on the gun) = Glock slide release; AKM selector (safe → auto → semi).
     - **Right stick click** = AKM selector.
-    - **Second A press with the magazine out** = assisted reload (1.2 s) for testing.
+    - **Hold A 0.8 s with no magazine** = assisted reload (1.2 s) for testing (v0.3; a second tap no longer reloads).
+    - v0.3: `busyLeft` / `busyRight` (Y and B + Y belong to the game only with free hands), `triggerBlocked` (the watch has the trigger), `fitHold(id|null)` (the watch's GUN FIT page), `setFit(id, {pitch, up, fwd}, source)`, `loadFits`, `fitsJSON`, `fitReport`, `setGloves`, `aimRayFor`.
     - **AKM two-handed:** while the left grip is held near `support`, the aim direction runs from the right grip to the left hand, and recoil is × 0.55.
     - **Haptics** (`hapticActuators[0].pulse`): shot 1.0 / 45 ms; slide home 0.75; magazine catch 0.28; rack 0.55.
-    - **Ammo** for the HUD: `weaponSystem.ammo()` returns `{ weapon, mag, chambered }`.
+    - **Ammo** for the watch: `weaponSystem.ammo()` returns `{ weapon, mag, chambered, mode }`.
 
 ## Enemies (builder E): `src/enemies/`
 
@@ -247,7 +256,7 @@ export class EnemyManager {
 - **Enemy shots** use `ctx.world.segmentClear` and the player capsule (`ctx.player`). They emit `playerHit` (torso 25, head 50) and `enemyShot`.
 - **Draw calls:** at most 2 per enemy (body + rifle). Animate bones fully when within 8 m and visible; otherwise at 20 Hz, round-robin.
 
-## Game, audio, HUD (builder G): `src/game/`, `src/audio/`, `src/ui/WristHud.js`
+## Game, audio, watch (builders G / R, U): `src/game/`, `src/audio/`, `src/ui/Watch.js`
 
 - `src/audio/AudioEngine.js`:
     - `unlock()` is called inside the Enter click.
@@ -259,19 +268,22 @@ export class EnemyManager {
     - No decode or allocation per play. Reuse source nodes where possible; creating an `AudioBufferSourceNode` per play is acceptable (the browser requires it), but nothing else.
 - `src/game/Player.js`: the `Player` object updated from the camera.
 - `src/game/GameSession.js`: survival waves.
-    - Wave n has 2 + n enemies, at most 4 alive at once; spawns come from `world.findSpawn`.
+    - Wave n has 2 + n enemies, at most 4 alive at once; spawns come from `world.findSpawn` (Roam: `world.spawnRoamFor`, another room than the player's).
     - 5 s break between waves, which heals 25.
     - Player health 100. On death, a `roundOver` card appears. **Y** = restart.
-    - **Safe zone:** centred where the player confirmed the spot (v0.2.1; v0.2: where they stood at the start), r = 0.8 m.
+    - **Roam (v0.3 default):** no zone. Running (≥ 0.9 m/s), the edge of the mapped floor and walls near the head are watch warnings, not pauses; tracking loss, visibility, controllers, frame gaps, B + Y, the watch menu and resets pause.
+    - **Safe zone (spot mode):** centred where the player confirmed the spot (v0.2.1; v0.2: where they stood at the start), r = 0.8 m.
         - A floor ring shows near the edge.
         - The head beyond r gives a full pause ("Return to your spot"). Resume after 0.5 s back inside, then a 3-2-1 countdown.
     - Visibility blur also pauses.
-    - **Exit** is in the wrist menu or by holding **Y** for 2 s. Both grips are needed for the AKM, so they are not an exit in play.
+    - **Exit** is in the watch menu (EXIT, two taps) or by holding **Y** for 2 s with a free left hand. Both grips are needed for the AKM, so they are not an exit in play.
     - Damage feedback: a red view tint of at most 0.3 opacity for at most 0.3 s, plus a hit sound and a haptic.
-- `src/ui/WristHud.js`: a small canvas panel on the left wrist (taken from the left grip pose).
-    - Shows wave, health, kills and an ammo line (toggle, default on for the test).
-    - Redraws only on change, at most 2 per second.
-    - Also floating messages: "Get ready", "Wave 2", "Round over — Y to restart".
+- `src/ui/Watch.js` (v0.3, replaces `WristHud`): a steel dive watch on the back of the left wrist (frame from the left target ray).
+    - Dial: health, rounds + chamber, wave, AKM fire mode, one info line (a warning, the state, or the kills). Readouts redraw on change only, at most 2 per second, through the shared upload gate.
+    - Wake on a wrist check; touch the dial with the right controller (or point + trigger) to open the menu: RESUME, RESTART, DIFFICULTY, MODE, GUN FIT, AMMO LINE, EXIT. `onAction(name, value)` reaches PlayKit; `capture` says when the trigger belongs to the watch.
+    - `warn(kind, level)` for run, edge, obstacle, stairs, tracking (GameSession is the sink).
+    - `WristHud.js` stays only for its legacy unit test; nothing in the app uses it.
+- GameSession's floating messages: spot mode "Get ready", "Wave 2", "Round over — Y to restart"; Roam shows only pauses, round over and exiting.
 
 ## Integration (builder I)
 
@@ -284,6 +296,7 @@ export class EnemyManager {
 - **App wiring:** `App.started` for mode `play` creates the Ctx and registers the systems in the order above (`PerfMonitor` system names to match).
     - It captures the Space Setup snapshot, builds the World and starts the GameSession behind a "Get ready" panel (with one draw of the pools behind it).
     - v0.2.1: the panel carries a controls card; then `game.pickSpot` lets the player confirm an open spot with the trigger (the world is rebuilt around it, behind the panel, when it is more than 0.25 m from the build point), and `game.start(zone)` starts the round there.
+    - v0.3: modes `play` (Roam), `spot` and `reduced` run the game. Roam: the card's trigger pull starts the round where the player stands (no spot, no rebuild); the Roam bake runs in slices (4 ms a frame behind the card, 1 ms in play). A reset during the round → REALIGN (held pause, enemies back in the queue, `world.realign`) → REWARM (one warm draw) → `game.realigned()`. The DriftWatch checks the Space Setup reference planes once a second.
     - It stores the snapshot in the session record (`rec.spaceSnapshot`), so the user's real house can be replayed on desktop later.
     - The `probe` mode stays as it is.
 - **`?emulate`:** loads `tests/fixtures/house.json`. IWER has no scene data.
@@ -303,5 +316,7 @@ export class EnemyManager {
 | W1 (weapon core) | `src/weapons/WeaponDefs.js`, `src/weapons/WeaponInstance.js`, `src/weapons/Recoil.js`, `tests/unit/weapon*.test.js`, `tests/unit/recoil*.test.js` |
 | W2 (weapon view) | `src/weapons/WeaponView.js`, `src/weapons/WeaponFX.js`, `src/weapons/WeaponSystem.js`, `src/player/**`, `tests/unit/body*.test.js`, `tests/unit/slots*.test.js` |
 | E (enemies) | `src/enemies/**`, `tests/unit/enemy*.test.js` |
-| G (game) | `src/game/**`, `src/audio/**`, `src/ui/WristHud.js`, `tests/unit/game*.test.js`, `tests/unit/audio*.test.js` |
-| I (integration) | everything else (`src/app/**`, `src/main.js`, `index.html`, `src/core/Warmup.js`, `tests/e2e/**`, `docs/**`), plus fixes anywhere after the builders finish |
+| G (game) | `src/game/**`, `src/audio/**`, `src/ui/WristHud.js` (legacy), `tests/unit/game*.test.js`, `tests/unit/audio*.test.js` |
+| U (watch, v0.3) | `src/ui/Watch.js`, `src/ui/watch*.js`, `src/ui/HomePage.js`, `tests/unit/watch*.test.js` |
+| R (Roam, v0.3) | `src/xr/XRSession.js`, `src/world/**` (Roam, Realign), `src/safety/**`, `src/game/**`, their tests |
+| I (integration) | everything else (`src/app/**`, `src/main.js`, `index.html`, `src/core/Warmup.js`, `tests/e2e/**`, `docs/**`), plus fixes anywhere after the builders finish (v0.3: `WeaponSystem.triggerBlocked` / `fitHold`, the Spot button in `HomePage`) |

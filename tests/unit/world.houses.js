@@ -98,3 +98,47 @@ export function toHouse(b, x, z) {
   const dx = x - b.ox, dz = z - b.oz;
   return [b.c * dx - b.s * dz, b.s * dx + b.c * dz];
 }
+
+/**
+ * A large synthetic house for the Roam tests (a whole house walked in one
+ * session): 250 m² on one level with the rooms of a three-storey house. A
+ * 25 × 10 m footprint, a 1.6 m corridor along the middle (z 4.2–5.8), ten
+ * 2.5 × 4.2 m rooms either side, each with a door onto the corridor (20) and
+ * five connecting doors per side between neighbours (10): 30 doors, 21 rooms,
+ * two pieces of furniture per room. One floor polygon covers it all (as Quest
+ * does when one Space Setup room spans several real rooms), so every interior
+ * wall has floor on both sides. Yawed 23° in the reference space.
+ * Door ids: 0–9 south rooms → corridor, 10–19 north rooms → corridor, 20–24
+ * south connecting doors (on x = 2.5, 7.5, …), 25–29 north connecting doors.
+ */
+export function largeHouse({ yaw = (23 * Math.PI) / 180 } = {}) {
+  const b = new SnapshotBuilder({ yaw, ox: 4, oz: -6 });
+  const W = 25, D = 10, H = 2.6, c0 = 4.2, c1 = 5.8, rw = 2.5;
+  const f = [[0, 0], [W, 0], [W, D], [0, D]];
+  b.floor(f, 0).ceiling(f, H);
+  for (let i = 0; i < 4; i++) { const [ax, az] = f[i], [bx, bz] = f[(i + 1) % 4]; b.wall(ax, az, bx, bz, 0, H, { extend: 0.1 }); }
+  b.wall(0, c0, W, c0, 0, H, {}).wall(W, c1, 0, c1, 0, H, {});
+  for (let k = 1; k < 10; k++) {
+    b.wall(k * rw, 0, k * rw, c0, 0, H, { flip: k % 2 === 0 });
+    b.wall(k * rw, D, k * rw, c1, 0, H, { flip: k % 2 === 1 });
+  }
+  for (let k = 0; k < 10; k++) b.door(k * rw + 0.8, c0, k * rw + 1.65, c0, 0, 2.03);
+  for (let k = 0; k < 10; k++) b.door(k * rw + 0.8, c1, k * rw + 1.65, c1, 0, 2.03);
+  for (let k = 1; k < 10; k += 2) b.door(k * rw, 1.5, k * rw, 2.35, 0, 2.03);
+  for (let k = 1; k < 10; k += 2) b.door(k * rw, 7.6, k * rw, 8.45, 0, 2.03);
+  for (let k = 0; k < 10; k++) {
+    const x = k * rw;
+    b.top('bed', x + 1.25, 0.95, 0.45, 0.9, 0.55).box('bed', x + 1.25, 0.95, 0.45, 0.9, 0, 0.55);
+    b.top('shelf', x + 2.25, 3.4, 0.18, 0.5, 1.8).box('shelf', x + 2.25, 3.4, 0.18, 0.5, 0, 1.8);
+    b.top('table', x + 1.25, 9.0, 0.5, 0.35, 0.75).box('table', x + 1.25, 9.0, 0.5, 0.35, 0, 0.75);
+    b.top('shelf', x + 0.25, 6.6, 0.18, 0.5, 1.8).box('shelf', x + 0.25, 6.6, 0.18, 0.5, 0, 1.8);
+  }
+  return b;
+}
+
+/** Room rectangles of largeHouse() in house coordinates: S0…S9, N0…N9, corridor. */
+export function largeRooms() {
+  /** @type {Record<string, number[]>} */ const r = { corridor: [0, 4.2, 25, 5.8] };
+  for (let k = 0; k < 10; k++) { r[`S${k}`] = [k * 2.5, 0, k * 2.5 + 2.5, 4.2]; r[`N${k}`] = [k * 2.5, 5.8, k * 2.5 + 2.5, 10]; }
+  return r;
+}

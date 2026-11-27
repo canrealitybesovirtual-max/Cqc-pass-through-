@@ -6,8 +6,9 @@
  *
  * - Glock: holster on the right hip. AKM: slung on the back, taken over the
  *   right shoulder. Spare magazines: pouch on the left hip.
- * - Grab: the empty strong hand within 0.13 m of the holstered grip (for the
- *   back, of the rifle's grip-to-butt line over the shoulder), and the squeeze
+ * - Grab: the empty strong hand within 0.13 m of the holstered grip centre
+ *   (for the back, 0.15 m of the rifle's grip-to-butt line over the
+ *   shoulder), and the squeeze
  *   rises past 0.55, or rose in the last 150 ms when the hand arrives. The gun
  *   settles into the fitted grip in 0.15 s.
  * - Let go within 0.24 m of the slot: the gun travels in along a smooth arc
@@ -21,7 +22,8 @@
 
 export const SLOTS = Object.freeze({
   grabReach: 0.13,
-  backLen: 0.22,          // m of the slung rifle (grip toward the butt) that counts as "over the shoulder" (design)
+  backLen: 0.27,          // m grip centre → butt of the tucked carry (BodyEstimator.backLen is the live value)
+  backReach: 0.15,        // m from that grip-to-butt line over the shoulder (v0.3 research-fit B)
   pouchReach: 0.15,       // m left grip to the pouched magazine's top (CQC pouchReach 0.16 × s)
   slotReach: 0.24,
   armS: 0.15,
@@ -66,7 +68,12 @@ const smoothU = (u) => u * u * (3 - 2 * u);
 export class Carry {
   constructor() {
     this.state = CARRY_SLOT;
-    /** Seconds in the current state. */
+    /**
+     * Seconds in the current state. Born a double (0.5, then 0), so V8 never moves the field from
+     * small-integer to double representation mid-play (a map deprecation migrates objects lazily,
+     * which allocates).
+     */
+    this.t = 0.5;
     this.t = 0;
   }
 

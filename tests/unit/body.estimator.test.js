@@ -50,7 +50,7 @@ test('standing, looking ahead: pelvis and holster where CQC put them (eye 1.70 m
   // pelvis about 0.93 m (CQC rest pelvis 0.935), centred under the head
   assert.ok(Math.abs(e.pelvis[1] - 0.925) < 0.02, `pelvis y ${e.pelvis[1]}`);
   assert.ok(Math.abs(e.pelvis[0]) < 1e-6);
-  // holster palm point: 21 cm to the right, ~1.02 m up (CQC SLOT_HOLSTER mid ride)
+  // holster grip centre: 21 cm to the right, ~1.02 m up (CQC SLOT_HOLSTER mid ride)
   const H = e.holster.p;
   assert.ok(Math.abs(H[0] - 0.212) < 0.005, `holster x ${H[0]}`);
   assert.ok(Math.abs(H[1] - 1.02) < 0.02, `holster y ${H[1]}`);
@@ -63,12 +63,15 @@ test('standing, looking ahead: pelvis and holster where CQC put them (eye 1.70 m
   // pouch: weak side, front of the hip, just above the belt
   const Pp = e.pouch.p;
   assert.ok(Pp[0] < -0.12 && Pp[2] < -0.03 && Pp[1] > 0.98 && Pp[1] < 1.1, `pouch ${[...Pp]}`);
-  // rifle on the back: behind and to the right of the neck, muzzle down-left, butt up-right
+  // rifle on the back (tucked carry): grip centre behind the neck, muzzle down-left, butt up behind the right trapezius
   const B = e.back.p;
-  assert.ok(B[0] > 0.1 && B[2] > 0.1 && B[1] > 1.3 && B[1] < 1.55, `back ${[...B]}`);
+  assert.ok(B[2] > 0.1 && B[1] > 1.25 && B[1] < 1.45 && Math.abs(B[0]) < 0.06, `back ${[...B]}`);
   qRotate(e.back.q, 0, 0, -1, v, 0);
-  assert.ok(v[0] < -0.3 && v[1] < -0.8, 'rifle muzzle down to the left');
+  assert.ok(Math.abs(v[0] + 0.301) < 0.01 && Math.abs(v[1] + 0.954) < 0.01, `rifle muzzle down to the left, 17.5° off vertical ${[...v]}`);
+  qRotate(e.back.q, 1, 0, 0, v, 0);
+  assert.ok(v[2] > 0.99, 'ejection port out of the back');
   assert.ok(e.backAxis[1] > 0.8 && e.backAxis[0] > 0.3, 'grip-to-butt axis up over the right shoulder');
+  assert.ok(Math.abs(e.backLen - 0.2704) < 0.002 && e.backButt[0] > 0.1 && e.backButt[1] > 1.5, `butt ${[...e.backButt]}, len ${e.backLen}`);
   // thighs below the hips
   const T = e.thighs;
   assert.ok(T[1] > T[4] + 0.3 && T[7] > T[10] + 0.3 && T[0] < 0 && T[6] > 0);
@@ -199,7 +202,7 @@ test('update does not allocate (sampling heap profiler)', async () => {
   const step = (i) => { head(e, -0.5 * Math.sin(i * 0.01), Math.sin(i * 0.003)); e.setHand(1, true, hand(0.2, 1.3, -0.4), true); e.update(DT, ref()); };
   for (let i = 0; i < 20000; i++) step(i);
   let best = Infinity, by = null;
-  for (let r = 0; r < 3 && best > 0; r++) {
+  for (let r = 0; r < 8 && best > 0; r++) { // best of up to 8 (early exit): a JIT deopt under load is one-off, a real allocation shows every time
     const ses = new Session();
     ses.connect();
     await ses.post('HeapProfiler.startSampling', { samplingInterval: 16 });
@@ -216,4 +219,49 @@ test('update does not allocate (sampling heap profiler)', async () => {
     if (t < best) { best = t; by = b; }
   }
   assert.equal(best, 0, JSON.stringify(by));
+});
+
+test('seated: a still head 0.36 m × s below the standing eye for 1.5 s moves the holster onto the thigh', () => {
+  const e = new BodyEstimator();
+  head(e, 0, 0, 1.7); run(e, 60);
+  assert.equal(e.seated, false);
+  const standQ = [...e.holster.q], standP = [...e.holster.p];
+  head(e, 0, 0, 1.2); run(e, 120);
+  assert.equal(e.seated, false, 'not before 1.5 s');
+  run(e, 60);
+  assert.equal(e.seated, true, 'seated after 1.5 s');
+  run(e, 60);
+  assert.equal(e.seatBlend, 1);
+  // muzzle toward the knee (forward, 12° down), slide up, grip centre ahead of the pelvis on the right
+  qRotate(e.holster.q, 0, 0, -1, v, 0);
+  assert.ok(v[2] < -0.95 && v[1] < -0.15 && v[1] > -0.25, `seated muzzle ${[...v]}`);
+  qRotate(e.holster.q, 0, 1, 0, v, 0);
+  assert.ok(v[1] > 0.95, 'slide up');
+  const H = e.holster.p, P = e.pelvisS;
+  assert.ok(H[0] - P[0] > 0.15 && P[2] - H[2] > 0.1 && Math.abs(H[1] - P[1]) < 0.03, `thigh socket ${[...H]} vs pelvis ${[...P]}`);
+  assert.ok(e.lean < 0.2, `upright torso while seated (lean ${e.lean})`);
+  assert.ok(Math.hypot(...standQ.map((x, i) => x - e.holster.q[i])) > 0.3 && standP[1] > H[1]);
+  // standing up: 0.4 s at less than 0.22 m × s of drop
+  head(e, 0, 0, 1.62); run(e, 50);
+  assert.equal(e.seated, false, 'standing again');
+  run(e, 40);
+  qRotate(e.holster.q, 0, 0, -1, v, 0);
+  assert.ok(v[1] < -0.95, 'hip holster muzzle down again');
+});
+
+test('seated: a crouch-walk or a long look down never counts as sitting; the stance setting forces it', () => {
+  const e = new BodyEstimator();
+  head(e, 0, 0, 1.7); run(e, 60);
+  head(e, 0, 0, 1.2);
+  run(e, 270, (i) => head(e, 0, 0, 1.2, 0, -i * 0.006));   // 0.54 m/s
+  assert.equal(e.seated, false, 'walking low');
+  head(e, -0.9, 0, 1.2); run(e, 270);
+  assert.equal(e.seated, false, 'looking down at the floor');
+  e.stance = 'seated'; run(e, 2);
+  assert.equal(e.seated, true);
+  e.stance = 'standing'; run(e, 2);
+  assert.equal(e.seated, false);
+  e.stance = 'auto';
+  e.reset(); head(e, 0, 0, 1.2); run(e, 1);
+  assert.equal(e.seated, false, 'reset forgets the stance');
 });

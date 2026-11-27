@@ -26,7 +26,20 @@
  * 0.62 m warning): the body may brush a jamb by 1 cm, which the occluder's 2 cm
  * jamb shrink never cuts.
  *
- * Flags are 16-bit (NAV_POCKET is bit 8).
+ * Flags are 16-bit (NAV_POCKET is bit 8, NAV_SHIELD bit 10).
+ *
+ * Roam (whole-house play, v0.3) adds, per cell:
+ * - `room`: room id from a 4-connected flood fill over floor cells that are
+ *   not a wall slab and not a carved door gap (`labelRooms`); 0 = none (walls,
+ *   door gaps, slivers under 1 m², off the floor);
+ * - the edge margin (`edge`, Float32): signed distance in metres to the edge
+ *   of the mapped floor where nothing real stands in the way (an inferred wall
+ *   or an open side, not a real wall): + on the map, − off it (`edgeField`);
+ * and `pathSource`: when set (WorldCore in Roam), `pathDistance` is the path
+ * from the player's CURRENT position (door fields), not from the build start.
+ *
+ * The cell size can grow per build (`reset(…, cell)`): a house larger than
+ * the capacity at 0.10 m gets coarser cells instead of being cropped.
  */
 
 import { pointInPolygon } from '../util/geom2d.js';
@@ -42,9 +55,12 @@ export const NAV_OBST = 32; // raw furniture footprint + 2 cm (distance-transfor
 export const NAV_WALK = 64; // walkable for an enemy centre
 export const NAV_VIRTUAL = 128; // virtual floor (no Space Setup data there)
 export const NAV_POCKET = 256; // virtual spawn pocket behind a door into unmapped space (also NAV_VIRTUAL)
+export const NAV_IWALL = 512; // inferred wall slab (no wall plane there: the edge of the map, not a real wall)
+export const NAV_SHIELD = 1024; // within 0.25 m of a REAL wall slab (off-floor cells there are behind the wall, not an open edge)
 
 const SQRT2 = Math.SQRT2;
-const BIG = 1e12;
+/** "Far" in the distance transforms (squared cells). */
+export const BIG = 1e12;
 /** Neighbour offsets: 4 orthogonal, then 4 diagonal. */
 const NDX = new Int8Array([1, -1, 0, 0, 1, 1, -1, -1]);
 const NDZ = new Int8Array([0, 0, 1, -1, 1, -1, 1, -1]);
@@ -52,7 +68,7 @@ const NDZ = new Int8Array([0, 0, 1, -1, 1, -1, 1, -1]);
 export class NavGrid {
   /**
    * @param {number} [capacity] maximum cells (65,536 = a 25.6 m square at 0.10 m)
-   * @param {number} [cell] metres
+   * @param {number} [cell] metres (the default; `reset` may use a larger one for a big house)
    */
   constructor(capacity = 65536, cell = NAV_CELL) {
     this.capacity = capacity;
@@ -70,6 +86,24 @@ export class NavGrid {
     this.pathDist = new Float32Array(capacity);
     this.doors = new Uint8Array(capacity);
     this.floorIdx = new Int8Array(capacity);
+    /** Room id per cell (labelRooms; 0 = none). */
+    this.room = new Uint16Array(capacity);
+    this.roomCount = 0;
+    /** Signed edge margin per cell (edgeField; m, + on the map). */
+    this.edge = new Float32Array(capacity);
+    /** False until edgeField ran for this build: edgeMargin() then reports 99 (no edge known). */
+    this.edgeReady = false;
+    /**
+     * Roam: the object that answers path distances from the player's current
+     * position (`pathFromPlayerCell(i)`); null = the build-time field from the start.
+     * @type {{ pathFromPlayerCell(i: number): number }|null}
+     */
+    this.pathSource = null;
+    /** The default cell size (reset may pick a larger one per build). */
+    this.baseCell = cell;
+    /** Query point for the *Q methods (written by the caller). */
+    this.qx = 0.5;
+    this.qz = 0.5;
     /** Reachable-from-the-player flag per region id. */
     this.reach = new Uint8Array(65536);
     this.agentClear = 0.28;
@@ -82,15 +116,25 @@ export class NavGrid {
     this.startCell = -1;
     this._queue = new Int32Array(capacity);
     /** @type {Float64Array|null} */ this._tmp = null;
+    /** One heap for every Dijkstra on this grid (path field, door fields): no allocation per build. */
+    this.heap = new IndexedMinHeap(capacity);
+    // distance-transform scratch (sized to the longest grid side, grown at build time only)
+    /** @type {Float64Array} */ this._f = new Float64Array(0);
+    /** @type {Float64Array} */ this._d = new Float64Array(0);
+    /** @type {Float64Array} */ this._zb = new Float64Array(0);
+    /** @type {Int32Array} */ this._v = new Int32Array(0);
   }
 
   /**
    * Clear and resize (at build).
    * @param {number} ox @param {number} oz
    * @param {number} w @param {number} h
+   * @param {number} [cell] metres (default: the constructor's)
    */
-  reset(ox, oz, w, h) {
+  reset(ox, oz, w, h, cell = this.baseCell) {
     if (w * h > this.capacity || w <= 0 || h <= 0) throw new Error(`NavGrid: ${w}×${h} exceeds capacity ${this.capacity}`);
+    this.cell = cell;
+    this.inv = 1 / cell;
     this.ox = ox;
     this.oz = oz;
     this.w = w;
@@ -102,10 +146,21 @@ export class NavGrid {
     this.pathDist.fill(Infinity, 0, this.count);
     this.doors.fill(0, 0, this.count);
     this.floorIdx.fill(-1, 0, this.count);
+    this.room.fill(0, 0, this.count);
+    this.roomCount = 0;
+    this.edgeReady = false;
+    this.pathSource = null;
     this.walkableCount = 0;
     this.regionCount = 0;
     this.startCell = -1;
     this.version++;
+    const m = w > h ? w : h;
+    if (this._f.length < m) {
+      this._f = new Float64Array(m);
+      this._d = new Float64Array(m);
+      this._zb = new Float64Array(m + 1);
+      this._v = new Int32Array(m);
+    }
   }
 
   // ---------------------------------------------------------------- queries (allocation-free)
@@ -129,10 +184,36 @@ export class NavGrid {
     return i >= 0 ? this.clr[i] : 0;
   }
 
-  /** @param {number} x @param {number} z */
+  /**
+   * Path length (m) from the player to (x, z): in Roam from where the player
+   * is now (door fields, see WorldCore.pathFromPlayerCell), otherwise from
+   * the build start. Infinity when unreachable.
+   * @param {number} x @param {number} z
+   */
   pathDistance(x, z) {
     const i = this.index(x, z);
-    return i >= 0 ? this.pathDist[i] : Infinity;
+    if (i < 0) return Infinity;
+    const src = this.pathSource;
+    return src ? src.pathFromPlayerCell(i) : this.pathDist[i];
+  }
+
+  /** Room id at (x, z) (0 = none). @param {number} x @param {number} z */
+  roomAt(x, z) {
+    const i = this.index(x, z);
+    return i >= 0 ? this.room[i] : 0;
+  }
+
+  /**
+   * Signed margin to the edge of the mapped floor (m): + on the map (how far
+   * the nearest open edge is), − off it (how far back onto it). 99 when
+   * unknown (edgeField has not run) or when the map has no open edge; −99
+   * outside the grid.
+   * @param {number} x @param {number} z
+   */
+  edgeMargin(x, z) {
+    if (!this.edgeReady) return 99;
+    const i = this.index(x, z);
+    return i >= 0 ? this.edge[i] : -99;
   }
 
   /** Is (x, z) walkable and connected to the player's area? @param {number} x @param {number} z */
@@ -341,9 +422,7 @@ export class NavGrid {
     const w = this.w, h = this.h, n = this.count, cell = this.cell;
     if (!this._tmp || this._tmp.length < n) this._tmp = new Float64Array(this.capacity);
     const g = this._tmp;
-    const m = Math.max(w, h);
-    const f = new Float64Array(m), d = new Float64Array(m), zb = new Float64Array(m + 1);
-    const v = new Int32Array(m);
+    const f = this._f, d = this._d, zb = this._zb, v = this._v;
     for (let i = 0; i < n; i++) {
       const fl = this.flags[i];
       g[i] = (fl & (NAV_INSIDE | NAV_DOOR)) === 0 || (fl & obstacleBits) !== 0 ? 0 : BIG;
@@ -519,6 +598,99 @@ export class NavGrid {
     this.propagateFloors();
   }
 
+  /**
+   * Rooms (Roam): 4-connected components of floor cells (NAV_INSIDE) that are
+   * neither a wall slab nor a carved door gap, so doors (and walls) split the
+   * house into rooms while open passages and furniture do not. Components
+   * smaller than `minCells` get room 0 (slivers along walls). Ids are 1 …
+   * roomCount (at most maxRooms − 1; any further component gets 0).
+   * Build time; allocation-free (uses the shared queue).
+   * @param {number} minCells
+   * @param {number} maxRooms
+   * @returns {number} rooms
+   */
+  labelRooms(minCells, maxRooms) {
+    const w = this.w, h = this.h, n = this.count, fl = this.flags, room = this.room, q = this._queue;
+    const DROP = 65535;
+    room.fill(0, 0, n);
+    let id = 0;
+    for (let s = 0; s < n; s++) {
+      if ((fl[s] & NAV_INSIDE) === 0 || (fl[s] & (NAV_WALL | NAV_DOOR)) !== 0 || room[s] !== 0) continue;
+      const lab = id + 1 < maxRooms ? id + 1 : DROP;
+      let head = 0, tail = 0;
+      q[tail++] = s;
+      room[s] = lab;
+      while (head < tail) {
+        const i = q[head++];
+        const ix = i % w, iz = (i - ix) / w;
+        let j = i - 1;
+        if (ix > 0 && room[j] === 0 && (fl[j] & NAV_INSIDE) !== 0 && (fl[j] & (NAV_WALL | NAV_DOOR)) === 0) { room[j] = lab; q[tail++] = j; }
+        j = i + 1;
+        if (ix < w - 1 && room[j] === 0 && (fl[j] & NAV_INSIDE) !== 0 && (fl[j] & (NAV_WALL | NAV_DOOR)) === 0) { room[j] = lab; q[tail++] = j; }
+        j = i - w;
+        if (iz > 0 && room[j] === 0 && (fl[j] & NAV_INSIDE) !== 0 && (fl[j] & (NAV_WALL | NAV_DOOR)) === 0) { room[j] = lab; q[tail++] = j; }
+        j = i + w;
+        if (iz < h - 1 && room[j] === 0 && (fl[j] & NAV_INSIDE) !== 0 && (fl[j] & (NAV_WALL | NAV_DOOR)) === 0) { room[j] = lab; q[tail++] = j; }
+      }
+      if (lab !== DROP && tail >= minCells) { id = lab; continue; }
+      for (let k = 0; k < tail; k++) room[q[k]] = DROP; // too small (or too many rooms): no room
+    }
+    for (let i = 0; i < n; i++) if (room[i] === DROP) room[i] = 0;
+    this.roomCount = id;
+    return id;
+  }
+
+  /**
+   * Nearest walkable cell within `maxR` of (x, z) that lies in room `ra` or
+   * `rb` (0 = no room), or is a door gap cell when `doors` is true. The ring
+   * search of nearestWalkable with a room test, so it never snaps through a
+   * wall into the next room. Allocation-free.
+   * @param {number} x @param {number} z @param {number} maxR
+   * @param {number} ra @param {number} rb @param {boolean} doors
+   * @returns {number} cell index or -1
+   */
+  nearestWalkableInRooms(x, z, maxR, ra, rb, doors) {
+    this.qx = x;
+    this.qz = z;
+    return this.nearestWalkableInRoomsQ(maxR, ra, rb, doors);
+  }
+
+  /**
+   * nearestWalkableInRooms for the point in `qx`, `qz` (the per-frame form:
+   * no computed doubles passed as arguments).
+   * @param {number} maxR @param {number} ra @param {number} rb @param {boolean} doors
+   * @returns {number}
+   */
+  nearestWalkableInRoomsQ(maxR, ra, rb, doors) {
+    const x = this.qx, z = this.qz;
+    const w = this.w, h = this.h, cell = this.cell, fl = this.flags, room = this.room;
+    const ix0 = Math.floor((x - this.ox) * this.inv), iz0 = Math.floor((z - this.oz) * this.inv);
+    const R = Math.ceil(maxR * this.inv) + 1;
+    const max2 = maxR * maxR;
+    let best = -1, bestD = Infinity;
+    for (let r = 0; r <= R; r++) {
+      for (let k = -r; k <= r; k++) {
+        for (let e = 0; e < 4; e++) {
+          let ix, iz;
+          if (e === 0) { ix = ix0 + k; iz = iz0 - r; } else if (e === 1) { if (r === 0) continue; ix = ix0 + k; iz = iz0 + r; } else {
+            if (k === -r || k === r) continue;
+            ix = e === 2 ? ix0 - r : ix0 + r; iz = iz0 + k;
+          }
+          if (ix < 0 || iz < 0 || ix >= w || iz >= h) continue;
+          const i = iz * w + ix, f = fl[i];
+          if ((f & NAV_WALK) === 0) continue;
+          const rm = room[i];
+          if (!((rm !== 0 && (rm === ra || rm === rb)) || (doors && (f & NAV_DOOR) !== 0))) continue;
+          const dx = this.ox + (ix + 0.5) * cell - x, dz = this.oz + (iz + 0.5) * cell - z;
+          const d = dx * dx + dz * dz;
+          if (d < bestD && d <= max2) { bestD = d; best = i; }
+        }
+      }
+      if (best >= 0 && bestD <= (r * cell) * (r * cell)) break;
+    }
+    return best;
+  }
+
   /** 4-connected components of walkable cells. */
   labelRegions() {
     const w = this.w, h = this.h, n = this.count, fl = this.flags, reg = this.region, q = this._queue;
@@ -550,10 +722,13 @@ export class NavGrid {
    */
   pathField(sx, sz) {
     const w = this.w, h = this.h, fl = this.flags, dist = this.pathDist, doors = this.doors, cell = this.cell;
+    dist.fill(Infinity, 0, this.count);
+    doors.fill(0, 0, this.count);
     const start = this.nearestWalkable(sx, sz, 3.0);
     this.startCell = start;
     if (start < 0) return;
-    const heap = new IndexedMinHeap(this.count);
+    const heap = this.heap;
+    heap.clear();
     dist[start] = Math.hypot(this.centerX(start) - sx, this.centerZ(start) - sz);
     doors[start] = 0;
     heap.push(start, dist[start]);
@@ -603,7 +778,7 @@ export class NavGrid {
  * @param {Int32Array} v
  * @param {Float64Array} z
  */
-function dt1(f, n, d, v, z) {
+export function dt1(f, n, d, v, z) {
   let k = 0;
   v[0] = 0;
   z[0] = -Infinity;

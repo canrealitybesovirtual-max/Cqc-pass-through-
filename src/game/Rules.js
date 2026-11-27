@@ -10,7 +10,10 @@ import { PAUSE, PauseManager, RESUME, SAFETY, VIOLATION, pauseIndex } from '../s
  *
  * - Wave n has 2 + n enemies, at most 4 alive at once, spawned one at a time
  *   (1.5–3.5 s apart, seeded) through `host.spawn()`; a failed spawn retries
- *   after 0.5 s.
+ *   after 0.5 s. `host.spawn()` may also return 2 = "still searching" (Roam's
+ *   time-sliced spawn search): asked again next frame, not counted as a fail.
+ *   `requeue(n)` puts n living enemies back into the wave's queue (a
+ *   reference-space realign despawns them).
  * - Pause is orthogonal to the phase and decided by ONE PauseManager
  *   (src/safety/PauseManager.js, `rules.pm`): the head beyond the safe-zone
  *   radius, the session not visible, tracking lost, no controller, an input
@@ -80,7 +83,8 @@ export const RULES = Object.freeze({
 
 /**
  * @typedef {Object} RulesHost
- * @property {() => boolean} spawn                 try to spawn one enemy; true when one was placed
+ * @property {() => boolean|number} spawn          try to spawn one enemy: true / 1 placed, 2 still searching (ask again
+ *                                                 next frame), false / 0 failed
  * @property {() => number} alive                  living enemies right now
  * @property {(wave: number, enemies: number) => void} waveStart
  * @property {(wave: number) => void} waveClear
@@ -94,14 +98,17 @@ export const RULES = Object.freeze({
 export class SurvivalRules {
   /**
    * @param {RulesHost} host
-   * @param {{ seed?: number, zoneR?: number, requirePress?: boolean }} [o] requirePress: false skips the Resume press (tools only)
+   * @param {{ seed?: number, zoneR?: number, requirePress?: boolean, runPause?: boolean }} [o] requirePress: false skips
+   *   the Resume press (tools only); runPause: false = running is a warning, not a pause (Roam)
    */
-  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR, requirePress = true } = {}) {
+  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR, requirePress = true, runPause = true } = {}) {
     this.host = host;
     this.seed = seed >>> 0 || 1;
     this.rng = this.seed;
     /** Every pause decision: PauseManager (feed its inputs before update). */
-    this.pm = new PauseManager({ zoneR, requirePress });
+    this.pm = new PauseManager({ zoneR, requirePress, runPause });
+    /** Frames a spawn search has been pending (diagnostics). */
+    this.spawnPendingFrames = 0;
     /** @type {number} PHASE */ this.phase = PHASE.IDLE;
     /** @type {number} */ this.health = RULES.maxHealth;
     this.wave = 0;
@@ -230,6 +237,17 @@ export class SurvivalRules {
     return d;
   }
 
+  /**
+   * Put `n` living enemies back into this wave's queue (they were despawned
+   * without a kill, e.g. by a realign). They spawn again as usual.
+   * @param {number} n
+   */
+  requeue(n) {
+    if (!(n > 0) || this.phase !== PHASE.WAVE) return;
+    this.spawned = Math.max(this.killedWave, this.spawned - Math.floor(n));
+    if (this.spawnT > RULES.firstSpawnS) this.spawnT = RULES.firstSpawnS;
+  }
+
   /** @param {boolean} headshot */
   kill(headshot) {
     if (!this.active) return;
@@ -283,7 +301,11 @@ export class SurvivalRules {
           this.spawnT -= dt;
           if (this.spawnT <= 0) {
             if (this.pm.paused) this.pm.violation(VIOLATION.SPAWN);
-            if (this.host.spawn()) {
+            const got = this.host.spawn();
+            if (got === 2) {
+              this.spawnPendingFrames++;
+              this.spawnT = 0; // still searching: ask again next frame
+            } else if (got === true || got === 1) {
               this.spawned++;
               this.spawnT = RULES.spawnGapMinS + (RULES.spawnGapMaxS - RULES.spawnGapMinS) * this.rand();
             } else {

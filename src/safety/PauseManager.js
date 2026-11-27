@@ -34,6 +34,11 @@
  *
  * Inputs are set before `update(dt, active)`; `active` = a round is running
  * (pauses only apply then; outside a round the state clears silently).
+ *
+ * Roam (the default play mode, v0.3): `runPause = false` makes running a
+ * warning, not a pause (`running` is still tracked; RoamSafety turns it into
+ * a watch cue), and the zone is off (GameSession feeds a zone distance of 0).
+ * Tracking loss, visibility, controllers, gaps, manual and reset still pause.
  */
 
 export const PAUSE = Object.freeze({
@@ -110,9 +115,13 @@ export function firstReason(bits) {
 }
 
 export class PauseManager {
-  /** @param {{ zoneR?: number, requirePress?: boolean }} [o] */
-  constructor({ zoneR = 0.8, requirePress = true } = {}) {
+  /** @param {{ zoneR?: number, requirePress?: boolean, runPause?: boolean }} [o] */
+  constructor({ zoneR = 0.8, requirePress = true, runPause = true } = {}) {
     this.zoneR = zoneR;
+    /** Running (> 1.2 m/s) pauses (spot play); false = only `running` is set (Roam: a warning). */
+    this.runPause = runPause;
+    /** Head speed above the run threshold right now (with hysteresis). */
+    this.running = false;
     /** The Resume press is part of the protocol (PLAN §6.2); false skips it (tools only). */
     this.requirePress = requirePress;
     // ── inputs ──
@@ -326,8 +335,9 @@ export class PauseManager {
     if (removed) this.raise(PAUSE.INPUT);
     // running: each rise above 1.2 m/s is an event (it restarts a resume in progress too)
     const fast = this.trackingOk && (this._fast ? this.speed > SAFETY.runSpeed * SAFETY.runOffK : this.speed > SAFETY.runSpeed);
-    if (fast && !this._fast) this.raise(PAUSE.RUNNING);
+    if (fast && !this._fast && this.runPause) this.raise(PAUSE.RUNNING);
     this._fast = fast;
+    this.running = fast;
     const fresh = this.fresh;
     this.fresh = 0;
 

@@ -103,7 +103,7 @@ export class HomePage {
     else { this.support.textContent = 'Mixed reality is supported.'; this.support.className = 'ok'; }
 
     /** @type {[string, string][]} */
-    const buttons = [['bPlay', 'play'], ['bProbe', 'probe'], ['bBounds', 'bounds'], ['bVR', 'vr'], ['bRetry', 'reduced']];
+    const buttons = [['bPlay', 'play'], ['bSpot', 'spot'], ['bProbe', 'probe'], ['bBounds', 'bounds'], ['bVR', 'vr'], ['bRetry', 'reduced']];
     for (const [id, mode] of buttons) {
       // No await, no work before enter(): the click is the user gesture requestSession needs.
       $(id).addEventListener('click', () => {
@@ -125,10 +125,13 @@ export class HomePage {
   /**
    * @param {string} mode
    * @param {boolean} [game] the session runs the game (exit with Y, not the grips)
+   * @param {string|null} [spaceNote] the honest boundary line when Roam has no whole-house tracking (page only)
+   * @param {string} [style] 'roam' | 'spot'
    */
-  inXR(mode, game = false) {
-    this.note(game ? `In ${mode}. Stand in an open spot and pull the trigger to start. Pause: B + Y. Exit: hold Y for 2 s (or X for 1 s while looking at your left wrist).`
-      : `In ${mode}. Hold both grips for 1 s to exit.`);
+  inXR(mode, game = false, spaceNote = null, style = 'roam') {
+    const menu = 'Menu and pause: look at your watch and touch it with the right controller (or point and pull the trigger). Exit: watch → EXIT, or hold Y for 2 s.';
+    const start = style === 'spot' ? 'Stand in an open spot and pull the trigger to start.' : 'Pull the trigger to start, then walk anywhere you scanned in Space Setup (walk, don’t run).';
+    this.note(game ? `In ${mode}. ${start} ${menu}${spaceNote ? ` ${spaceNote}.` : ''}` : `In ${mode}. Hold both grips for 1 s to exit.`);
   }
 
   /**
@@ -156,8 +159,8 @@ export class HomePage {
     const sup = this.sup || {};
     const ready = this.load === 'ready', idle = this.load !== 'loading';
     /** @type {[string, boolean][]} */
-    const gate = [['bPlay', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
-    for (const [id, ok] of gate) /** @type {HTMLButtonElement} */ ($(id)).disabled = !on || !ok;
+    const gate = [['bPlay', !!sup.ar && ready], ['bSpot', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
+    for (const [id, ok] of gate) { const b = /** @type {HTMLButtonElement|null} */ (document.getElementById(id)); if (b) b.disabled = !on || !ok; }
   }
 
   renderSummary() {
@@ -181,7 +184,8 @@ export class HomePage {
       const D = P.liveDepth;
       if (D && D.granted) bits.push(D.active ? `depth ${D.valid ? `${D.width}×${D.height}, ${D.textureChanges ? 'new texture per frame' : 'one texture'}` : 'no valid frames'}` : `depth off (${D.why})`);
       const G = r.play;
-      if (G && G.world) bits.push(`${G.world.describe}; wave ${G.wave ?? 0}, ${G.kills ?? 0} kills`);
+      if (G && G.world) bits.push(`${G.mode ? `${G.mode}: ` : ''}${G.world.describe}; wave ${G.wave ?? 0}, ${G.kills ?? 0} kills`);
+      if (G && G.roam && G.roam.spaceNote) bits.push(G.roam.spaceNote);
       const F = P.frameRate;
       if (F && F.target) bits.push(`${F.target} Hz requested: ${F.request}${F.hzAtEnd ? `, ${F.hzAtEnd} Hz measured` : ''}`);
       if (r.audio) bits.push(`audio ${r.audio.atStart} → ${r.audio.at1s ?? '?'}`);

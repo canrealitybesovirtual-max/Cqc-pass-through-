@@ -115,8 +115,12 @@ test('per-frame work does not allocate; 10 Hz decisions stay small (house run)',
   // per frame: steering, movement on the nav grid, facing, aim, shot timing, slots
   for (const a of brain.agents) a.think = 1e9; // no decisions from here on
   for (let k = 0; k < 72 * 30; k++) frame(); // let V8 settle on the new mix
+  // The best of up to 8 reps: until V8's concurrent compiler has re-optimised for the new mix, the
+  // interim code boxes doubles (move → Math.sqrt); on a loaded machine (parallel test files, other
+  // jobs) that took longer than the settle above and the first 3 reps read 35–49 KB. Allocations in
+  // the optimised code show in every rep, so they still fail.
   let grew = Infinity;
-  for (let rep = 0; rep < 3; rep++) {
+  for (let rep = 0; rep < 8 && grew >= 30_000; rep++) {
     globalThis.gc?.();
     const before = process.memoryUsage().heapUsed;
     for (let k = 0; k < 72 * 30; k++) frame();

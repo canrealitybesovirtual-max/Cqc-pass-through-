@@ -1,7 +1,9 @@
 // @ts-check
 /**
  * Offline asset bake (re-runnable): writes assets/models/{glock,akm,soldier}.glb,
- * assets/sounds/*.mp3 and assets/manifest.json per docs/CONTRACTS.md.
+ * assets/sounds/*.mp3 and assets/manifest.json per docs/CONTRACTS.md. The gun
+ * GLBs then get the gloved hands (hands.mjs; `node hands.mjs` alone re-does
+ * only that step on the baked GLBs).
  *
  *   cd tools/assets && npm install && node bake.mjs [--debug <dir>]
  *
@@ -15,6 +17,7 @@ import { AKM, GLOCK, bakeWeapon, rifleMesh } from './weapons.mjs';
 import { bakeSoldier } from './soldier.mjs';
 import { bakeSounds } from './sounds.mjs';
 import { ready as simplifierReady } from './lib/simplify.mjs';
+import { bakeHands } from './hands.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..', '..');
@@ -67,6 +70,8 @@ async function main() {
     sounds: snd.sounds,
     bytes,
   };
+  // v0.3: gloved hands from the CQC viewmodels, written into the gun GLBs (hands.mjs)
+  await bakeHands(env, manifest);
   writeFileSync(join(outDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
   const total = Object.values(bytes).reduce((a, b) => a + b, 0);

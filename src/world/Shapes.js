@@ -7,11 +7,20 @@
  * still hits the real floor or ceiling.
  *
  * Box record (8 floats): cx, cz, c, s, hx, hz, y0, y1 — see geom.js for the frame.
+ * `flags[i]` (Uint8) per box: SHAPE_JAMB (a wall piece beside a door opening),
+ * SHAPE_WALL, SHAPE_INFERRED (an inferred wall: no wall plane there),
+ * SHAPE_LINTEL (above a door). The safety code uses them for walking cues.
  */
 
 import { pointInPolygon } from '../util/geom2d.js';
 
 const BOX_STRIDE = 8;
+
+/** Box flags (`ShapeSet.flags`). */
+export const SHAPE_JAMB = 1;
+export const SHAPE_WALL = 2;
+export const SHAPE_INFERRED = 4;
+export const SHAPE_LINTEL = 8;
 
 /** @typedef {{ pts: Float64Array, n: number, y: number, x0: number, x1: number, z0: number, z1: number }} FlatPoly */
 
@@ -101,6 +110,8 @@ export class ShapeSet {
   constructor(maxBoxes = 160) {
     this.maxBoxes = maxBoxes;
     this.box = new Float32Array(maxBoxes * BOX_STRIDE);
+    /** SHAPE_* bits per box. */
+    this.flags = new Uint8Array(maxBoxes);
     /** @type {string[]} surface label per box */
     this.label = new Array(maxBoxes).fill('');
     this.count = 0;
@@ -133,6 +144,8 @@ export class ShapeSet {
       B[o] = b.cx; B[o + 1] = b.cz; B[o + 2] = b.c; B[o + 3] = b.s;
       B[o + 4] = b.hx; B[o + 5] = b.hz; B[o + 6] = b.y0; B[o + 7] = b.y1;
       this.label[i] = b.label;
+      this.flags[i] = (b.kind === 'wall' ? SHAPE_WALL : 0) | (b.jamb0 || b.jamb1 ? SHAPE_JAMB : 0)
+        | (b.source === 'inferred' ? SHAPE_INFERRED : 0) | (b.lintel ? SHAPE_LINTEL : 0);
     }
     this.count = boxes.length;
     this.floors = layout.floors.map((f) => ({ pts: f.pts, n: f.n, y: f.y, x0: f.x0, x1: f.x1, z0: f.z0, z1: f.z1 }));

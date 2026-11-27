@@ -419,7 +419,7 @@ test('per-frame update allocates nothing (sampling heap profiler)', async () => 
   // ending) may be charged a few interpreter bytes by V8, bounded per event (as in game.rules.test.js)
   const perFrame = ['update', 'speedStep', 'zoneStep', 'resumeStep', 'setZone', 'setHead', 'setVisible', 'setTracking', 'setControllers', 'setObstacle', 'press'];
   let best = null, worst = Infinity;
-  for (let r = 0; r < 3 && worst > 0; r++) {
+  for (let r = 0; r < 8 && worst > 0; r++) { // best of up to 8 (early exit): a JIT deopt under load is one-off, a real allocation shows every time
     const s = new Session();
     s.connect();
     await s.post('HeapProfiler.startSampling', { samplingInterval: 16 });

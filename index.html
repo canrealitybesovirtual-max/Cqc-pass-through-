@@ -17,6 +17,7 @@
       <div id="load" hidden><progress id="loadBar" max="1" value="0"></progress> <span id="loadText">Loading 0%</span></div>
       <div class="row">
         <button id="bPlay" disabled>Enter MR</button>
+        <button id="bSpot" disabled>Enter MR: one spot</button>
         <button id="bProbe" disabled>Probe session</button>
         <button id="bBounds" disabled>Boundary probe</button>
         <button id="bVR" disabled>VR test scene</button>
@@ -27,19 +28,18 @@
 
     <section>
       <h2>How to play (Enter MR)</h2>
-      <p>Wait for <b>Ready</b> under Start, then tap <b>Enter MR</b>. A “Get ready” card shows these controls while the game reads your Space Setup room; pull the trigger to go on.</p>
+      <p>Wait for <b>Ready</b> under Start, then tap <b>Enter MR</b> (the whole house). A “Get ready” card shows the controls while the game reads your Space Setup rooms; pull the trigger to start.</p>
       <ul>
-        <li><b>Safe spot:</b> a ring follows you on the floor. Stand where it is green, with room to turn, and <b>pull the trigger</b>. Amber: something is within arm’s reach (hold the trigger 1 s to play there anyway). Red: move where the arrow points. Step out of the ring during the round and the game pauses.</li>
-        <li><b>Glock:</b> right hand on your <b>right hip</b>, squeeze the <b>right grip</b>.</li>
-        <li><b>AKM:</b> right hand <b>over your right shoulder</b>, squeeze the <b>right grip</b>. Left grip on the handguard to aim with two hands.</li>
-        <li><b>Fire:</b> trigger. <b>AKM selector:</b> right stick click (semi → safe → auto → semi). It starts on semi; your left wrist shows the mode.</li>
-        <li><b>Reload:</b> <b>A</b> drops the magazine. Take a new one from your <b>left hip with the left grip</b>, then push it up into the gun. (A again with the magazine out reloads by itself, for testing.)</li>
-        <li><b>Rack:</b> left grip on the slide (AKM: the charging handle), pull back, let go. <b>B:</b> slide release.</li>
-        <li><b>Pause:</b> <b>B + Y</b> together; pull the trigger to resume. <b>Exit:</b> hold <b>Y</b> for 2 s.</li>
-        <li><b>Left wrist:</b> wave, health, kills, ammo and fire mode.</li>
+        <li><b>Whole house:</b> walk anywhere you scanned in Space Setup. Enemies come from other rooms. Walk, don’t run: running, the edge of the scanned area and walls close to your head make the <b>watch vibrate</b> and show a warning (nothing appears in front of you). Tracking loss pauses. <b>Enter MR: one spot</b> is the old stationary mode (a ring on the floor).</li>
+        <li><b>Glock:</b> right hand on your <b>right hip</b>, squeeze the <b>right grip</b> (sitting: on your right thigh). <b>AKM:</b> right hand <b>over your right shoulder</b>, squeeze. Let go at the hip / shoulder to put it back.</li>
+        <li><b>Fire:</b> trigger. <b>A</b> (or <b>X</b> with your left hand on the gun): drop the magazine. <b>B</b> (or <b>Y</b> with your left hand on the gun): Glock slide release, AKM fire mode (safe / auto / semi; the right stick click too).</li>
+        <li><b>Reload:</b> left grip at your <b>left hip</b> takes a magazine; push it up into the gun. AKM: squeeze the seated magazine with the left hand to pull it out. <b>Rack:</b> left grip on the slide (AKM: the charging handle), pull back, let go. (Holding A 1 s with no magazine reloads by itself, for testing.)</li>
+        <li><b>Two hands:</b> left grip on the AKM handguard.</li>
+        <li><b>Watch (left wrist):</b> health, rounds, wave and fire mode. Look at it, then <b>touch it with the right controller</b> (or point at it and pull the trigger) for the menu: RESUME, RESTART, DIFFICULTY, MODE (whole house / one spot), GUN FIT (tilt, height, forward per gun; SAVE keeps it), AMMO LINE, EXIT.</li>
+        <li><b>Pause:</b> the watch menu, or <b>B + Y</b> with empty hands. <b>Exit:</b> watch → EXIT, or hold <b>Y</b> for 2 s.</li>
         <li>Afterwards tap <b>Copy</b> below and paste it into the chat.</li>
       </ul>
-      <p class="quiet">Gun sits wrong in your hand? Add to the page address, then reload: <code>?gripPitch=5</code> (degrees, + = muzzle up), <code>&amp;gripY=0.01</code> (metres, + = gun higher in the hand), <code>&amp;gripZ=0.01</code> (metres, + = gun back toward you). The values used are saved with each session.</p>
+      <p class="quiet">The Quest boundary cannot be turned off from a web page. In whole-house mode the game asks for whole-house tracking; if the Quest refuses, the page says so and the boundary applies. Gun fit from the address (for testing): <code>?gripPitch=5</code> (degrees, + = muzzle up), <code>&amp;gripY=0.01</code> (metres, + = gun higher), <code>&amp;gripZ=0.01</code> (metres, + = gun back toward you); <code>?gloves=0</code> hides the gloves. The values used are saved with each session.</p>
     </section>
 
     <section>

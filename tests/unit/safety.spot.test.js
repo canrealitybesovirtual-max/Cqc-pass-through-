@@ -186,7 +186,7 @@ test('per-frame update allocates nothing (sampling heap profiler)', async () => 
   };
   loop(20000);
   let best = Infinity, by = null;
-  for (let r = 0; r < 3 && best > 0; r++) {
+  for (let r = 0; r < 8 && best > 0; r++) { // best of up to 8 (early exit): a JIT deopt under load is one-off, a real allocation shows every time
     const s = new Session();
     s.connect();
     await s.post('HeapProfiler.startSampling', { samplingInterval: 16 });

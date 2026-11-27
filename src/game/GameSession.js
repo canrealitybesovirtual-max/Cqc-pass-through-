@@ -7,6 +7,7 @@ import { PAUSE_NAMES, SAFETY, VIOLATION, VIOLATION_NAMES, pauseName } from '../s
 import { OBSTACLE, ObstacleWarnings, POINT } from '../safety/ObstacleWarnings.js';
 import { SPOT_STATUS, SPOT_STATUS_NAMES, STEP_LINES, SafeSpot } from '../safety/SafeSpot.js';
 import { ARROW_COL, SafetyView } from '../safety/SafetyView.js';
+import { CUE_NAMES, IN, RoamSafety } from '../safety/RoamSafety.js';
 
 /**
  * Survival game session (CONTRACTS.md "Game, audio, HUD"): the `game` system.
@@ -51,6 +52,37 @@ import { ARROW_COL, SafetyView } from '../safety/SafetyView.js';
  * Pauses (rules.paused) stop the wave clocks and ignore damage; the `pause`
  * event tells the other systems. Allocation-free per frame; message lines
  * are prebuilt (the round-over line is built once per death).
+ *
+ * **Roam** (`roam: true`, the default play mode in v0.3; `setRoam(false)` =
+ * the stationary spot mode above): the player walks the whole house.
+ * - No fixed zone: no ring, no "return to your spot", no spot choice
+ *   (`pickSpot` confirms the current position at once), no floor arrow.
+ * - Running is a warning (the watch vibrates), not a pause. Tracking loss,
+ *   visibility, controllers, frame gaps, B+Y and resets still pause.
+ * - Every walking cue is diegetic: RoamSafety's levels in `cue` (run, edge of
+ *   the map, obstacle near the head, stairs, tracking; the watch's WARN order)
+ *   go to the warning sink (`setWarnSink(watch)`: `watch.warn(kind, level)`
+ *   on change). A hand near a wall or box pulses that hand (touch feedback);
+ *   no outline, no head-locked panel. The message panel only shows while
+ *   paused, at round over and while holding Y to exit (no "Wave 2" text in
+ *   the view: the watch shows the wave).
+ * - Enemies freeze only while the head is inside a mapped box or more than
+ *   0.3 m off the mapped floor (nothing is known about real walls there).
+ * - Seated (`player.seated`): no run / edge / obstacle cues, no obstacle
+ *   freeze, no hand pulses.
+ * - Spawns: `world.spawnRoam` (another room, ≥ 3.5 m from the head and from
+ *   the head in 1 s, 5–30 m of path, hidden; time-sliced, "still searching"
+ *   asks again next frame).
+ * - A reference-space reset puts living enemies back into the wave's queue
+ *   (their positions belong to the old space).
+ *
+ * Watch menu hooks (research-cqc A7): `openMenu()` pauses, `closeMenu()`
+ * resumes through the countdown (no trigger needed), `restart()`,
+ * `setDifficulty('test'|'realistic'|0|1|2)` (player damage × 0.6 / 1 / 1.3;
+ * `difficultyScale` for the enemies), `setRoam(bool)` (applies to the next
+ * world build and round: rebuild the world with `{ roam: game.roam }`).
+ * Y (exit / restart) and B+Y (pause) count only with free hands when the
+ * weapons say so (`weapons.busyLeft` / `busyRight`).
  */
 
 const SPAWN_MIN_M = 3.5;
@@ -119,18 +151,39 @@ export class GameSession {
   /**
    * @param {GameCtx} ctx
    * @param {{ enemies?: { spawn: (x: number, z: number, facing: number) => number, alive: () => number, reset: () => void, warmMeshes?: () => THREE.Object3D[] } | null,
-   *   weapons?: { ammo?: () => any, reset?: () => void, worldRoot?: THREE.Object3D } | null, seed?: number, ringMode?: 'edge'|'always',
-   *   hideThreats?: boolean, hide?: THREE.Object3D[], gapMs?: number }} [o]
+   *   weapons?: { ammo?: () => any, reset?: () => void, worldRoot?: THREE.Object3D, busyLeft?: boolean, busyRight?: boolean } | null,
+   *   seed?: number, ringMode?: 'edge'|'always', hideThreats?: boolean, hide?: THREE.Object3D[], gapMs?: number,
+   *   roam?: boolean, warn?: { warn: (kind: string, level: number) => any, capture?: boolean } | null }} [o]
    *   hideThreats (default true): re-parent `enemies.warmMeshes()` and `weapons.worldRoot` (brass, dropped
    *   magazines, decals) under the safety veil, so a pause hides them; `hide`: more objects to hide.
    *   gapMs: a frame gap longer than this pauses (default 250 ms, PLAN Phase 2; the desktop emulator's
    *   software-rendered frames take 100–300 ms, so ?emulate should raise it, e.g. 1500).
+   *   roam (default true): Roam, the whole-house default play mode; false = the stationary spot mode.
+   *   warn: the warning sink for the diegetic cues (the Watch: `warn(kind, level)`), or setWarnSink later.
    */
-  constructor(ctx, { enemies = null, weapons = null, seed, ringMode = 'edge', hideThreats = true, hide = [], gapMs = GAP_PAUSE_MS } = {}) {
+  constructor(ctx, { enemies = null, weapons = null, seed, ringMode = 'edge', hideThreats = true, hide = [], gapMs = GAP_PAUSE_MS,
+    roam = true, warn = null } = {}) {
     this.ctx = ctx;
     this.enemies = enemies;
     this.weapons = weapons;
     this.ringMode = ringMode;
+    /** Roam (whole house, the default) or the stationary spot mode. */
+    this.roam = !!roam;
+    /** Walking cues and their stats (Roam). */
+    this.roamSafety = new RoamSafety();
+    /** Cue levels for the watch, CUE order (run, edge, obstacle, stairs, tracking). */
+    this.cue = this.roamSafety.cue;
+    this._cueSent = new Float32Array(CUE_NAMES.length).fill(-1);
+    /** @type {{ warn: (kind: string, level: number) => any }|null} */ this.warnSink = warn && typeof warn.warn === 'function' ? warn : null;
+    /** Roam: pickSpot confirms the current position on the next frame. */
+    this._roamPick = false;
+    /** The watch menu is open (the round is paused). */
+    this.menuOpen = false;
+    this._menuResume = false;
+    /** 0 test, 1 realistic, 2 hard. */
+    this.difficulty = 1;
+    /** Multipliers for the current difficulty (player damage taken; enemy aim error and reaction for the enemy system). */
+    this.difficultyScale = { damage: 1, aim: 1, reaction: 0 };
     /** @type {((reason: string) => void) | null} */ this.onExit = null;
     this.exiting = false;
     this.exitReason = '';
@@ -141,10 +194,10 @@ export class GameSession {
     /** Safe zone (also mirrored into ctx.player.zone at start). */
     /** @type {{ x: number, z: number, r: number }} */
     this.zone = { x: 0, z: 0, r: RULES.zoneR };
-    this.stats = { hits: 0, damage: 0, spawnFails: 0, pauses: 0, violations: 0, obstacleWarnings: 0 };
+    this.stats = { hits: 0, damage: 0, spawnFails: 0, pauses: 0, violations: 0, obstacleWarnings: 0, spawnPending: 0 };
     this._spawnAt = { x: 0, z: 0 };
     // safety
-    this.obstacles = new ObstacleWarnings();
+    this.obstacles = new ObstacleWarnings({ roam: this.roam });
     this.spot = new SafeSpot({ r: RULES.zoneR });
     this.view = new SafetyView();
     /** Choosing the spot (before a round): the rules are idle. */
@@ -177,7 +230,7 @@ export class GameSession {
       restart: () => this._restart(),
       exit: (/** @type {string} */ r) => this.requestExit(r),
     };
-    this.rules = new SurvivalRules(host, { seed });
+    this.rules = new SurvivalRules(host, { seed, runPause: !this.roam });
 
     // event payloads (reused)
     this._pWave = { wave: 0, enemies: 0 };
@@ -252,6 +305,72 @@ export class GameSession {
   get wave() { return this.rules.wave; }
   get kills() { return this.rules.kills; }
   get health() { return this.rules.health; }
+  /** The player is sitting (Player.seated, or the integrator's ctx.body.seated). */
+  get seated() {
+    const b = /** @type {any} */ (this.ctx).body;
+    if (b && typeof b.seated === 'boolean') return b.seated;
+    const p = /** @type {any} */ (this.ctx.player);
+    return !!(p && p.seated);
+  }
+
+  /**
+   * Roam (true, the default) or the stationary spot mode. Safety rules switch
+   * at once; the world must be built in the same mode (`world.build(snap,
+   * start, { roam: game.roam })`), so switch between rounds or behind a pause.
+   * @param {boolean} on
+   */
+  setRoam(on) {
+    const v = !!on;
+    if (v === this.roam) return;
+    this.roam = v;
+    this.obstacles.setRoam(v);
+    this.rules.pm.runPause = !v;
+    this.roamSafety.reset();
+    this.sendCues(true);
+    this.ring.visible = false;
+    this.view.hideArrow();
+  }
+
+  /** Where the diegetic cues go (the Watch). @param {{ warn: (kind: string, level: number) => any }|null} sink */
+  setWarnSink(sink) {
+    if (this.warnSink && this.warnSink !== sink) this.clearCues();
+    this.warnSink = sink && typeof sink.warn === 'function' ? sink : null;
+    this._cueSent.fill(-1);
+  }
+
+  /** The watch menu opened: pause (MANUAL) while it is open. */
+  openMenu() {
+    this.menuOpen = true;
+    this._menuResume = false;
+    this.rules.pauseNow(PAUSE.MANUAL);
+  }
+
+  /** The watch menu closed: resume through the normal protocol and the 3-2-1, without a trigger pull. */
+  closeMenu() {
+    this.menuOpen = false;
+    this._menuResume = this.rules.paused;
+  }
+
+  /** Restart the round (watch RESTART): full health, wave 0, "Get ready". */
+  restart() {
+    if (this.rules.phase === PHASE.IDLE) return;
+    this.menuOpen = false;
+    this._menuResume = false;
+    this.rules.start();
+    this._msgKey = -1;
+  }
+
+  /**
+   * @param {'test'|'realistic'|'easy'|'normal'|'hard'|number} d
+   */
+  setDifficulty(d) {
+    const v = d === 'test' || d === 'easy' || d === 0 ? 0 : d === 'hard' || d === 2 ? 2 : 1;
+    this.difficulty = v;
+    const S = this.difficultyScale;
+    S.damage = v === 0 ? 0.6 : v === 2 ? 1.3 : 1;
+    S.aim = v === 0 ? 1.4 : v === 2 ? 0.8 : 1;
+    S.reaction = v === 0 ? 0.25 : v === 2 ? -0.1 : 0;
+  }
 
   /** Meshes for the warm-up draw (compiled and drawn once before XR): ring, tint, panel, outline, arrow. */
   warmMeshes() { return [this.ring, this.tint, this.panel.mesh, ...this.view.warmMeshes()]; }
@@ -292,6 +411,7 @@ export class GameSession {
    */
   start(zone) {
     const p = this.ctx.player;
+    if (this.roam) { this.startRoam(zone); return; }
     const r = zone && zone.r && zone.r > 0 ? zone.r : RULES.zoneR;
     const x = zone ? zone.x : p && p.valid !== false ? p.head.x : 0;
     const z = zone ? zone.z : p && p.valid !== false ? p.head.z : 0;
@@ -324,6 +444,46 @@ export class GameSession {
   }
 
   /**
+   * Roam: start where the player stands; no zone (r = 0), no ring.
+   * @param {{ x: number, z: number }} [zone]
+   */
+  startRoam(zone) {
+    const p = this.ctx.player;
+    const x = zone ? zone.x : p && p.valid !== false ? p.head.x : 0;
+    const z = zone ? zone.z : p && p.valid !== false ? p.head.z : 0;
+    this.zone.x = Number.isFinite(x) ? x : 0;
+    this.zone.z = Number.isFinite(z) ? z : 0;
+    this.zone.r = 0;
+    if (p) { p.zone.x = this.zone.x; p.zone.z = this.zone.z; p.zone.r = 0; }
+    this.rules.zoneR = RULES.zoneR; // unused: the zone distance fed is 0
+    this.rules.pm.runPause = false;
+    this.exiting = false;
+    this.exitReason = '';
+    this.lastT = -1;
+    this._msgKey = -1;
+    this.spotting = false;
+    this._roamPick = false;
+    this.menuOpen = false;
+    this._menuResume = false;
+    this.spot.stop();
+    this.rules.setup = false;
+    this.obstacles.reset();
+    this.roamSafety.reset();
+    this.view.reset();
+    this.ring.visible = false;
+    this.panel.restart();
+    this.panel.shown = false;
+    const w = /** @type {any} */ (this.ctx.world);
+    const margin = w && typeof w.edgeMargin === 'function' ? w.edgeMargin(this.zone.x, this.zone.z) : 99;
+    this.spotReport = {
+      mode: 'roam', x: round2(this.zone.x), z: round2(this.zone.z), r: 0,
+      margin: round2(margin), room: w && typeof w.roomAt === 'function' ? w.roomAt(this.zone.x, this.zone.z) : 0,
+      clearance: w && w.nav ? round2(w.nav.clearance(this.zone.x, this.zone.z)) : null,
+    };
+    this.rules.start();
+  }
+
+  /**
    * Before a round: the player chooses where to stand (SafeSpot, PLAN §6.2).
    * The ring follows the head, coloured by the spot's status, with a floor
    * arrow and "Step back 0.6 m" while it is not clear; the trigger confirms
@@ -336,6 +496,22 @@ export class GameSession {
    */
   pickSpot(onConfirm = null, r = RULES.zoneR) {
     this.rules.stop();
+    if (this.roam) {
+      // Roam has no spot: the current position is confirmed on the next frame (the same callback path)
+      this.spotting = false;
+      this._roamPick = true;
+      this._onSpot = onConfirm;
+      this.rules.setup = true;
+      this.exiting = false;
+      this.exitReason = '';
+      this.lastT = -1;
+      this._msgKey = -1;
+      this.obstacles.reset();
+      this.view.reset();
+      this.panel.restart();
+      this.panel.shown = false;
+      return;
+    }
     this.spotting = true;
     this._onSpot = onConfirm;
     this.spot.begin(r);
@@ -359,6 +535,12 @@ export class GameSession {
   stop() {
     this.rules.stop();
     this.spotting = false;
+    this._roamPick = false;
+    this.menuOpen = false;
+    this._menuResume = false;
+    this.roamSafety.reset();
+    this.roamSafety.resetStats();
+    this.clearCues();
     this.spot.stop();
     this.rules.setup = false;
     this._onSpot = null;
@@ -391,8 +573,26 @@ export class GameSession {
       log.push({ kind: VIOLATION_NAMES[pm.logKind[i]], t: Math.round(pm.logT[i] * 100) / 100 });
     }
     return {
+      mode: this.roam ? 'roam' : 'spot', seated: this.seated,
       pauses, violations, log, obstacleWarnings: this.obstacles.warnings, spot: this.spotReport,
       veil: { adopted: this.view.adopted.length, notes: this.view.notes.slice(0, 10) },
+      roam: this.roam ? this.roamReport() : null,
+    };
+  }
+
+  /**
+   * Roam walking diagnostics for the session record (`rec.play.roam`; allocates):
+   * speed p50 / p95 / max, walked metres, run warnings, time off the map,
+   * obstacle cue time, seated time, rooms visited, spawn search counts.
+   */
+  roamReport() {
+    const w = /** @type {any} */ (this.ctx.world);
+    const sp = w && w.spawner;
+    return {
+      ...this.roamSafety.report(),
+      spawnPendingFrames: this.rules.spawnPendingFrames,
+      spawnSearch: sp && sp.roamStats ? { ...sp.roamStats } : null,
+      difficulty: this.difficulty,
     };
   }
 
@@ -417,6 +617,32 @@ export class GameSession {
     if (this.spotting) { this.spot.restartSweep(); return; }
     this.rules.pauseNow(PAUSE.RESET);
     if (o && o.hold) this.rules.hold(PAUSE.RESET);
+    if (this.roam) this.requeueEnemies();
+  }
+
+  /**
+   * Drift found (Realign.js DriftWatch) or any realign the integrator starts:
+   * the same as a held reset (pause, enemies back in the queue) until
+   * `realigned()` after the world was rebuilt in the new coordinates.
+   */
+  beginRealign() {
+    if (this.spotting || this._roamPick) return;
+    this.rules.pauseNow(PAUSE.RESET);
+    this.rules.hold(PAUSE.RESET);
+    if (this.rules.phase !== PHASE.IDLE) this.requeueEnemies();
+  }
+
+  /**
+   * Put the living enemies back into the wave's queue and clear them (their
+   * positions belong to the old reference space; no kill is counted). Roam
+   * does this on every reset; also for a realign after drift.
+   */
+  requeueEnemies() {
+    const R = this.rules;
+    if (R.phase !== PHASE.WAVE && R.phase !== PHASE.BREAK && R.phase !== PHASE.READY) return;
+    const n = R.living();
+    if (this.enemies) this.enemies.reset();
+    R.requeue(n);
   }
 
   /**
@@ -478,22 +704,33 @@ export class GameSession {
     const L = inp ? inp.left : null, Rh = inp ? inp.right : null;
     pm.setControllers(L ? !!L.present : true, Rh ? !!Rh.present : true);
     const pv = !!p && p.valid !== false;
+    const roam = this.roam;
     let dist = 0;
     if (pv) {
       const dx = p.head.x - this.zone.x, dz = p.head.z - this.zone.z;
-      dist = Math.sqrt(dx * dx + dz * dz);
+      dist = roam ? 0 : Math.sqrt(dx * dx + dz * dz); // Roam: no zone
       pm.setHead(p.head.x, p.head.z);
     } else pm.setHead(Number.NaN, Number.NaN);
     this._dist = dist;
+    const seated = this.seated;
 
-    // buttons: Y (exit / restart), B+Y (pause), a trigger pull (resume / confirm the spot)
-    const y = L ? !!L.b : false;
-    const by = !!(L && Rh && L.b && Rh.b);
+    // buttons: Y (exit / restart), B+Y (pause), a trigger pull (resume / confirm the spot);
+    // Y and B+Y only with free hands when the weapons report busy hands (Y is a gun button then)
+    const W = /** @type {any} */ (this.weapons);
+    const busyL = !!(W && W.busyLeft), busyR = !!(W && W.busyRight);
+    const y = L ? !!L.b && !busyL : false;
+    const by = !!(L && Rh && L.b && Rh.b) && !busyL && !busyR;
     if (by && !this._byWas) R.pauseNow(PAUSE.MANUAL);
     this._byWas = by;
     const trigDown = !!((L && L.triggerDown) || (Rh && Rh.triggerDown));
     const trigHeld = !!((L && L.triggerHeld) || (Rh && Rh.triggerHeld));
-    if (trigDown) R.press();
+    // the trigger belongs to the watch while its menu is open or the right hand points at it
+    const sink = /** @type {any} */ (this.warnSink);
+    if (trigDown && !this.menuOpen && !(sink && sink.capture)) R.press();
+    if (this._menuResume) {
+      if (!pm.paused) this._menuResume = false;
+      else R.press(); // the menu was closed: no trigger pull needed
+    }
 
     // mapped walls and furniture near the head or a hand
     const w = ctx.world;
@@ -504,15 +741,31 @@ export class GameSession {
     if (pv) ob.setPoint(POINT.HEAD, p.head.x, p.head.y, p.head.z); else ob.clearPoint(POINT.HEAD);
     ob.setGrip(POINT.LEFT, L && L.hasGrip ? L.grip : null);
     ob.setGrip(POINT.RIGHT, Rh && Rh.hasGrip ? Rh.grip : null);
-    ob.update(dt, live ? shapes : null, R.active ? this.zone : null);
-    pm.setObstacle(R.active && ob.any, R.active && ob.inside);
+    // seated (Roam): sitting on the couch is not an obstacle
+    ob.update(dt, live && !(roam && seated) ? shapes : null, R.active && !roam ? this.zone : null);
+    if (roam) {
+      const RS = this.roamSafety;
+      const margin = pv && w && typeof w.edgeMargin === 'function' ? w.edgeMargin(p.head.x, p.head.z) : 99;
+      const room = w && typeof w.roomAt === 'function' && pv ? w.playerRoom || w.roomAt(p.head.x, p.head.z) : 0;
+      const I = RS.input; // doubles through a typed array: nothing boxed per frame
+      I[IN.DT] = dt;
+      I[IN.X] = pv ? p.head.x : 0;
+      I[IN.Z] = pv ? p.head.z : 0;
+      I[IN.SPEED] = pv && typeof p.speed === 'number' ? p.speed : pm.speed;
+      I[IN.MARGIN] = margin;
+      I[IN.OBSTACLE] = ob.headLevel;
+      RS.step(R.active, pv, seated, pm.trackingOk, room);
+      // enemies freeze only with the head inside a mapped box or well off the map
+      pm.setObstacle(R.active && (RS.freeze || (ob.inside && !seated)), R.active && ob.inside && !seated);
+    } else pm.setObstacle(R.active && ob.any, R.active && ob.inside);
     if (live) {
       if (ob.pulseL && L) pulse(L.source, OBSTACLE.pulse, OBSTACLE.pulseMs);
       if (ob.pulseR && Rh) pulse(Rh.source, OBSTACLE.pulse, OBSTACLE.pulseMs);
     }
 
-    R.setup = this.spotting;
+    R.setup = this.spotting || this._roamPick;
     if (this.spotting && pv) this.spotStep(dt, p, w, trigDown, trigHeld);
+    if (this._roamPick && pv) this.roamPickStep(p);
 
     R.update(dt, dist, visible, y);
     if (pm.tick) this.tick();
@@ -522,6 +775,7 @@ export class GameSession {
       + pm.pauseCounts[5] + pm.pauseCounts[6] + pm.pauseCounts[7] + pm.pauseCounts[8];
     st.violations = pm.violationCounts[0] + pm.violationCounts[1] + pm.violationCounts[2] + pm.violationCounts[3];
     st.obstacleWarnings = ob.warnings;
+    st.spawnPending = R.spawnPendingFrames;
   }
 
   /**
@@ -536,6 +790,46 @@ export class GameSession {
     this.updateTint(dt, p);
     this.updateSafety(t, p);
     this.updateMessage(dt, t, p);
+    this.sendCues(false);
+  }
+
+  /**
+   * Hand the cue levels to the warning sink (the Watch) when they changed by
+   * more than 0.05 (or crossed 0). Allocation-free (kind names are constants).
+   * @param {boolean} force
+   */
+  sendCues(force) {
+    const sink = this.warnSink;
+    if (!sink) return;
+    const C = this.roam ? this.cue : ZERO_CUES, S = this._cueSent;
+    for (let k = 0; k < C.length; k++) {
+      const v = C[k], o = S[k];
+      if (!force && o >= 0 && (v === 0) === (o === 0) && Math.abs(v - o) < 0.05) continue;
+      S[k] = v;
+      sink.warn(CUE_NAMES[k], v);
+    }
+  }
+
+  /** Every cue off at the sink. */
+  clearCues() {
+    const sink = this.warnSink;
+    this._cueSent.fill(-1);
+    if (!sink) return;
+    for (let k = 0; k < CUE_NAMES.length; k++) sink.warn(CUE_NAMES[k], 0);
+    this._cueSent.fill(0);
+  }
+
+  /** Roam: confirm the current position as the start (pickSpot's callback path). @param {import('./Player.js').Player} p */
+  roamPickStep(p) {
+    this._roamPick = false;
+    this.rules.setup = false;
+    const f = p.flatForward || p.forward;
+    const z = this._spotZone;
+    z.x = p.head.x; z.z = p.head.z; z.r = 0; z.facing = Math.atan2(f.x, f.z);
+    const cb = this._onSpot;
+    this._onSpot = null;
+    if (cb) cb(z);
+    else this.start(z);
   }
 
   /**
@@ -582,7 +876,7 @@ export class GameSession {
       ring.visible = true;
       return;
     }
-    if (R.phase === PHASE.IDLE) { ring.visible = false; return; }
+    if (R.phase === PHASE.IDLE || this.roam) { ring.visible = false; return; }
     const r = this.zone.r;
     let op, col;
     if (R.paused && (R.reasons & PAUSE.ZONE)) {
@@ -616,6 +910,7 @@ export class GameSession {
     const R = this.rules, pm = R.pm, v = this.view;
     v.setHidden(this.threatsHidden);
     const w = this._world;
+    if (this.roam) { v.updateOutline(this.obstacles, null, null); v.hideArrow(); return; } // diegetic cues only
     v.updateOutline(this.obstacles, w && w.built !== false ? w.shapes : null, this._floorY);
     const pv = !!p && p.valid !== false;
     if (!pv) { v.hideArrow(); return; }
@@ -659,11 +954,17 @@ export class GameSession {
   updateMessage(dt, t, p) {
     const R = this.rules;
     const panel = this.panel;
-    const spot = this.spotting && R.msg !== MSG.EXITING;
-    const key = spot ? this.spotKey(dt) : R.msg * 1000 + R.msgN;
+    // The open watch menu is the only UI: its pause message ("Pull the trigger to resume", the menu's
+    // own MANUAL pause) sat half behind the menu disc and asked for a pull the watch owns (v0.3 verifier).
+    const menu = this.menuOpen && R.msg !== MSG.EXITING;
+    const spot = this.spotting && R.msg !== MSG.EXITING && !menu;
+    // Roam: nothing in the view during play (the watch shows the wave); pauses, round over and exiting only
+    const m = menu ? MSG.NONE
+      : this.roam && !spot && !R.paused && (R.msg === MSG.GET_READY || R.msg === MSG.WAVE || R.msg === MSG.CLEARED) ? MSG.NONE : R.msg;
+    const key = spot ? this.spotKey(dt) : m * 1000 + (m === MSG.NONE ? 0 : R.msgN);
     if (key !== this._msgKey) {
       this._msgKey = key;
-      const lines = spot ? this.spotLines() : this.linesFor(R.msg, R.msgN);
+      const lines = spot ? this.spotLines() : this.linesFor(m, R.msgN);
       if (lines) {
         panel.setLines(lines);
         if (!panel.shown) { panel.placed = false; panel.shown = true; }
@@ -747,12 +1048,17 @@ export class GameSession {
 
   // ── rules host ───────────────────────────────────────────────────────────
 
+  /** @returns {boolean|number} true / 1 placed, 2 still searching (Roam), false failed */
   _spawn() {
     const w = this.ctx.world, e = this.enemies, p = this.ctx.player;
     if (!w || !e || !p || typeof w.findSpawn !== 'function') return false;
     const f = p.flatForward || p.forward;
     const o = this._spawnAt;
-    if (!w.findSpawn(p.head.x, p.head.z, f.x, f.z, SPAWN_MIN_M, o)) return false;
+    if (this.roam && typeof w.spawnRoamFor === 'function') {
+      const r = w.spawnRoamFor(p, o);
+      if (r === 2) return 2;
+      if (r !== 1) return false;
+    } else if (!w.findSpawn(p.head.x, p.head.z, f.x, f.z, SPAWN_MIN_M, o)) return false;
     // facing as a yaw about +Y, 0 = +Z (the soldier GLB faces +Z): toward the player
     const facing = Math.atan2(p.head.x - o.x, p.head.z - o.z);
     return e.spawn(o.x, o.z, facing) >= 0;
@@ -816,7 +1122,7 @@ export class GameSession {
 
   /** @param {{ damage: number, fromX: number, fromY: number, fromZ: number }} e */
   _onPlayerHit(e) {
-    const d = this.rules.damage(e.damage);
+    const d = this.rules.damage(e.damage * this.difficultyScale.damage);
     if (d <= 0) return;
     this.stats.hits++;
     this.stats.damage += d;
@@ -848,6 +1154,9 @@ export class GameSession {
   /** An enemy shot while paused is a safety violation (PLAN §6.2). */
   _onEnemyShot() { if (this.rules.paused) this.rules.pm.violation(VIOLATION.SHOT); }
 }
+
+/** All cues off (spot mode sends these). */
+const ZERO_CUES = new Float32Array(CUE_NAMES.length);
 
 /**
  * Tracking for the pause rule: the viewer pose exists and is not emulated

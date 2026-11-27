@@ -18,14 +18,23 @@
  *
  * Outputs (all smoothed with a critically damped filter, so what you see is
  * what you grab):
- * - `holster`: the pistol's palm point and its orientation in the right-hip
- *   holster (muzzle down, canted 12° to the rear, PLAN §8);
+ * - `holster`: the pistol's GRIP CENTRE (manifest grip.pos) and its
+ *   orientation in the right-hip holster (muzzle down, canted 12° to the
+ *   rear, PLAN §8). v0.3 anchors the slots by a gun feature, not the palm
+ *   point, so a grip-fit change never moves the holstered gun. Seated: on top
+ *   of the right thigh, muzzle toward the knee (a drop-leg holster with the
+ *   thigh swung forward), blended over 0.35 s;
  * - `pouch`: the magazine's top point in the left-hip pouch, upright frame;
- * - `back`: the rifle's palm point slung on the back behind the right
- *   shoulder (muzzle down to the left, ejection port out) and `backAxis`, the
- *   unit vector from the grip toward the butt (the grab capsule over the
- *   shoulder);
- * - `thighs`: hip and knee points of both thighs (the draw's trigger gate).
+ * - `back`: the rifle's grip centre in the tucked back carry (v0.3 research:
+ *   muzzle down to the left, 17.5° off vertical, butt up behind the right
+ *   trapezius, ejection port out of the back) and `backAxis` / `backLen`, the
+ *   unit vector and length from the grip centre to the butt (the grab capsule
+ *   over the shoulder);
+ * - `thighs`: hip and knee points of both thighs (the draw's trigger gate);
+ * - `seated`: sitting detected from the eye height (below the calibrated
+ *   standing eye by 0.36 m × s, the head still, for 1.5 s; standing again
+ *   at 0.22 m × s for 0.4 s), or forced with `stance`. While seated the
+ *   crouch lean is off (the torso is upright on a bed or couch).
  *
  * Usage, once per frame (allocation-free; inputs are objects, so no double is
  * boxed at the call):
@@ -63,12 +72,22 @@ export const BODY_EST = Object.freeze({
   pelvisMinAboveFloor: 0.3,
   chestFollow: 0.4, chestMax: 0.8,
   // sockets (body frame: x right, y up, z back; × s)
-  holster: Object.freeze([0.212, 0.095, 0.02]),   // CQC SLOT_HOLSTER (palm point) relative to the pelvis
+  holster: Object.freeze([0.212, 0.095, 0.02]),   // CQC SLOT_HOLSTER height; v0.3: the grip centre, relative to the pelvis
   holsterCant: 0.21,                              // rad muzzle to the rear (PLAN §8: 10–15°)
   holsterRoll: 0.05,                              // rad about the bore, along the hip (CQC SLOT_ROT)
   pouch: Object.freeze([-0.16, 0.12, -0.06]),     // magazine top, front of the weak-side hip (design)
-  back: Object.freeze([0.15, -0.07, 0.17]),       // rifle palm point behind the right shoulder blade, from C7 (design)
-  backMuzzle: Object.freeze([-0.45, -0.89, 0]),   // muzzle down to the left (design)
+  // tucked back carry (v0.3 research-fit B), chest yaw frame from the smoothed C7
+  back: Object.freeze([0.0184, -0.1863, 0.17]),   // AKM grip centre
+  backButt: Object.freeze([0.13, 0.06, 0.17]),    // butt, behind the right trapezius
+  backQuat: Object.freeze([0.57028, 0.41806, 0.57028, -0.41806]),   // muzzle (−0.301, −0.954, 0), port out of the back
+  // seated (design; PLAN §8 "seated mode defaults to the thigh")
+  seatDrop: 0.36, standDrop: 0.22,       // m eye drop below the standing eye (× s): sit at, stand at
+  seatHoldS: 1.5, standHoldS: 0.4,
+  seatMaxSpeed: 0.25,                    // m/s head speed: a crouch-walk is not sitting
+  seatMaxPitchDown: 0.6,                 // rad: looking hard down (picking something up) is not sitting
+  seatBlendS: 0.35,
+  seatHolster: Object.freeze([0.19, 0.0, -0.13]),   // grip centre on top of the right thigh
+  seatHolsterPitch: -0.21,                // muzzle toward the knee, 12° down (the standing cant, thigh swung 90°)
   hipJoint: 0.09, thigh: 0.43, kneeFwd: 0.05,
   omega: 30,                                      // 1/s output smoothing: 63 % in ~70 ms (PLAN §8: 60–100 ms)
   maxStep: 0.008,                                 // s filter sub-step
@@ -173,6 +192,18 @@ export function qBasis(X, Y, Z, out) {
   }
 }
 
+/**
+ * Normalised lerp of two unit quaternions (shortest way), out may alias neither.
+ * @param {ArrayLike<number>} a @param {ArrayLike<number>} b @param {number} t @param {Float64Array} out
+ */
+export function nlerp(a, b, t, out) {
+  const d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3], sg = d < 0 ? -1 : 1, k = 1 - t;
+  out[0] = a[0] * k + b[0] * t * sg; out[1] = a[1] * k + b[1] * t * sg;
+  out[2] = a[2] * k + b[2] * t * sg; out[3] = a[3] * k + b[3] * t * sg;
+  const n = Math.sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2] + out[3] * out[3]) || 1;
+  out[0] /= n; out[1] /= n; out[2] /= n; out[3] /= n;
+}
+
 /** A world pose: position and orientation. */
 function pose() { return { p: new Float64Array(3), q: new Float64Array([0, 0, 0, 1]) }; }
 
@@ -218,6 +249,22 @@ export class BodyEstimator {
     this.pouch = pose();
     this.back = pose();
     this.backAxis = new Float64Array(3);
+    /** m from the back grip centre to the butt (× s). */
+    this.backLen = 0;
+    /** World point of the slung rifle's butt. */
+    this.backButt = new Float64Array(3);
+    // seated
+    /** Sitting (bed, couch, chair): the holster moves onto the thigh. */
+    this.seated = false;
+    /** 'auto' (eye height) | 'standing' | 'seated' (a setting). */
+    this.stance = 'auto';
+    /** 0 standing … 1 seated sockets (eased). */
+    this.seatBlend = 0;
+    this._seatT = 0;
+    this._headSpeed = 0;
+    this._headPrev = new Float64Array(3);
+    this._qSeat = new Float64Array(4);
+    this._qs = new Float64Array(4);
     /** Hip L, knee L, hip R, knee R (x, y, z each). */
     this.thighs = new Float64Array(12);
     /** Smoothed pelvis and yaw the sockets hang from. */
@@ -240,17 +287,19 @@ export class BodyEstimator {
   _recomputeLocal() {
     const B = BODY_EST;
     qEulerYXZ(-Math.PI / 2 - B.holsterCant, 0, B.holsterRoll, this._qHolster);
-    const m = B.backMuzzle, n = Math.hypot(m[0], m[1], m[2]);
-    const Z = [-m[0] / n, -m[1] / n, -m[2] / n];           // gun +Z (toward the butt)
-    const X = [0, 0, 1];                                   // ejection side out of the back
-    const Y = [Z[1] * X[2] - Z[2] * X[1], Z[2] * X[0] - Z[0] * X[2], Z[0] * X[1] - Z[1] * X[0]];   // Y = Z × X
-    qBasis(X, Y, Z, this._qBack);
+    qEulerYXZ(B.seatHolsterPitch, 0, B.holsterRoll, this._qSeat);
+    const bq = B.backQuat, n = Math.hypot(bq[0], bq[1], bq[2], bq[3]);
+    for (let i = 0; i < 4; i++) this._qBack[i] = bq[i] / n;
   }
 
   /** Forget the body (new session, reference-space reset). */
   reset() {
     this.valid = false;
     this._headSet = false;
+    this.seated = false;
+    this.seatBlend = 0;
+    this._seatT = 0;
+    this._headSpeed = 0;
     this.freeze = 0;
     this.handConf = 0;
     this.speed = 0;
@@ -305,6 +354,7 @@ export class BodyEstimator {
     this._headingStep();
     this._vote();
     this._hips();
+    this._seatStep();
     this._chain();
     this._speedStep();
     this._frame();
@@ -396,12 +446,44 @@ export class BodyEstimator {
     const yaw = this.yaw, cy = Math.cos(yaw), sy = Math.sin(yaw);
     const C = this.c7;
     C[0] = ax + v[0] - sy * B.bodyFwd * s; C[1] = ay + v[1]; C[2] = az + v[2] - cy * B.bodyFwd * s;
-    const drop = Math.max(0, W[2] - (H[1] - floorY));
+    const drop = this.seated ? 0 : Math.max(0, W[2] - (H[1] - floorY));   // seated: the torso is upright
     const leanT = clamp(drop * B.leanCrouchK, 0, B.leanCrouchMax) + clamp(-hPitch - B.leanLookFrom, 0, B.leanLookMax) * B.leanLookK;
     this.lean = this._first ? leanT : this.lean + (leanT - this.lean) * (1 - Math.exp(-dt * B.leanRate));
     const Lt = B.torso * s, ly = -Lt * Math.cos(this.lean), lz = Lt * Math.sin(this.lean) - B.pelvisBack * s;
     const P = this.pelvis;
     P[0] = C[0] + sy * lz; P[1] = Math.max(C[1] + ly, floorY + B.pelvisMinAboveFloor); P[2] = C[2] + cy * lz;
+  }
+
+  /** Seated detection from the eye height (hysteresis + hold), or the forced stance; the socket blend. */
+  _seatStep() {
+    const B = BODY_EST, W = this._w, H = this._head, hp = this._headPrev, dt = W[0], s = W[3];
+    if (!this._first && dt > 0) {
+      const dx = H[0] - hp[0], dz = H[2] - hp[2];
+      let sp = Math.sqrt(dx * dx + dz * dz) / dt;
+      if (sp > 6) sp = 0;                                    // a tracking jump
+      this._headSpeed += (sp - this._headSpeed) * (1 - Math.exp(-dt * 6));
+    } else this._headSpeed = 0;
+    hp[0] = H[0]; hp[1] = H[1]; hp[2] = H[2];
+    const st = this.stance;
+    if (st === 'seated' || st === 'standing') {
+      this.seated = st === 'seated';
+      this._seatT = 0;
+    } else {
+      const drop = W[2] - (H[1] - W[1]);
+      if (!this.seated) {
+        const sitting = drop > B.seatDrop * s && this._headSpeed < B.seatMaxSpeed && W[4] < B.seatMaxPitchDown;
+        this._seatT = sitting ? this._seatT + dt : 0;
+        if (this._seatT >= B.seatHoldS) { this.seated = true; this._seatT = 0; }
+      } else {
+        this._seatT = drop < B.standDrop * s ? this._seatT + dt : 0;
+        if (this._seatT >= B.standHoldS) { this.seated = false; this._seatT = 0; }
+      }
+    }
+    if (this._first) this.seatBlend = this.seated ? 1 : 0;
+    else {
+      const k = dt / B.seatBlendS;
+      this.seatBlend = this.seated ? Math.min(1, this.seatBlend + k) : Math.max(0, this.seatBlend - k);
+    }
   }
 
   /** Pelvis speed (walking eases the freeze and speeds the settle). */
@@ -444,12 +526,14 @@ export class BodyEstimator {
   _sockets() {
     const B = BODY_EST, pS = this.pelvisS, q = this._q, v = this._v, s = this._w[3];
     qYaw(this.yawS, q);
-    // holster (palm point + pistol orientation)
-    const hp = B.holster;
-    qRotate(q, hp[0] * s + this.holsterOut, hp[1] * s + this.holsterUp, hp[2] * s - this.holsterFwd, v, 0);
+    // holster (grip centre + pistol orientation); seated: on the thigh, blended
+    const sb = this.seatBlend, u = sb * sb * (3 - 2 * sb), hp = B.holster, sh = B.seatHolster;
+    const hx = hp[0] + (sh[0] - hp[0]) * u, hy = hp[1] + (sh[1] - hp[1]) * u, hz = hp[2] + (sh[2] - hp[2]) * u;
+    qRotate(q, hx * s + this.holsterOut, hy * s + this.holsterUp, hz * s - this.holsterFwd, v, 0);
     const Hs = this.holster;
     Hs.p[0] = pS[0] + v[0]; Hs.p[1] = pS[1] + v[1]; Hs.p[2] = pS[2] + v[2];
-    qMul(q, this._qHolster, Hs.q);
+    nlerp(this._qHolster, this._qSeat, u, this._qs);
+    qMul(q, this._qs, Hs.q);
     // pouch (magazine top, upright body frame)
     const pp = B.pouch;
     qRotate(q, pp[0] * s, pp[1] * s, pp[2] * s, v, 0);
@@ -463,13 +547,19 @@ export class BodyEstimator {
       T[o] = pS[0] + cy * B.hipJoint * s * sd; T[o + 1] = pS[1]; T[o + 2] = pS[2] - sy * B.hipJoint * s * sd;
       T[o + 3] = T[o] - sy * B.kneeFwd * s; T[o + 4] = pS[1] - B.thigh * s; T[o + 5] = T[o + 2] - cy * B.kneeFwd * s;
     }
-    // back (rifle palm point behind the right shoulder; chest frame)
+    // back (rifle grip centre, tucked carry behind the right shoulder; chest frame)
     const fx = this._fx;
     qYaw(fx[7], this._q2);
-    const bp = B.back, Bk = this.back;
+    const bp = B.back, bb = B.backButt, Bk = this.back;
     qRotate(this._q2, bp[0] * s, bp[1] * s, bp[2] * s, v, 0);
     Bk.p[0] = fx[3] + v[0]; Bk.p[1] = fx[4] + v[1]; Bk.p[2] = fx[5] + v[2];
     qMul(this._q2, this._qBack, Bk.q);
-    qRotate(Bk.q, 0, 0, 1, this.backAxis, 0);
+    qRotate(this._q2, bb[0] * s, bb[1] * s, bb[2] * s, v, 0);
+    const Bu = this.backButt, A = this.backAxis;
+    Bu[0] = fx[3] + v[0]; Bu[1] = fx[4] + v[1]; Bu[2] = fx[5] + v[2];
+    A[0] = Bu[0] - Bk.p[0]; A[1] = Bu[1] - Bk.p[1]; A[2] = Bu[2] - Bk.p[2];
+    const len = Math.sqrt(A[0] * A[0] + A[1] * A[1] + A[2] * A[2]);
+    this.backLen = len;
+    if (len > 1e-9) { A[0] /= len; A[1] /= len; A[2] /= len; }
   }
 }

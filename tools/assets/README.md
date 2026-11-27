@@ -9,7 +9,11 @@ node bake.mjs          # assets/models/*.glb, assets/sounds/*.mp3, assets/manife
 node check.mjs         # re-reads the GLBs: triangles, draws, textures, GPU memory
 node inspect.mjs glock # source pieces with their labels (for editing the rules in weapons.mjs)
 NODE_PATH=$(npm root -g) node render-check.mjs <outDir>   # headless Chromium screenshots (from the repo root)
+node hands.mjs [--debug <dir>]   # only the gloved hands, into the baked gun GLBs (bake.mjs runs it too)
+NODE_PATH=$(npm root -g) node tools/assets/fit-check.mjs <outDir> <profilesDir>   # v0.3 gun fit over the Touch Plus mesh
 ```
+
+`fit-check.mjs` needs the controller meshes of the npm package `@webxr-input-profiles/assets` (its `dist/profiles` folder, e.g. from `npm pack @webxr-input-profiles/assets`); it renders each gun in the right hand (side, eye, trigger close-ups, with and without gloves) over the real Touch Plus mesh, and the holster / sling looking down standing and seated.
 
 The first bake encodes nine KTX2 maps (about a minute each for 2048 maps). The results are cached in `.cache/` by content hash, so a re-bake with unchanged textures takes about 4 minutes (the hidden-surface pass).
 
@@ -37,3 +41,5 @@ The first bake encodes nine KTX2 maps (about a minute each for 2048 maps). The r
 - `ejectionPort`: half a case length ahead of the breech face, on the outer right side. `ejectDir` is tuned, not measured: the Glock's is CQC's tested case velocity [1.5, 1.9, 0.8].
 - `sights`: the top of the rear sight (Glock: ears; AKM: the notch end of the leaf) and of the front post, on the centre plane.
 - Extras that are not in the contract: `parts` (part names), `bore.radius`, `magCatch {pos, axis, travel}`, `slideStop` (Glock part 3) or `selector` (AKM part 3), and `textures`.
+
+**Gloved hands** (`hands.mjs`, v0.3): the CQC viewmodel rigs `vm-pistol2.glb` (Glock) and `vm-ak.glb` (AKM) are evaluated at t = 0 of their clip on the CPU (`lib/rig.mjs`), registered onto our gun space (Ry 180°, scale 0.0088, the middle finger's loop round the grip on the manifest grip centre), the index finger is re-posed onto the trigger face (a grid search over three joint rotations), and the right hand (plus the AKM's left hand on the handguard, centred on it) is cut at a 3 cm cuff. The arm texture is cropped to the hands' UV window (base 512² ETC1S, normal and ORM 256² UASTC). The meshes go into the gun GLB as nodes `hand_r` / `hand_l` with their own `hand` material and a float `_PART` (2 on the index finger's distal segment, so it follows the trigger); `manifest.weapons[id].hands` records them. Re-running it replaces the earlier hands; the gun and magazine are re-encoded unchanged (a few normals re-round).

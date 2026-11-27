@@ -332,7 +332,7 @@ test('play and update allocate nothing in the engine (sampling heap profiler)', 
   // A steady allocation shows in every run; a one-off JIT event (a deopt boxes
   // doubles in whatever function it hits) does not, so take the best of three.
   let best = null, bestTotal = Infinity;
-  for (let r = 0; r < 3 && bestTotal > 0; r++) {
+  for (let r = 0; r < 8 && bestTotal > 0; r++) { // best of up to 8 (early exit): a JIT deopt under load is one-off, a real allocation shows every time
     const s = new Session();
     s.connect();
     await s.post('HeapProfiler.startSampling', { samplingInterval: 16 });

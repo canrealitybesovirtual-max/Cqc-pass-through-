@@ -331,9 +331,10 @@ test('per-frame paths allocate nothing (sampling heap profiler)', async () => {
     }
   };
   loop(200000); // warm the JIT on every path (a deopt would box doubles and blame update)
-  // best of three: a steady allocation shows every time, a one-off JIT deopt does not
+  // best of up to 8: a steady allocation shows every time, a one-off JIT deopt does not (on a loaded
+  // machine V8's concurrent re-optimisation lags, and three reps once all read ~1 KB in update)
   let by = null, ev = 0;
-  for (let r = 0; r < 3; r++) {
+  for (let r = 0; r < 8; r++) {
     events = 0;
     const b = await allocatedIn('/src/game/Rules.js', () => loop(200000));
     const sum = Object.values(b).reduce((x, y) => x + y, 0);

@@ -43,13 +43,17 @@ const r6 = (v) => Math.round(v * 1e6) / 1e6 + 0;
  *
  * @param {any} frame XRFrame (or any object with detectedPlanes / detectedMeshes / getPose)
  * @param {any} space XRReferenceSpace the poses are expressed in
- * @param {{ spaceName?: string, stats?: { planes: number, meshes: number, skippedPlanes: number, skippedMeshes: number } }} [opts]
+ * @param {{ spaceName?: string, stats?: { planes: number, meshes: number, skippedPlanes: number, skippedMeshes: number },
+ *   keep?: any[] }} [opts] keep: filled with the XRPlane objects in `planes` order (for the drift watch:
+ *   `keep[i]` is the live plane of `snap.planes[i]`; references only, nothing is copied)
  * @returns {import('./Layout.js').SpaceSnapshot}
  */
 export function captureSnapshot(frame, space, opts = {}) {
   /** @type {import('./Layout.js').SpaceSnapshot} */
   const snap = { version: SNAPSHOT_VERSION, space: opts.spaceName || 'local-floor', planes: [], meshes: [] };
   let skippedPlanes = 0, skippedMeshes = 0;
+  const keep = Array.isArray(opts.keep) ? opts.keep : null;
+  if (keep) keep.length = 0;
   const planes = frame && frame.detectedPlanes;
   if (planes) {
     for (const p of planes) {
@@ -63,6 +67,7 @@ export function captureSnapshot(frame, space, opts = {}) {
         ? p.orientation
         : (Math.abs(m[5]) > 0.7 ? 'horizontal' : 'vertical');
       snap.planes.push({ label: labelOf(p.semanticLabel), orientation, pose: poseArray(m), polygon: pts });
+      if (keep) keep.push(p);
     }
   }
   const meshes = frame && frame.detectedMeshes;

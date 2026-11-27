@@ -2,9 +2,9 @@
 
 A mixed-reality tactical FPS for Meta Quest 3, played in your real house through passthrough. It is built with three.js and WebXR and runs in the Quest Browser.
 
-**Status:** v0.2, the first playable test slice: survival waves in your Space Setup room with a Glock and an AKM, desktop-tested in the emulator, not yet played on the headset. A probe session measures what your Quest's browser supports. See [docs/FEATURES.md](docs/FEATURES.md).
+**Status:** v0.3: survival waves through your whole Space Setup house (Roam) with a Glock and an AKM held in the controller's grip, CQC's reload controls, gloved hands and a dive-watch menu on the left wrist. v0.2 was played on the headset; v0.3 is desktop-tested in the emulator only. A probe session measures what your Quest's browser supports. See [docs/FEATURES.md](docs/FEATURES.md).
 
-- **Play:** open the site in the Quest Browser and tap **Enter MR**.
+- **Play:** open the site in the Quest Browser and tap **Enter MR** (the whole house), or **Enter MR: one spot** (stationary).
 - **Develop:**
     - `node tools/serve.mjs`, then open `http://localhost:8080/?emulate` (Meta's IWER emulator).
     - `npm test` runs the unit tests.

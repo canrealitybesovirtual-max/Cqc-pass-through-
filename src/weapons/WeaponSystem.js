@@ -1,7 +1,7 @@
 // @ts-check
 import * as THREE from 'three';
 import { getDef } from './WeaponDefs.js';
-import { WeaponInstance, CHAMBER_LIVE, HOME_RACK, HOME_RELEASE } from './WeaponInstance.js';
+import { WeaponInstance, CHAMBER_LIVE, HOME_RACK, HOME_RELEASE, SLIDE_LOCKED } from './WeaponInstance.js';
 import { Recoil } from './Recoil.js';
 import { WeaponView } from './WeaponView.js';
 import { WeaponFX, Rng } from './WeaponFX.js';
@@ -11,31 +11,47 @@ import {
   CARRY_SLOT, CARRY_DRAW, CARRY_HAND, CARRY_HOLSTER, CARRY_DROP, CARRY_SHRINK, CARRY_GROW, EV_STOWED,
 } from '../player/Slots.js';
 import { HANDLING, MagWell, MAG_FREE, MAG_GUIDED, TriggerGate, HapticGate, rackFraction, boreAtThighs } from '../player/Handling.js';
+import { computeFit, parseFits, serializeFits, clampAdj, zeroAdj, FIT_KEY } from './GunFit.js';
+import { makeHolsterShell } from './Holster.js';
+
 
 /**
  * The `weapons` system (CONTRACTS.md "W2"): both guns, the body slots, the
  * hands on the guns, shots, effects and haptics. Allocation-free per frame.
  *
- * Controls (right hand = gun hand):
- * - Right grip at the right hip draws the Glock; over the right shoulder
- *   takes the AKM off the back. Let go near the slot to put it back.
+ * Controls (right hand = gun hand; v0.3 = CQC's Quest map, see Controls.js):
+ * - Right grip at the right hip draws the Glock (seated: on the right thigh);
+ *   over the right shoulder takes the AKM off the back (slung out of sight).
+ *   Let go near the slot to put it back.
  * - Right trigger fires (bore at the moment the trigger breaks, through
- *   `ctx.raycast`). A = magazine release; A again with the magazine out =
- *   assisted reload (1.2 s, for testing). B = slide release. Right stick
- *   click = AKM selector (lever order, wrapping: safe → auto → semi → safe; the
- *   AKM is issued on semi, so the first click puts it on safe).
+ *   `ctx.raycast`).
+ * - A, or X with the left hand on the gun: magazine release (it leaves the
+ *   well at 1.1 m/s, CQC). B, or Y with the left hand on the gun: Glock slide
+ *   release; AKM selector (lever order, wrapping: safe → auto → semi → safe;
+ *   issued on semi). Right stick click = selector too. Test aid: hold A 0.8 s
+ *   with no magazine = assisted reload (1.2 s). Empty hands: face buttons do
+ *   nothing here.
  * - Left grip at the left-hip pouch takes a fresh magazine; bring it to the
- *   well, aligned, and push it home. Left grip on the slide's rear / the
- *   AKM's charging handle racks (the slide follows the hand along its axis).
- *   Left grip on the AKM handguard: two-handed (the aim runs from the right
- *   grip to the left hand, recoil × 0.55); on the Glock, cupping the right
- *   hand: two-handed recoil.
+ *   well, aligned, and push it home. A free left hand squeezing the lower
+ *   75 % of the AKM's seated magazine strips it into the hand (CQC MAG_STRIP).
+ *   Left grip on the slide's rear / the AKM's charging handle racks (reach
+ *   0.085 / 0.10 m, +0.02 unchambered or locked; a tick when a free hand
+ *   comes into reach). Left grip on the AKM handguard: two-handed (the aim
+ *   runs from the right grip to the left hand, recoil × 0.55); on the Glock,
+ *   cupping the right hand: two-handed recoil.
+ * - Guns are held in GRIP space (GunFit; the player's nudges via setFit).
+ *   A held gun whose bore would pass through a world shape (grip → muzzle
+ *   ray) slides back along the bore, with a haptic tick.
  *
  * Integration:
  *   const weapons = new WeaponSystem(ctx, { fpScene });   // at load, after assets; adds its own objects
  *   warm-up: weapons.setWarm(true) … draw … weapons.setWarm(false); weapons.warmMeshes()
  *   `weapons` system: weapons.update(dt, t, frame, ctx) (after `player`)
  *   HUD: weapons.ammo() → { weapon, mag, chambered, mode } (one reused object; mode 'safe' | 'semi' | 'auto')
+ *   Fit: weapons.loadFits(localStorage[FIT_KEY]) at load; setFit(id, {pitch, up, fwd}, source) any time
+ *   (allocation-free); fitsJSON() to save (outside the frame loop); fitReport() for the record.
+ *   Game / watch: busyLeft, busyRight, onGunLeft (face buttons belong to the gun then); body.seated;
+ *   triggerBlocked (the watch has the trigger: no shot); fitHold(id | null) for the watch's GUN FIT page.
  * It listens to `pause` (no firing while paused; the guns still follow the
  * hands) and emits `shot` and `enemyHit` (reused payloads). Pass
  * `{ enemies }` to also call enemies.applyHit for each enemy hit.
@@ -58,11 +74,24 @@ export const HAPTIC = Object.freeze({
   dry: Object.freeze([0.2, 12]),
   pouch: Object.freeze([0.4, 25]),
   support: Object.freeze([0.3, 14]),
+  rackHover: Object.freeze([0.12, 12]),   // CQC: a free hand comes into rack reach
+  strip: Object.freeze([0.35, 25]),       // CQC stripMag
+  wall: Object.freeze([0.15, 10]),        // the held gun meets a wall (design)
 });
 
 export const SYSTEM = Object.freeze({
   range: 100,               // m hitscan range indoors
-  magPush: 0.6,             // m/s a released magazine leaves the well (design)
+  magPush: 1.1,             // m/s a released magazine leaves the well (CQC)
+  assistHoldS: 0.8,         // s holding A with no magazine starts the assisted reload (test aid)
+  rackReach: Object.freeze({ glock: 0.085, akm: 0.10 }),   // m (CQC defs)
+  rackOpenBonus: 0.02,      // m more reach when unchambered or locked open (CQC rackReachOf)
+  stripReach: 0.06,         // m left hand to the seated AKM magazine (CQC MAG_STRIP)
+  stripBand: 0.75,          // lower fraction of the magazine that counts
+  stripBlendS: 0.08,        // s the stripped magazine moves into the hand
+  wallMargin: 0.02,         // m kept between the muzzle and a wall
+  wallMaxPush: 0.3,         // m
+  wallTickMin: 0.006,       // m of push that ticks
+  wallRelax: 14,            // 1/s the gun slides forward again
   glockCup: 0.09,           // m: left grip this close to the right grip cups the Glock (design)
   glockCupSlip: 0.15,
   assistShow: 0.15,         // s: the assisted reload's magazine slides in over the last of it
@@ -71,7 +100,9 @@ export const SYSTEM = Object.freeze({
 });
 
 const LEFT = 0, RIGHT = 1;
-const L_NONE = 0, L_RACK = 1, L_SUPPORT = 2, L_MAG = 3;
+const L_NONE = 0, L_RACK = 1, L_SUPPORT = 2, L_MAG = 3, L_STRIP = 4;
+/** GrabSense bit of the left hand's rack zone (hover tick). */
+const RACK_BIT = 4;
 
 /**
  * Grip-space pose inside the aim-ray space for Quest Touch Plus controllers,
@@ -113,6 +144,9 @@ class Hand {
     this.lostT = 0;
     this.sense = new GrabSense();
     this.hap = new HapticGate();
+    /** Session sum of the learned grip → ray rotation (sign-aligned), for the record. */
+    this.relSum = new Float64Array(4);
+    this.relN = 0;
   }
 }
 
@@ -152,10 +186,17 @@ class Weapon {
     this.prev = new THREE.Vector3();
     this.hadPrev = false;
     this.assistT = -1;
+    /** The A press that is held began with no magazine seated (the assisted-reload test aid). */
+    this.aNoMag = false;
     this.twoHand = false;
     this.scale = 1;
     /** Floor under the let-go point (a dropped gun rests on it until it returns). */
     this.dropFloor = 0;
+    /** The player's grip-fit nudges (GunFit). */
+    this.fitAdj = zeroAdj();
+    /** m the held gun is slid back from a wall, and whether it is touching (tick once). */
+    this.wallPush = 0;
+    this.wallTouch = false;
   }
 }
 
@@ -166,6 +207,8 @@ export class WeaponSystem {
    * @param {{ fpScene?: THREE.Object3D | null, enemies?: { applyHit?: (enemy: number, part: string, damage: number, dx: number, dy: number, dz: number) => void } | null, seed?: number }} [opts]
    */
   constructor(ctx, opts = {}) {
+    /** Left glove on the AKM handguard: off until it is re-posed to wrap the handguard (v0.3). */
+    this.supportGlove = false;
     const models = ctx.assets.models;
     this.fpRoot = new THREE.Group();
     this.fpRoot.name = 'w2-fp';
@@ -185,6 +228,24 @@ export class WeaponSystem {
       w.view.root.visible = false;
       this._wire(w);
     }
+    /** The Glock's holster shell: at the holster socket every frame, drawn or not. */
+    this.holster = makeHolsterShell();
+    this.holster.visible = false;
+    this.fpRoot.add(this.holster);
+    /** 'default' | 'saved' | 'url' | 'edit' — where the current grip fit came from. */
+    this.fitSource = 'default';
+    this.fitEdits = 0;
+    this._pose7 = new Float64Array(7);
+    this._palm3 = new Float64Array(3);
+    /** Wall push-back ray (one reused hit record). */
+    this._wallHit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, kind: 'none', surface: '', enemy: -1, part: '' };
+    /** Draw the gloved hands on held guns. */
+    this.gloves = true;
+    /** A magazine is being stripped (its catch release must not drop it). */
+    this._stripping = false;
+    this._stripT = 0;
+    this._stripP = new THREE.Vector3();
+    this._stripQ = new THREE.Quaternion();
     this.fx = new WeaponFX({
       worldRoot: this.worldRoot, fpRoot: this.fpRoot,
       light: ctx.gfx && ctx.gfx.flashLights ? ctx.gfx.flashLights[0] : null,
@@ -224,6 +285,12 @@ export class WeaponSystem {
     this._lp = new THREE.Vector3();
     this._lq = new THREE.Quaternion();
     this._warm = false;
+    /** The trigger belongs to something else this frame (the watch: pointing at it / its menu open). */
+    this.triggerBlocked = false;
+    /** @type {Weapon|null} gun-fit mode keeps this gun in the right hand without the squeeze */
+    this._fitHold = null;
+    /** The fit mode drew it (it goes back to its slot when the mode ends). */
+    this._fitDrew = false;
 
     if (ctx.events && ctx.events.on) ctx.events.on('pause', (/** @type {any} */ p) => { this.paused = !!(p && p.paused); });
   }
@@ -261,6 +328,8 @@ export class WeaponSystem {
     if (held && this.lRole === L_SUPPORT && this.lWeapon === held && held.id === 'akm' && held.carry.inHand && this.L.ok) {
       held.view.aimTwoHanded(held.bq, this.R.pos, this.L.pos, held.bp, HANDLING.supportMinSpan);
     }
+    if (held && held.carry.inHand) this._wallStep(held, dt);
+    else if (held) held.wallPush = 0;
     // the bore at the trigger break = base + the recoil so far
     for (let i = 0; i < this.weapons.length; i++) this._display(this.weapons[i]);
     if (held && held.carry.inHand) this._operate(held, dt, I);
@@ -279,8 +348,10 @@ export class WeaponSystem {
       const inHand = w === held;
       v.updateParts(dt, w.inst, inHand && I ? I.right.trigger : 0, inHand && I ? I.right.a : false);
       v.mag.visible = w.inst.magSeated || (w.assistT >= 0 && w.assistT < SYSTEM.assistShow);
+      this._gloves(w);
     }
-    this._placeHandMag();
+    this._placeHandMag(dt);
+    this._placeHolster();
     this.fx.update(dt, this.now, ctx);
   }
 
@@ -297,6 +368,8 @@ export class WeaponSystem {
       _m.fromArray(s.ray);
       h.quat.setFromRotationMatrix(_m);
       h.rel.copy(h.gripQuat).invert().multiply(h.quat);
+      const S = h.relSum, r = h.rel, sg = h.relN > 0 && S[0] * r.x + S[1] * r.y + S[2] * r.z + S[3] * r.w < 0 ? -1 : 1;
+      if (Number.isFinite(r.x + r.y + r.z + r.w)) { S[0] += sg * r.x; S[1] += sg * r.y; S[2] += sg * r.z; S[3] += sg * r.w; h.relN++; }
     } else {
       h.quat.copy(h.gripQuat).multiply(h.rel);
     }
@@ -320,13 +393,15 @@ export class WeaponSystem {
   }
 
   /**
-   * Distance from a hand to a weapon's grab zone (holster point, or the
-   * slung rifle's grip-to-butt line over the shoulder).
+   * Distance from a hand to a weapon's grab zone (the holstered grip centre,
+   * or the slung rifle's grip-to-butt line over the shoulder), in units of
+   * that zone's reach (≤ 1 = in reach).
    * @param {Weapon} w @param {THREE.Vector3} p
    */
   _grabDist(w, p) {
     const B = this.body;
-    return w.id === 'glock' ? pointDist(p.x, p.y, p.z, B.holster.p) : segmentDist(p.x, p.y, p.z, B.back.p, B.backAxis, SLOTS.backLen);
+    return w.id === 'glock' ? pointDist(p.x, p.y, p.z, B.holster.p) / SLOTS.grabReach
+      : segmentDist(p.x, p.y, p.z, B.back.p, B.backAxis, B.backLen) / SLOTS.backReach;
   }
 
   // ======================================================================= right hand
@@ -343,7 +418,7 @@ export class WeaponSystem {
       for (let i = 0; i < this.weapons.length; i++) {
         const x = this.weapons[i];
         const d = x.carry.grabbable ? this._grabDist(x, R.pos) : Infinity;
-        const near = d <= SLOTS.grabReach;
+        const near = d <= 1;
         if (R.sense.enter(x.bit, near)) entered = true;
         if (near && d < bestD) { best = x; bestD = d; }
       }
@@ -352,7 +427,7 @@ export class WeaponSystem {
       return;
     }
     if (!w.carry.inHand) { this.held = null; return; }
-    if (!(s && s.squeezeHeld)) this._letGo(w, false);
+    if (!(s && s.squeezeHeld)) { if (this._fitHold !== w) this._letGo(w, false); }
     else if (R.lostT > SLOTS.lostS) this._letGo(w, true);
   }
 
@@ -375,7 +450,7 @@ export class WeaponSystem {
    */
   _letGo(w, lost) {
     const v = w.view;
-    v.toWorld(v.palm, _v);
+    v.toWorld(v.gripCentre, _v);
     const near = !lost && _v.distanceTo(w.slotP) <= SLOTS.slotReach;
     if (lost) w.carry.lost(); else w.carry.release(near);
     w.relP.copy(v.root.position);
@@ -387,6 +462,8 @@ export class WeaponSystem {
     w.recoil.reset();
     w.assistT = -1;
     w.twoHand = false;
+    w.wallPush = 0;
+    w.wallTouch = false;
     this.held = null;
     if (near) this._pulse(RIGHT, SLOTS.holster);
   }
@@ -397,7 +474,7 @@ export class WeaponSystem {
   _base(w, dt) {
     const v = w.view, c = w.carry;
     v.slotPose(w.slotP, w.slotQ, w.sp, w.sq);
-    if (c.inHand && this.R.ok) v.holdPose(this.R.pos, this.R.quat, w.hp, w.hq);
+    if (c.inHand && this.R.ok) v.holdPose(this.R.pos, this.R.gripQuat, w.hp, w.hq);
     w.scale = c.scale;
     switch (c.state) {
       case CARRY_DRAW: {
@@ -448,8 +525,105 @@ export class WeaponSystem {
     if (w.carry.inHand && r.active) v.applyRecoil(w.bp, w.bq, r.back, r.pitch, r.yaw, root.position, root.quaternion);
     else { root.position.copy(w.bp); root.quaternion.copy(w.bq); }
     root.scale.setScalar(w.scale > 1e-3 ? w.scale : 1e-3);
-    const st = w.carry.state;
-    root.visible = this._warm || (st !== CARRY_SLOT && st !== CARRY_GROW) || this.body.valid;
+    const st = w.carry.state, slung = st === CARRY_SLOT || st === CARRY_GROW;
+    // a rifle on your back is out of sight (research-fit B: no occluder hid it without hiding the holster too)
+    root.visible = this._warm || !slung || (this.body.valid && w.id !== 'akm');
+  }
+
+  /**
+   * Gun–wall push-back: a ray from the grip to the muzzle against the world;
+   * on a hit the gun slides back along its bore so the muzzle stays 2 cm off
+   * the surface (fast in, eased out), with one haptic tick on contact.
+   * @param {Weapon} w @param {number} dt
+   */
+  _wallStep(w, dt) {
+    const W = this.ctx && this.ctx.world, R = this.R;
+    let target = 0;
+    if (W && typeof W.raycast === 'function' && W.built !== false && R.ok) {
+      _v.copy(w.view.muzzle).applyQuaternion(w.bq).add(w.bp);
+      _v2.subVectors(_v, R.pos);
+      const len = _v2.length();
+      if (len > 1e-3) {
+        _v2.multiplyScalar(1 / len);
+        const H = this._wallHit, reach = len + SYSTEM.wallMargin;
+        if (W.raycast(R.pos.x, R.pos.y, R.pos.z, _v2.x, _v2.y, _v2.z, reach, H) && H.dist < reach) {
+          target = reach - H.dist;
+          if (target > SYSTEM.wallMaxPush) target = SYSTEM.wallMaxPush;
+        }
+      }
+    }
+    if (target >= w.wallPush) w.wallPush = target;
+    else w.wallPush += (target - w.wallPush) * (1 - Math.exp(-SYSTEM.wallRelax * (dt > 0 ? dt : 0)));
+    if (w.wallPush < 1e-5) w.wallPush = 0;
+    if (!w.wallTouch && w.wallPush > SYSTEM.wallTickMin) { w.wallTouch = true; this._pulse(RIGHT, HAPTIC.wall); }
+    else if (w.wallTouch && w.wallPush < SYSTEM.wallTickMin * 0.5) w.wallTouch = false;
+    if (w.wallPush > 0) {
+      _v3.set(0, 0, 1).applyQuaternion(w.bq);
+      w.bp.addScaledVector(_v3, w.wallPush);
+    }
+  }
+
+  /**
+   * Gloves: the right one while the gun is in the hand (from half-way through the draw), the
+   * left one while the left hand supports the AKM.
+   * @param {Weapon} w
+   */
+  _gloves(w) {
+    const v = w.view, c = w.carry, on = this.gloves || this._warm;
+    if (v.handR) v.handR.visible = this._warm || (on && (c.state === CARRY_HAND || (c.state === CARRY_DRAW && c.blend > 0.5)));
+    // The AKM support glove is off until it is re-posed to wrap the handguard (v0.3 verifier: it
+    // stood upright beside it, ~4 cm above the real controller). Still warmed.
+    if (v.handL) v.handL.visible = this._warm || (this.supportGlove && on && c.inHand && w.twoHand && this.lRole === L_SUPPORT && this.lWeapon === w && w.id === 'akm');
+  }
+
+  /**
+   * Gun-fit mode (the watch's GUN FIT page, research-fit C): keep gun `id` in
+   * the right hand without the squeeze, drawing it from its slot when the hand
+   * is empty (or holds a gun this mode drew; a gun the player drew stays).
+   * `null` ends the mode: the held gun goes back to its slot unless the grip
+   * is squeezed. Called from
+   * the watch's action (an event, not per frame). `fitHolding` says which gun is held this way.
+   * @param {'glock'|'akm'|null} id
+   */
+  fitHold(id) {
+    const s = this.ctx && this.ctx.input ? this.ctx.input.right : null;
+    const squeezed = !!(s && s.squeezeHeld);
+    if (!id) {
+      const w = this._fitHold;
+      this._fitHold = null;
+      if (w && this.held === w && !squeezed) this._letGo(w, true); // not squeezed: back to its slot
+      this._fitDrew = false;
+      return;
+    }
+    const w = id === 'akm' ? this.akm : this.glock;
+    if (this.held === w) { if (this._fitHold !== w) this._fitDrew = false; this._fitHold = w; return; }
+    if (this.held) {
+      if (!(this._fitDrew && this._fitHold === this.held)) { this._fitHold = this.held; return; } // the player's own gun stays
+      this._letGo(this.held, true);
+    }
+    this._fitHold = w;
+    this._fitDrew = false;
+    if (w.carry.state !== CARRY_SLOT) w.carry.stow();
+    this._draw(w);
+    this._fitDrew = this.held === w;
+  }
+
+  /** The gun the fit mode holds in the right hand (null outside it). */
+  get fitHolding() { return this._fitHold ? this._fitHold.id : null; }
+
+  /**
+   * Gloved hands on or off (URL `?gloves=0`, a watch setting). Default on.
+   * @param {boolean} on
+   */
+  setGloves(on) { this.gloves = !!on; }
+
+  /** The holster shell at the holster socket's gun-root pose (drawn or not). */
+  _placeHolster() {
+    const H = this.holster, g = this.glock;
+    H.visible = this._warm || this.body.valid;
+    if (!this.body.valid) return;
+    H.position.copy(g.sp);
+    H.quaternion.copy(g.sq);
   }
 
   /** @param {Weapon} w @param {number} dt */
@@ -489,13 +663,18 @@ export class WeaponSystem {
       }
       return;
     }
+    // rack reach (CQC rackReachOf) and the hover tick for a free hand
+    let dr = Infinity;
+    if (held && L.ok) {
+      held.view.rackLocal(held.inst.slidePos, _v);
+      _v.applyQuaternion(held.bq).add(held.bp);
+      dr = L.pos.distanceTo(_v) / this._rackReach(held);
+    }
+    if (L.sense.enter(RACK_BIT, dr <= 1) && !(s && s.squeezeHeld)) this._pulse(LEFT, HAPTIC.rackHover);
     if (!(s && s.squeezeDown) || !L.ok) return;
     let role = L_NONE, best = 1;
     if (held) {
       const v = held.view;
-      v.rackLocal(held.inst.slidePos, _v);
-      _v.applyQuaternion(held.bq).add(held.bp);
-      const dr = L.pos.distanceTo(_v) / HANDLING.rackReach;
       if (dr < best) { best = dr; role = L_RACK; }
       let ds = Infinity;
       if (held.id === 'akm' && v.support) {
@@ -503,6 +682,10 @@ export class WeaponSystem {
         ds = L.pos.distanceTo(_v) / HANDLING.supportReach;
       } else if (held.id === 'glock') ds = L.pos.distanceTo(this.R.pos) / SYSTEM.glockCup;
       if (ds < best) { best = ds; role = L_SUPPORT; }
+      if (held.id === 'akm' && held.inst.magSeated && !this.handMag) {
+        const dm = this._stripDist(held, L.pos) / SYSTEM.stripReach;
+        if (dm < best) { best = dm; role = L_STRIP; }
+      }
     }
     if (!this.handMag && this.body.valid) {
       const dp = pointDist(L.pos.x, L.pos.y, L.pos.z, this.body.pouch.p) / SLOTS.pouchReach;
@@ -518,6 +701,8 @@ export class WeaponSystem {
       this.lRole = L_SUPPORT;
       this.lWeapon = held;
       this._pulse(LEFT, HAPTIC.support);
+    } else if (role === L_STRIP && held) {
+      this._strip(held);
     } else if (role === L_MAG) {
       const w = held || this.lastHeld;
       this.lRole = L_MAG;
@@ -528,6 +713,49 @@ export class WeaponSystem {
       this._pulse(LEFT, HAPTIC.pouch);
       this._sound('cloth', L.pos, 0.6);
     }
+  }
+
+  /** @param {Weapon} w rack reach (m), more when unchambered or locked open */
+  _rackReach(w) {
+    const i = w.inst, base = w.id === 'akm' ? SYSTEM.rackReach.akm : SYSTEM.rackReach.glock;
+    return i.chamber !== CHAMBER_LIVE || i.slide === SLIDE_LOCKED ? base + SYSTEM.rackOpenBonus : base;
+  }
+
+  /**
+   * Distance from a point to the lower `stripBand` of the seated magazine (its box, gun space).
+   * @param {Weapon} w @param {THREE.Vector3} p world
+   */
+  _stripDist(w, p) {
+    const v = w.view;
+    v.toLocal(p, w.bp, w.bq, _v3).sub(v.mag.position);
+    const c = v.magCentre, h = v.magHalf;
+    const y0 = c.y - h.y, y1 = y0 + 2 * h.y * SYSTEM.stripBand;
+    const x = _v3.x < c.x - h.x ? c.x - h.x : _v3.x > c.x + h.x ? c.x + h.x : _v3.x;
+    const y = _v3.y < y0 ? y0 : _v3.y > y1 ? y1 : _v3.y;
+    const z = _v3.z < c.z - h.z ? c.z - h.z : _v3.z > c.z + h.z ? c.z + h.z : _v3.z;
+    return Math.hypot(_v3.x - x, _v3.y - y, _v3.z - z);
+  }
+
+  /**
+   * The left hand strips the seated magazine (CQC MAG_STRIP): it comes out
+   * with its rounds into the hand and must leave the well before it re-seats.
+   * @param {Weapon} w
+   */
+  _strip(w) {
+    const v = w.view, inst = w.inst;
+    v.localToWorldPose(v.mag.position, v.mag.quaternion, w.bp, w.bq, this._stripP, this._stripQ);
+    this._stripping = true;
+    const rounds = inst.magRelease();
+    this._stripping = false;
+    if (rounds < 0) return;
+    this.lRole = L_MAG;
+    this.handMag = w;
+    this.handMagRounds = rounds;
+    w.well.reset();
+    w.well.block();
+    v.handMag.visible = true;
+    this._stripT = SYSTEM.stripBlendS;
+    this._pulse(LEFT, HAPTIC.strip);
   }
 
   /** The left hand lets go of whatever it does. */
@@ -570,13 +798,20 @@ export class WeaponSystem {
       if (_v2.length() > HANDLING.rackSlip) this._endLeft();
       else inst.rackPull(rackFraction(_v.dot(v.slideAxis), this.rackOffset, v.travel));
     }
-    if (s) {
-      if (s.aDown) {
-        if (inst.magSeated) { this._pulse(RIGHT, HAPTIC.magCatch); inst.magRelease(); }
-        else if (w.assistT < 0) w.assistT = HANDLING.assistS;
-      }
-      if (s.bDown) inst.slideRelease();
-      if (s.stickDown) inst.selector();
+    // face buttons on whichever hand is on the gun (CQC): A / X magazine release, B / Y slide release or selector
+    const Lb = I ? I.left : null;
+    const onL = !!Lb && this.L.ok && (this.lRole === L_SUPPORT || this.lRole === L_RACK) && this.lWeapon === w;
+    const aR = !!s && s.aDown, aL = onL && /** @type {any} */ (Lb).aDown;
+    if (aR) w.aNoMag = !inst.magSeated;
+    if (aR || aL) {
+      if (inst.magSeated) { this._pulse(aR ? RIGHT : LEFT, HAPTIC.magCatch); inst.magRelease(); }
+    }
+    if ((s && s.bDown) || (onL && /** @type {any} */ (Lb).bDown)) this._buttonB(w);
+    if (s && s.stickDown) inst.selector();
+    // test aid: hold A 0.8 s with no magazine
+    if (s && s.a && w.aNoMag && s.aHeldS >= SYSTEM.assistHoldS && !inst.magSeated && w.assistT < 0 && this.handMag !== w) {
+      w.assistT = HANDLING.assistS;
+      w.aNoMag = false;
     }
     if (w.assistT >= 0) {
       if (inst.magSeated) w.assistT = -1;
@@ -593,7 +828,18 @@ export class WeaponSystem {
     const atThigh = this.body.valid && boreAtThighs(_v, _v2, this.body.thighs);
     _v3.copy(v.muzzle).applyQuaternion(w.sq).add(w.sp);
     const open = w.gate.update(trig, _v.distanceTo(_v3), atThigh);
-    inst.setTrigger(open && w.carry.state === CARRY_HAND && !this.paused ? trig : 0);
+    inst.setTrigger(open && w.carry.state === CARRY_HAND && !this.paused && !this.triggerBlocked ? trig : 0);
+  }
+
+  /**
+   * B / Y: the slide release where the gun has one (or the action is locked
+   * open), otherwise the fire selector (AKM).
+   * @param {Weapon} w
+   */
+  _buttonB(w) {
+    const inst = w.inst;
+    if (w.def.hasSlideRelease || inst.slide === SLIDE_LOCKED) inst.slideRelease();
+    else if (w.def.modes.length > 1) inst.selector();
   }
 
   /**
@@ -604,7 +850,7 @@ export class WeaponSystem {
     if (this.lRole !== L_MAG || this.handMag !== w || !this.L.ok) return;
     const v = w.view;
     if (w.inst.magSeated) { w.well.state = MAG_FREE; return; }
-    v.handMagPose(this.L.pos, this.L.quat, this._mp, this._mq);
+    v.handMagPose(this.L.pos, this.L.gripQuat, this._mp, this._mq);
     v.toLocal(this._mp, w.bp, w.bq, _v).sub(v.magSeat);
     _q.copy(w.bq).invert().multiply(this._mq);
     _v2.copy(v.magAxis).applyQuaternion(_q);
@@ -624,16 +870,26 @@ export class WeaponSystem {
     }
   }
 
-  /** The magazine in the left hand: free in the hand, or guided by the well. */
-  _placeHandMag() {
+  /**
+   * The magazine in the left hand: free in the hand, or guided by the well
+   * (a stripped one moves from the well into the hand over 80 ms).
+   * @param {number} dt
+   */
+  _placeHandMag(dt) {
     const w = this.handMag;
-    if (!w || this.lRole !== L_MAG) return;
+    if (!w || this.lRole !== L_MAG) { this._stripT = 0; return; }
     const v = w.view, m = v.handMag;
     if (w === this.held && w.well.state === MAG_GUIDED) {
       v.guidedMagLocal(w.well.along, this._lp, this._lq);
       v.localToWorldPose(this._lp, this._lq, v.root.position, v.root.quaternion, m.position, m.quaternion);
     } else if (this.L.ok) {
-      v.handMagPose(this.L.pos, this.L.quat, m.position, m.quaternion);
+      v.handMagPose(this.L.pos, this.L.gripQuat, m.position, m.quaternion);
+      if (this._stripT > 0) {
+        this._stripT -= dt > 0 ? dt : 0;
+        const k = this._stripT > 0 ? this._stripT / SYSTEM.stripBlendS : 0;
+        m.position.lerp(this._stripP, k);
+        m.quaternion.slerp(this._stripQ, k);
+      }
     }
     m.visible = true;
   }
@@ -721,6 +977,7 @@ export class WeaponSystem {
    */
   _magOut(w) {
     const v = w.view;
+    if (this._stripping) { v.magOut = 0; this._soundAt(w, w.def.sounds.magOut, 1); return; }   // into the hand, not the floor
     _v3.copy(v.magSeat).addScaledVector(v.magAxis, -v.magOut);
     v.toWorld(_v3, _v);
     v.dirWorld(v.magAxis, _v2).multiplyScalar(-SYSTEM.magPush).add(w.vel);
@@ -787,17 +1044,136 @@ export class WeaponSystem {
       w.recoil.reset();
       w.well.reset();
       w.assistT = -1;
+      w.aNoMag = false;
       w.view.magOut = 0;
       if (w !== this.held) w.carry.stow();
     }
+    this._stripT = 0;
     this.fx.reset();
   }
+
+  // ----------------------------------------------------------------------- fit
+
+  /**
+   * The player's grip-fit nudges for one gun (a copy).
+   * @param {'glock'|'akm'} id
+   * @returns {{ pitch: number, up: number, fwd: number }}
+   */
+  getFit(id) { const a = (id === 'akm' ? this.akm : this.glock).fitAdj; return { pitch: a.pitch, up: a.up, fwd: a.fwd }; }
+
+  /**
+   * Set one gun's grip fit (clamped: ±30°, ±0.04 m). Allocation-free, so the
+   * in-headset fit mode may call it every frame. Never writes storage.
+   * @param {'glock'|'akm'} id
+   * @param {{ pitch?: number, up?: number, fwd?: number }} adj
+   * @param {'default'|'saved'|'url'|'edit'} [source]
+   * @returns {{ pitch: number, up: number, fwd: number }} the effective nudges (the weapon's own object: read, do not keep)
+   */
+  setFit(id, adj, source = 'edit') {
+    const w = id === 'akm' ? this.akm : this.glock, a = w.fitAdj;
+    a.pitch = adj && adj.pitch !== undefined ? adj.pitch : 0;
+    a.up = adj && adj.up !== undefined ? adj.up : 0;
+    a.fwd = adj && adj.fwd !== undefined ? adj.fwd : 0;
+    clampAdj(a);
+    computeFit(w.id, a, this._pose7, this._palm3);
+    w.view.setFit(this._pose7, this._palm3);
+    this.fitSource = source;
+    if (source === 'edit') this.fitEdits++;
+    return a;
+  }
+
+  /**
+   * Apply saved fits (localStorage[FIT_KEY], a string or parsed object; junk = defaults).
+   * @param {unknown} json
+   * @returns {boolean} anything other than the defaults
+   */
+  loadFits(json) {
+    const f = parseFits(json);
+    this.setFit('glock', f.glock, 'saved');
+    this.setFit('akm', f.akm, 'saved');
+    const any = [f.glock, f.akm].some((a) => a.pitch !== 0 || a.up !== 0 || a.fwd !== 0);
+    if (!any) this.fitSource = 'default';
+    return any;
+  }
+
+  /** JSON for localStorage[FIT_KEY] (write it outside the frame loop, e.g. in a setTimeout). */
+  fitsJSON() { return serializeFits({ glock: this.glock.fitAdj, akm: this.akm.fitAdj }); }
+
+  /** The storage key the integrator saves `fitsJSON()` under. */
+  static get FIT_KEY() { return FIT_KEY; }
+
+  /**
+   * `rec.play.grip` (research-fit D): the fit per gun (nudges, gun root in
+   * grip space) and the session mean of the learned grip → ray rotation per
+   * hand (device-verifies the 45° / 7° IWER relation). Allocates; call at
+   * session end.
+   */
+  fitReport() {
+    const r4 = (/** @type {number} */ v) => Math.round(v * 10000) / 10000;
+    /** @param {Weapon} w */
+    const gun = (w) => ({
+      pitch: w.fitAdj.pitch, up: w.fitAdj.up, fwd: w.fitAdj.fwd,
+      pos: w.view.fitPos.toArray().map(r4), quat: w.view.fitQuat.toArray().map(r4), palm: w.view.palm.toArray().map(r4),
+    });
+    /** @param {Hand} h */
+    const rel = (h) => {
+      if (!h.relN) return null;
+      const S = h.relSum, q = new THREE.Quaternion(S[0], S[1], S[2], S[3]).normalize();
+      const d = new THREE.Vector3(0, 0, -1).applyQuaternion(q);   // ray direction in grip space
+      return {
+        q: q.toArray().map(r4), n: h.relN,
+        rayPitchDeg: Math.round((Math.atan2(-d.z, -d.y) * 1800) / Math.PI) / 10,
+        rayYawDeg: Math.round((Math.asin(Math.max(-1, Math.min(1, d.x))) * 1800) / Math.PI) / 10,
+      };
+    };
+    return {
+      fitVersion: 2, source: this.fitSource, edits: this.fitEdits,
+      glock: gun(this.glock), akm: gun(this.akm),
+      rayRel: { right: rel(this.R), left: rel(this.L) },
+      seated: this.body.seated, stance: this.body.stance,
+    };
+  }
+
+  /**
+   * The right controller's aim-ray orientation that points the held gun's
+   * bore along (dx, dy, dz) with the gun upright (tests and the e2e driver:
+   * ray = gun · fit⁻¹ · rel, where grip = ray · rel⁻¹). Allocation-free.
+   * @param {number} dx @param {number} dy @param {number} dz
+   * @param {THREE.Quaternion} out
+   * @returns {boolean} false with no gun in the right hand
+   */
+  aimRayFor(dx, dy, dz, out) {
+    const w = this.held;
+    if (!w) return false;
+    _v.set(dx, dy, dz).normalize();
+    // gun upright: yaw then pitch so −Z → dir
+    const yaw = Math.atan2(-_v.x, -_v.z), pitch = Math.asin(Math.max(-1, Math.min(1, _v.y)));
+    out.setFromAxisAngle(_YA, yaw).multiply(_q.setFromAxisAngle(_XA, pitch));
+    out.multiply(_q.copy(w.view.fitQuat).invert()).multiply(this.R.rel);
+    return true;
+  }
+
+  // ----------------------------------------------------------------------- state for the game / watch
+
+  /** The left hand is doing something with a gun or a magazine. */
+  get busyLeft() { return this.lRole !== L_NONE; }
+  /** The right hand holds a gun. */
+  get busyRight() { return !!(this.held && this.held.carry.inHand); }
+  /** The left hand is on the held gun (support or rack): its X / Y are gun buttons. */
+  get onGunLeft() { return (this.lRole === L_SUPPORT || this.lRole === L_RACK) && !!this.held && this.lWeapon === this.held; }
+
+  /**
+   * Stance: 'auto' (eye height), 'standing' or 'seated' (a setting).
+   * @param {'auto'|'standing'|'seated'} s
+   */
+  setStance(s) { this.body.stance = s === 'standing' || s === 'seated' ? s : 'auto'; }
 
   /** Meshes for the warm-up compile and draw. */
   warmMeshes() {
     /** @type {THREE.Object3D[]} */
     const out = [];
     for (const w of this.weapons) out.push(w.view.root, w.view.handMag);
+    out.push(this.holster);
     return out.concat(this.fx.warmMeshes());
   }
 
@@ -815,8 +1191,11 @@ export class WeaponSystem {
       v.root.visible = on || v.root.visible;
       v.handMag.visible = on ? true : this.handMag === w && this.lRole === L_MAG;
       for (const m of [v.gun, v.mag, v.handMag]) m.frustumCulled = !on;
-      if (!on) v.root.visible = this.body.valid || w.carry.state !== CARRY_SLOT;
+      for (const h of [v.handR, v.handL]) if (h) { h.frustumCulled = !on; h.visible = on; }
+      if (!on) v.root.visible = (this.body.valid && w.id !== 'akm') || w.carry.state !== CARRY_SLOT;
     }
+    this.holster.visible = on || this.body.valid;
+    this.holster.frustumCulled = !on;
     this.fx.setWarm(on);
   }
 }

@@ -17,7 +17,8 @@ const report = {};
 const server = await serve(0);
 const port = server.address().port;
 const browser = await chromium.launch({ args: ['--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
-const page = await browser.newPage();
+const mainContext = await browser.newContext(); // shared with the reload check (same localStorage)
+const page = await mainContext.newPage();
 const consoleErrors = [];
 page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
 page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
@@ -29,7 +30,7 @@ await page.addInitScript(() => {
     const t = document.getElementById('loadText');
     if (!t) return;
     const $ = (id) => document.getElementById(id).disabled;
-    new MutationObserver(() => window.__loadTrace.push({ text: t.textContent, play: $('bPlay'), probe: $('bProbe'), bounds: $('bBounds'), at: performance.now() }))
+    new MutationObserver(() => window.__loadTrace.push({ text: t.textContent, play: $('bPlay'), spot: $('bSpot'), probe: $('bProbe'), bounds: $('bBounds'), at: performance.now() }))
       .observe(t, { childList: true, characterData: true, subtree: true });
   });
 });
@@ -103,14 +104,64 @@ const installHelpers = () => page.evaluate(async () => {
       const ox = h.grip[12] - h.ray[12], oy = h.grip[13] - h.ray[13], oz = h.grip[14] - h.ray[14];
       c.position.set(p[0] - ox, p[1] - oy, p[2] - oz);
     },
-    /** Point the controller's −Z (aim ray) from its grip toward `to`. */
+    /**
+     * Point at `to`: with a gun in the right hand, the BORE (guns are held in grip space, so the aim ray
+     * is 24–29° off the bore: WeaponSystem.aimRayFor); otherwise the controller's −Z (aim ray).
+     */
     aimAt(side, to) {
       const g = app.input[side].grip;
       const d = new THREE.Vector3(to[0] - g[12], to[1] - g[13], to[2] - g[14]).normalize();
-      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), d);
+      const q = new THREE.Quaternion();
+      if (!(side === 'right' && app.play && app.play.weapons.aimRayFor(d.x, d.y, d.z, q))) q.setFromUnitVectors(new THREE.Vector3(0, 0, -1), d);
       dev.controllers[side].quaternion.set(q.x, q.y, q.z, q.w);
     },
     level(side) { dev.controllers[side].quaternion.set(0, 0, 0, 1); },
+    /**
+     * A wrist check: the left controller posed so the watch's dial sits 35 cm from the eyes, 50° below
+     * the horizon, facing them, and the head looking at it. Returns the dial target.
+     */
+    checkWatch() {
+      const w = app.play.watch, L = app.input.left, eye = app.play.player.eye;
+      const rayM = new THREE.Matrix4().fromArray(L.ray), gripM = new THREE.Matrix4().fromArray(L.grip);
+      const G = rayM.clone().invert().multiply(gripM); // ray → grip (IWER's fixed offset)
+      const Gt = new THREE.Vector3().setFromMatrixPosition(G);
+      const off = w.offset, offT = new THREE.Vector3().setFromMatrixPosition(off);
+      const nLocal = new THREE.Vector3().setFromMatrixColumn(off, 2).normalize();
+      const target = new THREE.Vector3(-0.18, -0.77, -0.62).normalize().multiplyScalar(0.35).add(eye);
+      const toEye = eye.clone().sub(target).normalize();
+      const f = new THREE.Vector3(1, 0.12, -0.3).normalize(), Z = f.clone().negate();
+      const X0 = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), Z).normalize(), Y0 = new THREE.Vector3().crossVectors(Z, X0);
+      let best = -2, bestR = null;
+      for (let a = 0; a < 360; a += 2) {
+        const r = (a * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r);
+        const X = X0.clone().multiplyScalar(c).addScaledVector(Y0, s), Y = Y0.clone().multiplyScalar(c).addScaledVector(X0, -s);
+        const R = new THREE.Matrix4().makeBasis(X, Y, Z);
+        const d = nLocal.clone().applyMatrix4(R).normalize().dot(toEye);
+        if (d > best) { best = d; bestR = R; }
+      }
+      const q = new THREE.Quaternion().setFromRotationMatrix(bestR);
+      const p = target.clone().sub(Gt.clone().add(offT).applyQuaternion(q));
+      dev.controllers.left.position.set(p.x, p.y, p.z);
+      dev.controllers.left.quaternion.set(q.x, q.y, q.z, q.w);
+      const look = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(eye, target, new THREE.Vector3(0, 1, 0)));
+      dev.quaternion.set(look.x, look.y, look.z, look.w);
+      return { target: target.toArray(), face: best };
+    },
+    /** The right controller 20 cm in front of the dial, its aim ray on the dial's centre. */
+    pointAtWatch() {
+      const w = app.play.watch, o = w.o, n = w.az;
+      const p = o.clone().addScaledVector(n, 0.2);
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), n.clone().negate());
+      dev.controllers.right.position.set(p.x, p.y, p.z);
+      dev.controllers.right.quaternion.set(q.x, q.y, q.z, q.w);
+    },
+    /** Controllers and head back to IWER's defaults. */
+    restorePose() {
+      const c = dev.controllers;
+      c.left.position.set(-0.25, 1.5, -0.4); c.left.quaternion.set(0, 0, 0, 1);
+      c.right.position.set(0.25, 1.5, -0.4); c.right.quaternion.set(0, 0, 0, 1);
+      dev.quaternion.set(0, 0, 0, 1);
+    },
   };
 });
 
@@ -135,32 +186,44 @@ try {
     const warmed = new Set(p.warmed);
     return { state: p.state, error: p.error, progress: p.progress, history: p.history, warm: p.warm, times: p.times, warnings: p.warnings,
       text: document.getElementById('loadText').textContent, bar: document.getElementById('loadBar').value,
-      play: document.getElementById('bPlay').disabled, probe: document.getElementById('bProbe').disabled,
+      play: document.getElementById('bPlay').disabled, spot: document.getElementById('bSpot').disabled, probe: document.getElementById('bProbe').disabled,
       sounds: p.audio ? Object.keys(p.audio.buffers).length : 0, models: m ? Object.keys(m) : [],
       detached: !!m && ['glock', 'akm', 'soldier'].every((x) => m[x].scene.parent === null),
       kit: !!k && k.stepName === 'idle',
       poolsWarmed: !!k && warmed.has(k.world.occluder) && warmed.has(k.world.overlay) && k.enemies.pool.rigs.every((r) => warmed.has(r.root)) && warmed.has(k.weapons.glock.view.root)
-        && warmed.has(k.weapons.akm.view.root) && warmed.has(k.game.tint) && warmed.has(k.hud.panel.mesh),
-      poolsRestored: !!k && k.enemies.pool.rigs.every((r) => !r.root.visible) && !k.weapons.glock.view.root.visible && !k.game.tint.visible,
+        && warmed.has(k.weapons.akm.view.root) && warmed.has(k.weapons.holster) && warmed.has(k.game.tint) && warmed.has(k.watch.root) && warmed.has(k.watch.menuRoot),
+      poolsRestored: !!k && k.enemies.pool.rigs.every((r) => !r.root.visible) && !k.weapons.glock.view.root.visible && !k.game.tint.visible && !k.watch.root.visible && !k.watch.menuRoot.visible,
+      gloves: !!k && ['glock', 'akm'].map((id) => { const v = k.weapons[id].view; return { id, right: !!v.handR, left: !!v.handL, inGun: !!v.handR && v.root.getObjectById(v.handR.id) === v.handR, shown: !!v.handR && v.handR.visible,
+        sameProgram: !!v.handR && v.handR.material.customProgramCacheKey && v.handR.material.customProgramCacheKey() === v.gun.material.customProgramCacheKey(),
+        doubleSided: !!v.handR && v.handR.material.side === 2 && (!v.handL || v.handL.material.side === 2) }; }),
+      env: { set: !!a.gfx.scene.environment, same: a.gfx.scene.environment === a.gfx.envTexture, intensity: a.gfx.scene.environmentIntensity, lighting: a.gfx.lighting,
+        cloth: k && k.enemies.pool.rigs[0] ? k.enemies.pool.rigs[0].mesh.material.envMapIntensity : null },
+      watchSounds: !!k && k.watchSounds && !!p.audio.buffers.watchTick && !!p.audio.buffers.watchAlert,
       diag: JSON.parse(a.diag.json()).preload, trace: window.__loadTrace,
-      grip: k && { ...k.gripReport }, gripPatched: !!k && k.weapons.glock.view.holdPose !== Object.getPrototypeOf(k.weapons.glock.view).holdPose };
+      grip: k && { ...k.gripReport } };
   });
   ok('preload: ready', pre.state === 'ready', pre.error || `${pre.times.totalMs} ms (assets ${pre.times.assetsMs}, audio ${pre.times.audioMs}, pools ${pre.times.poolsMs}, warm-up ${pre.times.warmMs})`);
   const pcts = pre.history.map((h) => h.pct);
   ok('preload: progress reaches 100 %', pre.progress === 1 && pcts.at(-1) === 100 && pre.bar === 1 && pcts.every((v, i) => i === 0 || v >= pcts[i - 1]),
     `${pcts.length} steps: ${pcts.slice(0, 6).join(',')}…${pcts.at(-1)}`);
   const during = pre.trace.filter((e) => /^Loading \d+%$/.test(e.text) && e.text !== 'Loading 100%');
-  ok('preload: "Loading n%" shown with Enter MR and Probe disabled', during.length > 0 && during.every((e) => e.play && e.probe && e.bounds),
+  ok('preload: "Loading n%" shown with Enter MR (both buttons) and Probe disabled', during.length > 0 && during.every((e) => e.play && e.spot && e.probe && e.bounds),
     `${during.length} updates, e.g. ${during.slice(0, 3).map((e) => e.text).join(' | ')}`);
-  ok('preload: Enter MR enabled only after the warm-up', !pre.play && !pre.probe && /^Ready/.test(pre.text) && pre.trace.filter((e) => !e.play).every((e) => /^Ready/.test(e.text)), pre.text);
+  ok('preload: Enter MR (whole house) and Enter MR: one spot enabled only after the warm-up', !pre.play && !pre.spot && !pre.probe && /^Ready/.test(pre.text)
+    && pre.trace.filter((e) => !e.play || !e.spot).every((e) => /^Ready/.test(e.text)), pre.text);
   ok('preload: models and sounds loaded', pre.models.length === 3 && pre.sounds >= 20, `models ${pre.models.join(',')}; ${pre.sounds} sound keys; ${pre.warnings.join('; ')}`);
-  ok('preload: the game is built at load (world, weapons, enemy pool, session, HUD)', pre.kit);
-  ok('preload: every pool is in the warm-up draw, then hidden again', pre.poolsWarmed && pre.poolsRestored);
+  ok('preload: the game is built at load (world, weapons, enemy pool, session, watch)', pre.kit);
+  ok('preload: every pool (and the holster, the watch and its menu) is in the warm-up draw, then hidden again', pre.poolsWarmed && pre.poolsRestored);
+  ok('preload: gloved hands come inside both gun GLBs (children of the gun root, the gun\'s shader hook, double-sided: the open glove shell), hidden until held',
+    pre.gloves.every((g) => g.right && g.inGun && !g.shown && g.sameProgram && g.doubleSided) && pre.gloves.find((g) => g.id === 'akm').left, JSON.stringify(pre.gloves));
+  ok('preload: the room environment map is set before the warm-up (PMREM), enemy cloth dimmed', pre.env.set && pre.env.same && pre.env.intensity > 0 && pre.env.cloth === 0.35,
+    JSON.stringify(pre.env));
+  ok('preload: the watch\'s tick and alert sounds are made before Enter', pre.watchSounds);
   ok('preload: programs count recorded', pre.warm && pre.warm.programs > 0 && pre.warm.textures > 0 && pre.warm.geometries > 0 && pre.diag && pre.diag.warm.programs === pre.warm.programs,
     pre.warm && `${pre.warm.programs} programs, ${pre.warm.textures} textures, ${pre.warm.geometries} geometries; ${pre.warm.drawables} drawables, ${pre.warm.calls} calls, ${pre.warm.textureCount} uploads`);
   ok('preload: asset scenes detached again', pre.detached);
-  ok('preload: no grip fit in the URL: default fit, holdPose untouched', pre.grip && pre.grip.source === 'default' && pre.grip.pitchDeg === 0 && !pre.gripPatched && pre.grip.applied.length === 0,
-    pre.grip && JSON.stringify(pre.grip.palm));
+  ok('preload: no grip fit saved or in the URL: the default fit on both guns', pre.grip && pre.grip.fitVersion === 2 && pre.grip.source === 'default'
+    && ['glock', 'akm'].every((id) => pre.grip[id].pitch === 0 && pre.grip[id].up === 0 && pre.grip[id].fwd === 0), pre.grip && JSON.stringify({ glock: pre.grip.glock.pos, akm: pre.grip.akm.pos }));
   report.preload = { ...pre.times, programs: pre.warm.programs, textures: pre.warm.textures, geometries: pre.warm.geometries, drawables: pre.warm.drawables };
 
   // Fake GPU depth (IWER has none): XRWebGLBinding.getDepthInformation returns, while on, one of two
@@ -324,38 +387,34 @@ try {
       sys.update = (dt, t, f, c) => orig(dt, clock(t), f, c);
     }
   });
-  // The "Get ready" card (world built behind it) with the controls, then the safe-spot step
+  // The "Get ready" card (world built behind it) with the controls; in Roam a trigger pull starts the round where you stand
   const card = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'start' && { lines: a.panel.lines.slice(), visible: a.panel.mesh.visible }; }, null, 15000);
-  ok('play: the "Get ready" card shows the controls after the build', card && card.visible && card.lines[0] === 'Get ready' && card.lines.includes('[How to play]')
-    && card.lines.some((l) => /Exit: hold Y/.test(l)) && card.lines.some((l) => /B: slide release/.test(l)), card && card.lines.join(' | '));
+  ok('play: the "Get ready" card shows the CQC controls after the build', card && card.visible && card.lines[0] === 'Get ready' && card.lines.includes('[How to play]')
+    && card.lines.some((l) => /Exit: hold Y/.test(l)) && card.lines.some((l) => /A \(or X on the gun\): drop the magazine/.test(l)) && card.lines.some((l) => /B \(or Y on the gun\)/.test(l))
+    && card.lines.some((l) => /watch/.test(l)) && card.lines.at(-1) === 'Pull the trigger to start', card && card.lines.join(' | '));
   const skipped = await skipCard();
-  const sp = await waitFor(() => {
-    const a = window.__app, k = a.play, g = k.game;
-    return k.stepName === 'spot' && g.panel.mesh.visible && { status: g.spotStatus, spotting: g.spotting, appPanel: a.panel.mesh.visible, lines: k.panelLines(), ring: g.ring.visible,
-      msg: g.panel.lines.slice(), skipped: a.rec.play.cardSkipped, cardMs: a.rec.play.cardMs };
-  }, null, 10000);
-  ok('play: a trigger pull moves on to the safe spot: App panel hidden, ring and spot message shown', skipped && sp && sp.spotting && !sp.appPanel && sp.lines === null && sp.ring && sp.skipped,
-    sp && `${sp.status}; "${sp.msg.join(' / ')}"; card up ${sp.cardMs} ms`);
-  const spotSeen = await confirmSpot();
-  report.spot = spotSeen;
   const ready = await waitFor(() => window.__app.play.stepName === 'play', null, 15000);
   const g0 = await page.evaluate(() => {
-    const a = window.__app, k = a.play, rec = a.rec;
+    const a = window.__app, k = a.play, rec = a.rec, g = k.game;
     return { space: rec.granted.referenceSpace, req: rec.requested, systems: a.perf.systems, loop: a.loop.systems.map((s) => s.name), play: rec.play, warmXR: rec.warmXR,
       snap: rec.spaceSnapshot && { planes: rec.spaceSnapshot.planes.length, meshes: rec.spaceSnapshot.meshes.length }, world: k.world.describe(), virtual: k.world.virtual,
-      phase: k.game.phaseName, msg: k.game.panel.mesh.visible ? k.game.panel.lines : null, programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone },
-      head: { x: k.player.head.x, z: k.player.head.z }, view: rec.view, xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible };
+      phase: g.phaseName, roam: g.roam, worldRoam: k.world.roamOn, rooms: k.world.stats.rooms, spotting: g.spotting, ring: g.ring.visible, msg: g.panel.mesh.visible ? g.panel.lines : null,
+      programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone }, head: { x: k.player.head.x, z: k.player.head.z }, view: rec.view,
+      xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible, watchOn: k.watch.enabled, sink: g.warnSink === k.watch };
   });
-  ok('play: local-floor and no unbounded request', g0.space === 'local-floor' && !g0.req.includes('unbounded'), `${g0.space}; ${g0.req.join(',')}`);
+  ok('play: whole house by default: `unbounded` requested (IWER grants it) and the Roam rules', g0.req.includes('unbounded') && ['unbounded', 'local-floor'].includes(g0.space) && g0.roam && g0.worldRoam
+    && g0.play.mode === 'roam', `${g0.space}; ${g0.req.join(',')}; ${g0.rooms} rooms`);
+  report.space = g0.space;
   ok('play: systems in the contract order', g0.loop.join(',') === 'input,world,player,weapons,enemies,game,audio,ui' && g0.systems.join(',') === 'input,world,player,weapons,enemies,game,audio,ui,render', g0.systems.join(' → '));
   ok('play: Space Setup snapshot captured (house fixture) and stored in the session record', !!ready && g0.snap && g0.snap.planes === 19 && g0.snap.meshes === 4 && g0.play.source === 'fixture',
     g0.snap && `${g0.snap.planes} planes, ${g0.snap.meshes} meshes`);
-  ok('play: world built from it behind the Get ready panel', !g0.virtual && /2 floors/.test(g0.world) && g0.play.world.buildMs >= 0, `${g0.world}; build ${g0.play.world.buildMs} ms`);
+  ok('play: world built from it behind the Get ready panel (Roam: rooms found)', !g0.virtual && /2 floors/.test(g0.world) && g0.play.world.buildMs >= 0 && g0.play.world.mode === 'roam' && g0.rooms >= 2,
+    `${g0.world}; build ${g0.play.world.buildMs} ms`);
   ok('play: one XR warm draw of every pool, nothing new compiled', g0.warmXR && !g0.warmXR.skipped && g0.warmXR.programs === before.programs && g0.programs === before.programs,
     g0.warmXR && `${g0.warmXR.drawables} drawables, ${g0.warmXR.calls} calls, ${g0.warmXR.ms} ms; ${g0.programs} programs (before play ${before.programs}, warm-up ${pre.warm.programs})`);
-  ok('play: the trigger in a good spot starts the round there ("Get ready", zone at the head)', !!ready && g0.phase === 'ready' && g0.msg && g0.msg[0] === 'Get ready' && !g0.appPanel
-    && Math.hypot(g0.zone.x - g0.head.x, g0.zone.z - g0.head.z) < 0.3 && g0.play.spot && g0.play.spot.rebuilt === g0.play.spot.movedM > 0.25,
-    `${g0.phase}; ${g0.msg && g0.msg.join(' / ')}; spot ${spotSeen.join('→')}; zone ${JSON.stringify(g0.zone)}; ${JSON.stringify(g0.play.spot)}`);
+  ok('play (Roam): the card\'s trigger pull starts the round where you stand: no spot step, no ring, no zone, no text in the view', skipped && !!ready && ['ready', 'wave'].includes(g0.phase)
+    && !g0.spotting && !g0.ring && g0.msg === null && !g0.appPanel && g0.zone.r === 0 && g0.play.spot && g0.play.spot.mode === 'roam' && g0.play.spot.rebuilt === false && g0.watchOn && g0.sink,
+    `${g0.phase}; msg ${JSON.stringify(g0.msg)}; ${JSON.stringify(g0.play.spot)}; card up ${g0.play.cardMs} ms`);
   ok('play: near plane 0.02 m without depth sensing', g0.view && g0.view.near === 0.02 && !g0.view.depthSensing && Math.abs(g0.xrNear - 0.02) < 1e-9, JSON.stringify(g0.view));
   const fr = await waitFor(() => { const F = window.__app.rec.probes.frameRate; return F && F.request !== 'pending' && { ...F }; }, null, 5000);
   ok('play: 72 Hz requested (updateTargetFrameRate), logged with the measured rate', fr && fr.target === 72 && fr.request === 'ok' && fr.offered.includes(72),
@@ -427,28 +486,33 @@ try {
   report.combat = { playerShots: w1.stats.shots, enemyHits: w1.stats.enemyHits, kills: w1.en.killed, enemyShots: w1.en.shots, hitsOnPlayer: w1.en.hitsOnPlayer, health: w1.health };
   // Enemy follow-ups: the "test" difficulty, spawn tiers, hit puffs (gap audit F1, F4, F6)
   const efx = await page.evaluate(() => {
-    const k = window.__app.play, W = k.world, z = W.zone, S = W.spawner, rec = [];
-    for (let j = 0; j < S.logCount; j++) { const g = ((S.logHead - S.logCount + j + 16) % 16) * 4; rec.push({ d: Math.hypot(S.log[g] - z.x, S.log[g + 1] - z.z), tier: S.log[g + 2] }); }
-    return { rec, dmg: window.__pdmg.slice(), diff: k.enemies.brain.diff.name, puffWarm: new Set(window.__app.preload.warmed).has(k.enemies.puff.mesh), puffs: k.enemies.puff.spawned };
+    const k = window.__app.play, W = k.world, rep = W.report();
+    return { rec: rep.spawn.recent, search: rep.spawn.roamSearch, rooms: W.stats.rooms, dmg: window.__pdmg.slice(), diff: k.enemies.brain.diff.name,
+      puffWarm: new Set(window.__app.preload.warmed).has(k.enemies.puff.mesh), puffs: k.enemies.puff.spawned };
   });
   const efe = w1.en, tiered = efe.spawnBehind + efe.spawnHiddenRoom + efe.spawnHiddenDoor + efe.spawnInView;
   ok('play: enemies on the "test" difficulty by default (torso 10, head 20)', efe.difficulty === 'test' && efx.diff === 'test' && efx.dmg.every((d) => d === 10 || d === 20),
     `${efe.difficulty}; rounds on the player ${efx.dmg.join(', ') || 'none yet'}`);
-  ok('play: every spawn came from the world spawner with its tier, ≥ 3.5 m from the spot', efe.spawned > 0 && tiered === efe.spawned && efe.spawnDirect === 0 && efe.lastSpawnTier >= 1
-    && efx.rec.length >= efe.spawned && efx.rec.every((r) => r.d >= 3.5 - 0.35), `${efe.spawned} spawns: behind ${efe.spawnBehind}, room ${efe.spawnHiddenRoom}, door ${efe.spawnHiddenDoor}, in view ${efe.spawnInView}; ${efx.rec.map((r) => r.d.toFixed(1)).join(' ')} m`);
+  ok('play: every spawn came from the world spawner with its tier', efe.spawned > 0 && tiered === efe.spawned && efe.spawnDirect === 0 && efe.lastSpawnTier >= 1 && efx.rec.length >= Math.min(efe.spawned, 16),
+    `${efe.spawned} spawns: behind ${efe.spawnBehind}, room ${efe.spawnHiddenRoom}, door ${efe.spawnHiddenDoor}, in view ${efe.spawnInView}`);
+  ok('play (Roam): enemies spawn in another room than the player\'s (hidden, through the house)', efx.rooms >= 2 && efx.rec.length > 0 && efx.rec.every((r) => r.room > 0 && r.playerRoom > 0 && r.room !== r.playerRoom),
+    `${efx.rooms} rooms; ${efx.rec.map((r) => `room ${r.room} (player in ${r.playerRoom}, tier ${r.tier})`).join(', ')}; search ${JSON.stringify(efx.search)}`);
+  report.spawns = efx.rec;
   ok('play: a hit on an enemy shows a pooled puff (warmed at load)', efx.puffWarm && efe.puffs >= hits && efx.puffs === efe.puffs, `${efe.puffs} puffs for ${hits} hits`);
   report.enemies = { difficulty: efe.difficulty, spawnTiers: { behind: efe.spawnBehind, room: efe.spawnHiddenRoom, door: efe.spawnHiddenDoor, inView: efe.spawnInView }, puffs: efe.puffs, pathMaxStepMs: efe.pathMaxStepMs, pathTimeouts: efe.pathTimeouts };
 
-  // Magazine release (A): the magazine drops; A again = assisted reload (1.2 s)
+  // Magazine release (A): the magazine drops; holding A 0.8 s with no magazine = assisted reload (1.2 s; test aid)
   await page.evaluate(() => window.__h.level('right'));
   await sleep(200);
   await press('right', 'a-button');
   await sleep(400);
   const m1 = await page.evaluate(() => { const w = window.__app.play.weapons; return { seated: w.glock.inst.magSeated, dropped: w.fx.magPools.reduce((n, B) => n + B.count, 0) }; });
   ok('play: A releases the magazine; it drops as a pooled object', !m1.seated && m1.dropped > 0, JSON.stringify(m1));
-  await press('right', 'a-button');
-  const reloaded = await waitFor(() => { const w = window.__app.play.weapons; return w.glock.inst.magSeated && w.glock.inst.magRounds === 17; }, null, 4000);
-  ok('play: A again with the magazine out = assisted reload (17 rounds)', !!reloaded, await page.evaluate(() => JSON.stringify({ reloads: window.__app.play.weapons.stats.reloads, rounds: window.__app.play.weapons.glock.inst.magRounds })));
+  await press('right', 'a-button', 150);
+  const tapNoReload = await page.evaluate(() => { const w = window.__app.play.weapons; return !w.glock.inst.magSeated && w.glock.assistT < 0; });
+  await press('right', 'a-button', 3500); // 0.8 s of game time (dt is clamped to 0.1 s per slow emulator frame)
+  const reloaded = await waitFor(() => { const w = window.__app.play.weapons; return w.glock.inst.magSeated && w.glock.inst.magRounds === 17; }, null, 6000);
+  ok('play: a second A tap does not reload; holding A with the magazine out = assisted reload (17 rounds)', tapNoReload && !!reloaded, await page.evaluate(() => JSON.stringify({ reloads: window.__app.play.weapons.stats.reloads, rounds: window.__app.play.weapons.glock.inst.magRounds })));
 
   // Holster the Glock (let go at the hip), then take the AKM from over the right shoulder
   const hol2 = await page.evaluate(() => Array.from(window.__app.play.weapons.body.holster.p));
@@ -456,26 +520,79 @@ try {
   await button('right', 'squeeze', 0);
   const holstered = await waitFor(() => { const w = window.__app.play.weapons; return w.held === null && w.glock.carry.inSlot; }, null, 3000);
   ok('play: letting go at the hip holsters the Glock', !!holstered);
+  const gloveOff = await waitFor(() => { const w = window.__app.play.weapons; return w.glock.carry.inSlot && !w.glock.view.handR.visible; }, null, 3000);
+  ok('play: the glove is hidden once the gun is holstered', !!gloveOff);
+
+  // ---- The watch: wake on a wrist check, open the menu with the right ray + trigger, a setting, the gun-fit page
+  const wk = await page.evaluate(() => window.__h.checkWatch());
+  const awake = await waitFor(() => window.__app.play.watch.wake.awake, null, 6000);
+  const wk2 = await page.evaluate(() => { const w = window.__app.play.watch; return { shown: w.root.visible, wakes: w.stats.wakes, info: w._s[9] }; });
+  ok('watch: a wrist check (dial toward the eyes, head looking at it) wakes the watch', !!awake && wk2.shown && wk2.wakes >= 1, `face cos ${wk.face.toFixed(3)}; ${JSON.stringify(wk2)}`);
+  await page.evaluate(() => window.__h.pointAtWatch());
+  const pointed = await waitFor(() => window.__app.play.watch.capture, null, 4000);
+  const firedBefore = await page.evaluate(() => window.__app.play.weapons.stats.shots);
+  await press('right', 'trigger', 300);
+  const opened = await waitFor(() => { const k = window.__app.play; return k.watch.menuOpen && k.game.menuOpen && { phase: k.game.phaseName, paused: k.game.paused, menu: k.watch.menuRoot.visible }; }, null, 4000);
+  ok('watch: pointing the right ray at the awake dial captures the trigger; a pull opens the menu (a live round pauses)', !!pointed && !!opened && opened.menu
+    && (opened.paused || opened.phase === 'over') && (await page.evaluate((n) => window.__app.play.weapons.stats.shots === n, firedBefore)), `pointed ${!!pointed}; ${JSON.stringify(opened)}`);
+  await page.evaluate(() => window.__h.restorePose());
+  // RESTART (two taps): a fresh round. From here the e2e keeps the player alive (test aid: a death ends the round, and an
+  // ended round has nothing to pause, cue or requeue)
+  await page.evaluate(() => { window.__app.play.game.rules.damage = () => 0; });
+  await page.evaluate(() => { const w = window.__app.play.watch; w.select('restart'); w.select('restart'); });
+  const restarted = await waitFor(() => { const k = window.__app.play; return !k.watch.menuOpen && ['ready', 'wave'].includes(k.game.phaseName) && k.game.health === 100 && { phase: k.game.phaseName, wave: k.game.wave }; }, null, 4000);
+  ok('watch: RESTART (two taps) starts a fresh round and closes the menu', !!restarted, JSON.stringify(restarted));
+  // AMMO LINE off → saved after the frame (setTimeout) → on again
+  const ammo0 = await page.evaluate(() => window.__app.play.watch.status.ammoLine);
+  await page.evaluate(() => window.__app.play.watch.select('ammo'));
+  const ammoSaved = await waitFor(() => { const s = localStorage.getItem('cqcpt.settings.v1'); return s && JSON.parse(s).ammoLine === false && s; }, null, 3000);
+  await page.evaluate(() => window.__app.play.watch.select('ammo'));
+  const ammoBack = await waitFor(() => { const s = localStorage.getItem('cqcpt.settings.v1'); return s && JSON.parse(s).ammoLine === true; }, null, 3000);
+  ok('watch: a menu action (AMMO LINE) reaches the game and is saved outside the frame loop', ammo0 === true && !!ammoSaved && !!ammoBack, ammoSaved || 'not saved');
+  const menuPause = await page.evaluate(() => { const k = window.__app.play; return { open: k.watch.menuOpen, paused: k.game.paused, latched: k.game.rules.pm.latched }; });
+  ok('watch: the open menu pauses the round (manual pause)', menuPause.open && menuPause.paused && (menuPause.latched & 128) !== 0, JSON.stringify(menuPause));
+  // GUN FIT: the page puts the Glock in the empty right hand (no squeeze needed), the gloves show, + pitch × 4 = +2°, SAVE
+  await page.evaluate(() => window.__app.play.watch.select('fit'));
+  const fitIn = await waitFor(() => { const k = window.__app.play, w = k.weapons; return w.held === w.glock && w.fitHolding === 'glock' && w.glock.carry.state === window.__CARRY_HAND
+    && { page: k.watch.page, glove: w.glock.view.handR.visible, paused: k.game.paused }; }, null, 5000);
+  ok('gun fit: the watch\'s GUN FIT page draws the Glock into the empty right hand (game still paused)', !!fitIn && fitIn.page === 1 && fitIn.paused, JSON.stringify(fitIn));
+  ok('gloves: the right glove shows while the Glock is held', !!fitIn && fitIn.glove);
+  const fit0 = await page.evaluate(() => window.__app.play.weapons.getFit('glock'));
+  for (let i = 0; i < 4; i++) await page.evaluate(() => window.__app.play.watch.select('pitch', 1));
+  const fitLive = await page.evaluate(() => { const w = window.__app.play.weapons; return { fit: w.getFit('glock'), source: w.fitSource, quat: w.glock.view.fitQuat.toArray() }; });
+  ok('gun fit: + nudges are applied live to the held gun (pitch +2°)', Math.abs(fitLive.fit.pitch - (fit0.pitch + 2)) < 1e-9 && fitLive.source === 'edit', JSON.stringify(fitLive));
+  await page.evaluate(() => window.__app.play.watch.select('save'));
+  const fitSaved = await waitFor(() => { const s = localStorage.getItem('cqcpt.gunfit.v1'); return s && JSON.parse(s).glock && JSON.parse(s).glock.pitch === 2 && s; }, null, 3000);
+  const fitOut = await waitFor(() => { const k = window.__app.play, w = k.weapons; return w.fitHolding === null && w.held === null && k.watch.page === 0 && { saves: k.fitSaves.slice() }; }, null, 5000);
+  ok('gun fit: SAVE writes the fit per weapon to localStorage (after the frame), logs it, and the Glock goes back to the holster', !!fitSaved && !!fitOut
+    && fitOut.saves.some((f) => f.weapon === 'glock' && f.pitch === 2 && f.saved), `${fitSaved}; ${fitOut && JSON.stringify(fitOut.saves)}`);
+  await page.evaluate(() => window.__app.play.watch.select('resume'));
+  const resumed = await waitFor(() => { const k = window.__app.play; return !k.watch.menuOpen && !k.game.menuOpen; }, null, 3000);
+  const causesW = await resumeIfPaused();
+  ok('watch: RESUME closes the menu and the round resumes (3-2-1, no trigger pull needed)', !!resumed && !causesW.includes('still paused'), causesW.join(','));
+  await waitFor(() => { const w = window.__app.play.weapons; return w.glock.carry.inSlot; }, null, 3000);
   const back = await page.evaluate(() => { const B = window.__app.play.weapons.body; return [0, 1, 2].map((i) => B.back.p[i] + B.backAxis[i] * 0.08); });
   for (let i = 0; i < 3; i++) { await page.evaluate((p) => window.__h.gripTo('right', p), back); await sleep(200); }
   await button('right', 'squeeze', 1);
   const akm = await waitFor(() => window.__app.play.weapons.held?.id === 'akm', null, 3000);
   ok('play: right grip over the right shoulder takes the AKM', !!akm, `back slot at (${back.map((v) => v.toFixed(2)).join(', ')})`);
+  const akmGlove = await waitFor(() => { const w = window.__app.play.weapons; return w.akm.carry.state === window.__CARRY_HAND && w.akm.view.handR.visible && !w.glock.view.handR.visible; }, null, 4000);
+  ok('gloves: the right glove shows on the AKM in the hand (and not on the holstered Glock)', !!akmGlove);
   await page.evaluate(() => window.__h.gripTo('right', [0.16, 1.4, -0.35]));
   await sleep(700);
   // the AKM is issued on semi (WeaponDefs); the stick click goes semi → safe → auto (held across a
   // few slow emulator frames, so each click is seen)
   const akmModes = [await page.evaluate(() => window.__app.play.weapons.akm.inst.mode)];
-  const hudSemi = await waitFor(() => window.__app.play.hud._s[10] === 2, null, 4000);
+  const hudSemi = await waitFor(() => window.__app.play.watch._s[5] === 2, null, 4000);
   await press('right', 'thumbstick', 400);
   akmModes.push(await page.evaluate(() => window.__app.play.weapons.akm.inst.mode));
-  const hudSafe = await waitFor(() => window.__app.play.hud._s[10] === 1, null, 4000);
+  const hudSafe = await waitFor(() => window.__app.play.watch._s[5] === 1, null, 4000);
   await press('right', 'thumbstick', 400);
   const mode = await page.evaluate(() => window.__app.play.weapons.akm.inst.mode);
   akmModes.push(mode);
   ok('play: right stick click cycles the AKM selector (semi → safe → auto)', akmModes.join() === 'semi,safe,auto', akmModes.join(' → '));
-  const hudAuto = await waitFor(() => window.__app.play.hud._s[10] === 3, null, 4000);
-  ok('play: the wrist HUD shows the fire mode (SEMI, SAFE, AUTO)', !!hudSemi && !!hudSafe && !!hudAuto);
+  const hudAuto = await waitFor(() => window.__app.play.watch._s[5] === 3, null, 4000);
+  ok('play: the watch shows the AKM fire mode (SEMI, SAFE, AUTO)', !!hudSemi && !!hudSafe && !!hudAuto);
   await page.evaluate(() => window.__h.aimAt('right', [0.16, 1.3, -5]));
   await waitFor(() => { const w = window.__app.play.weapons; return w.akm.carry.state === window.__CARRY_HAND && w.akm.gate.open; }, null, 8000);
   const causes2 = await resumeIfPaused();
@@ -525,15 +642,79 @@ try {
     fall && `at (${fall.x.toFixed(2)}, ${fall.z.toFixed(2)}), falls along (${fall.fx.toFixed(2)}, ${fall.fz.toFixed(2)}), score ${fall.score}; ${JSON.stringify(fell)}`);
   ok('play: the killing hit showed a puff', !!fall && fall.puffs === 1 && fall.puffShown);
 
+  // ---- Roam: running is a watch warning, not a pause. The head is moved at 1.5 m/s (by the loop's dt) along an open line.
+  const runLine = await page.evaluate(() => {
+    const k = window.__app.play, W = k.world, h = k.player.head;
+    for (const L of [2.4, 1.8]) for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * Math.PI * 2, dx = Math.cos(a), dz = Math.sin(a);
+      let ok = true;
+      for (let s = 0; s <= L + 0.4 && ok; s += 0.1) { const x = h.x + dx * s, z = h.z + dz * s; ok = W.nav.clearance(x, z) >= 0.55 && W.edgeMargin(x, z) >= 0.6; }
+      if (ok) return { x: h.x, z: h.z, dx, dz, L };
+    }
+    return null;
+  });
+  if (runLine) {
+    await page.evaluate((R) => {
+      const a = window.__app, k = a.play, sys = a.loop.systems.find((x) => x.name === 'world'), orig = sys.update, dev = window.__iwer;
+      const M = window.__run = { s: 0, maxCue: 0, maxSpeed: 0, runPaused: false, pausedAny: false, done: false, warn: 0 };
+      sys.update = (dt, t, f, c) => {
+        if (!M.done) {
+          M.s = Math.min(R.L, M.s + 1.5 * dt);
+          dev.position.set(R.x + R.dx * M.s, 1.6, R.z + R.dz * M.s);
+          if (M.s >= R.L) M.done = true;
+        }
+        const g = k.game;
+        M.maxCue = Math.max(M.maxCue, g.cue[0]);
+        M.maxSpeed = Math.max(M.maxSpeed, k.player.speed);
+        M.warn = Math.max(M.warn, k.watch.warns.levels[0]);
+        if (g.paused) { M.pausedAny = true; if (g.rules.reasons & (1 << 6)) M.runPaused = true; }
+        orig(dt, t, f, c);
+      };
+      window.__restoreWorld = () => { sys.update = orig; };
+    }, runLine);
+    await waitFor(() => window.__run.done, null, 15000);
+    await sleep(600);
+    const run = await page.evaluate(() => { window.__restoreWorld(); return { ...window.__run }; });
+    ok('roam: walking fast (1.5 m/s) raises the watch\'s run cue and never pauses for running', run.maxSpeed > 1.0 && run.maxCue > 0 && run.warn > 0 && !run.runPaused,
+      `peak speed ${run.maxSpeed.toFixed(2)} m/s, cue ${run.maxCue.toFixed(2)}, watch level ${run.warn.toFixed(2)}, ${run.s.toFixed(1)} m${run.pausedAny ? ' (another pause came up)' : ''}`);
+    await page.evaluate((R) => window.__iwer.position.set(R.x, 1.6, R.z), runLine);
+    await sleep(800);
+    const c4 = await resumeIfPaused();
+    if (c4.length) report.pausesResumed = (report.pausesResumed || []).concat(c4);
+  } else ok('roam: walking fast (1.5 m/s) raises the watch\'s run cue and never pauses for running', false, 'no open 1.8 m line from the head');
+
+  // ---- Roam: a reference-space reset with a transform during the round: hold, enemies back in the queue, the world moved and
+  // rebuilt behind the pause, one warm draw, the hold released; then the inverse reset puts it back
+  const rs0 = await page.evaluate(() => { const k = window.__app.play, r = window.__app.gfx.renderer; return { realigns: k.world.stats.realigns, programs: r.info.programs.length, alive: k.enemies.alive() }; });
+  const T = await page.evaluate(() => {
+    const THREE = window.__h.THREE, m = new THREE.Matrix4().compose(new THREE.Vector3(0.4, 0, -0.3), new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.1), new THREE.Vector3(1, 1, 1));
+    window.__T = m;
+    window.__app.refReset({ transform: { matrix: m.toArray() } });
+    const k = window.__app.play;
+    return { step: k.stepName, paused: k.game.paused, held: (k.game.rules.pm.held & 256) !== 0, alive: k.enemies.alive() };
+  });
+  const realigned = await waitFor(() => { const k = window.__app.play; return k.stepName === 'play' && k.realigns.length >= 1 && { ...k.realigns[0], realignsWorld: k.world.stats.realigns }; }, null, 10000);
+  const rs1 = await page.evaluate(() => { const k = window.__app.play, r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries,
+    errors: window.__app.rec.errors.slice(0, 3), paused: k.game.paused }; });
+  ok('roam: a reset with a transform pauses and holds, puts the enemies back in the queue, realigns the world behind the pause (nothing compiled)',
+    T.step === 'realign' && T.paused && T.held && T.alive === 0 && !!realigned && realigned.cause === 'reset' && realigned.transform && realigned.realignsWorld === rs0.realigns + 1
+    && rs1.programs === rs0.programs && rs1.errors.length === 0, `${JSON.stringify(T)}; ${JSON.stringify(realigned)}; programs ${rs1.programs} (before ${rs0.programs}); ${rs1.errors.join(' | ')}`);
+  await page.evaluate(() => window.__app.refReset({ transform: { matrix: window.__T.clone().invert().toArray() } }));
+  await waitFor(() => { const k = window.__app.play; return k.stepName === 'play' && k.realigns.length >= 2; }, null, 10000);
+  const c5 = await resumeIfPaused();
+  if (c5.length) report.pausesResumed = (report.pausesResumed || []).concat(c5);
+  const back2 = await page.evaluate(() => ({ phase: window.__app.play.game.phaseName, paused: window.__app.play.game.paused }));
+  ok('roam: after the realign the round resumes (trigger pull, 3-2-1)', !back2.paused && ['wave', 'break', 'ready'].includes(back2.phase), JSON.stringify(back2));
+
   // No program, texture or geometry created after the warm-up
   const st2 = await page.evaluate(async () => { const m = await import('/src/core/Warmup.js'); const r = window.__app.gfx.renderer; return { ...m.assertStable(r, () => {}), programs: r.info.programs.length, tex: r.info.memory.textures, geo: r.info.memory.geometries, growth: window.__app.rec.warmGrowth || null }; });
   ok('play: renderer.info.programs flat through the whole round', st2.checked && st2.ok && st2.programs === before.programs && st2.tex === before.textures && st2.geo === before.geometries && !st2.growth,
     `${st2.programs} programs, ${st2.tex} textures, ${st2.geo} geometries (before play ${before.programs}/${before.textures}/${before.geometries})`);
 
   // CPU time per frame (PerfMonitor: the frame callback, per system) and the wrist HUD
-  const perf = await page.evaluate(() => { const a = window.__app; return { recent: a.perf.recent(120), sys: a.perf.systemAverages(120), hud: a.play.hud.panel.mesh.visible, hudDraws: a.play.hud.draws, loopErrors: a.loop.errors, errors: a.rec.errors.slice(0, 5) }; });
+  const perf = await page.evaluate(() => { const a = window.__app; return { recent: a.perf.recent(120), sys: a.perf.systemAverages(120), shown: a.play.watch.shown, hudDraws: a.play.watch.draws, menuDraws: a.play.watch.menuDraws, loopErrors: a.loop.errors, errors: a.rec.errors.slice(0, 5) }; });
   ok('play: no errors in the frame loop', perf.loopErrors === 0 && perf.errors.length === 0, perf.errors.join(' | '));
-  ok('play: wrist HUD shown on the left grip', perf.hud && perf.hudDraws > 0, `${perf.hudDraws} redraws`);
+  ok('play: the watch follows the left controller and redraws on change', perf.shown && perf.hudDraws > 0 && perf.menuDraws > 0, `${perf.hudDraws} dial redraws, ${perf.menuDraws} menu redraws`);
   report.cpu = { framesSampled: perf.recent.frames, cpuAvgMs: perf.recent.cpuAvg, intervalAvgMs: perf.recent.intervalAvg, fps: perf.recent.fps, perSystemAvgMs: perf.sys };
 
   // Exit: hold Y for 2 s (the game ends the session from a timeout, never inside the frame callback)
@@ -547,10 +728,29 @@ try {
   ok('play: session saved with the snapshot and the round summary', pl && pl.mode === 'play' && pl.spaceSnapshot && pl.spaceSnapshot.planes.length === 19 && pl.play && pl.play.weapons && pl.play.enemies && pl.systemsMs,
     pl && pl.play && `wave ${pl.play.wave}, ${pl.play.kills} kills, phase ${pl.play.phase}; ${JSON.stringify(pl.play.weapons)}`);
   ok('play: no XR-frame errors at exit', !consoleErrors.some((e) => /outside the callback/i.test(e)));
-  ok('play: record has the safety report (spot chosen), the grip fit, audio states, rate and near plane',
-    pl && pl.play.safety && pl.play.safety.spot && pl.play.safety.spot.chosen === true && pl.play.grip && pl.play.grip.source === 'default'
+  ok('play: record has the safety report (Roam start), audio states, rate and near plane',
+    pl && pl.play.safety && pl.play.safety.mode === 'roam' && pl.play.safety.spot && pl.play.safety.spot.mode === 'roam'
       && pl.audio && pl.audio.at1s && pl.probes.frameRate.request === 'ok' && 'hzAtEnd' in pl.probes.frameRate && pl.view.near === 0.02 && pl.play.world.report && pl.play.world.report.spawn,
-    pl && pl.play.safety && `spot ${JSON.stringify(pl.play.safety.spot)}; pauses ${JSON.stringify(pl.play.safety.pauses)}; audio ${pl.audio.atStart}→${pl.audio.at1s}→${pl.audio.atEnd}; ${pl.probes.frameRate.hzAtEnd} Hz at end`);
+    pl && pl.play.safety && `start ${JSON.stringify(pl.play.safety.spot)}; pauses ${JSON.stringify(pl.play.safety.pauses)}; audio ${pl.audio.atStart}→${pl.audio.at1s}→${pl.audio.atEnd}; ${pl.probes.frameRate.hzAtEnd} Hz at end`);
+  const R = pl && pl.play;
+  ok('play: record has the grip fit (v2: the saved nudge, the learned grip→ray relation), the fit saves, the watch and its actions',
+    R && R.grip && R.grip.fitVersion === 2 && R.grip.glock.pitch === 2 && R.grip.rayRel && R.grip.rayRel.right && R.fitSaves.some((f) => f.weapon === 'glock' && f.pitch === 2 && f.saved)
+      && R.watch && R.watch.opens >= 1 && R.watch.wakes >= 1 && R.watch.actions.fitSave >= 1 && R.watch.actions.ammoLine === 2 && R.watch.actions.restart === 1 && R.hudDraws > 0,
+    R && `grip ${JSON.stringify({ source: R.grip.source, glock: R.grip.glock.pitch, rayRel: R.grip.rayRel.right })}; watch ${JSON.stringify(R.watch)}`);
+  ok('play: record has the Roam report (speeds, cues, rooms), the resets and realigns, the drift watch, the lighting',
+    R && R.roam && R.roam.mode === 'roam' && R.roam.resets.length === 2 && R.roam.realigns.length === 2 && R.roam.drift && R.roam.world && R.roam.world.rooms >= 2
+      && R.lighting && R.lighting.envMap && R.settings && R.settings.gloves === true && (report.space === 'unbounded' ? R.roam.spaceNote === null : /Whole-house tracking unavailable/.test(R.roam.spaceNote || '')),
+    R && R.roam && `${JSON.stringify({ space: R.roam.space, note: R.roam.spaceNote, realigns: R.roam.realigns, drift: R.roam.drift, lighting: R.lighting })}`);
+
+  // ---- A reload (same browser profile): the saved gun fit and settings come back at load, before the warm-up
+  const re = await mainContext.newPage();
+  await re.goto(`http://localhost:${port}/?emulate`);
+  await re.waitForFunction(() => ['ready', 'failed'].includes(window.__app?.preload?.state), null, { timeout: 120000 });
+  const reFit = await re.evaluate(() => { const k = window.__app.play; return { fit: k.weapons.getFit('glock'), akm: k.weapons.getFit('akm'), source: k.gripReport.source, watchFit: Array.from(k.watch.fitEdit.cur[0]),
+    settings: k.settings, diff: k.enemies.diff.name }; });
+  ok('gun fit: after a reload the saved Glock fit is applied (source "saved") and the watch\'s fit page starts from it', reFit.fit.pitch === 2 && reFit.akm.pitch === 0 && reFit.source === 'saved'
+    && reFit.watchFit[0] === 2 && reFit.settings.ammoLine === true && reFit.diff === 'test', JSON.stringify(reFit));
+  await re.close();
 
   // Diagnostics: Copy takes only the last session (Download / Share keep everything), sizes shown
   const cp = await page.evaluate(() => {
@@ -574,7 +774,7 @@ try {
   await page.evaluate(() => window.__app.session.end());
   ok('vr: ended', await waitState('menu'));
 
-  // ---- Rejected request offers the reduced retry (fresh tap); reduced runs the game too
+  // ---- Rejected request offers the reduced retry (fresh tap); reduced runs the game too (Roam rules on local-floor)
   await page.evaluate(() => {
     const orig = navigator.xr.requestSession.bind(navigator.xr);
     let once = true;
@@ -587,10 +787,28 @@ try {
   ok('reduced: entered xr', await waitState('xr'));
   const red = await page.evaluate(() => window.__app.rec.requested);
   ok('reduced: only local-floor requested', JSON.stringify(red) === '["local-floor"]', JSON.stringify(red));
-  // The spot step with a move: confirming 0.5+ m from where the world was built rebuilds it there
-  const redBefore = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
   const redCard = await skipCard();
-  const redSpot = await waitFor(() => window.__app.play.stepName === 'spot', null, 10000);
+  const redPlay = await waitFor(() => { const k = window.__app.play; return k.stepName === 'play' && { roam: k.game.roam, note: k.spaceNote, page: document.getElementById('msg').textContent }; }, null, 10000);
+  ok('reduced: the game runs with the Roam rules; the page (never the headset) says the Quest boundary applies', redCard && !!redPlay && redPlay.roam
+    && /Whole-house tracking unavailable.*boundary applies/.test(redPlay.note || '') && /boundary applies/.test(redPlay.page), redPlay && `${redPlay.note} | page: ${redPlay.page}`);
+  await page.evaluate(() => window.__app.session.end());
+  await waitState('menu');
+  await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
+
+  // ---- Enter MR: one spot (the stationary v0.2 mode): local-floor, the safe-spot step; a spot 0.5 m away rebuilds the world
+  const spBefore = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
+  await page.click('#bSpot');
+  ok('spot: entered xr', await waitState('xr'));
+  const spReq = await page.evaluate(() => ({ req: window.__app.rec.requested, mode: window.__app.rec.mode, roam: window.__app.play.game.roam, worldRoam: null }));
+  ok('spot: local-floor, no unbounded request, spot rules', !spReq.req.includes('unbounded') && spReq.req.includes('local-floor') && spReq.mode === 'spot' && spReq.roam === false, JSON.stringify(spReq));
+  const spCard = await skipCard();
+  const spSpot = await waitFor(() => {
+    const a = window.__app, k = a.play, g = k.game;
+    return k.stepName === 'spot' && g.panel.mesh.visible && { status: g.spotStatus, spotting: g.spotting, appPanel: a.panel.mesh.visible, lines: k.panelLines(), ring: g.ring.visible,
+      msg: g.panel.lines.slice(), skipped: a.rec.play.cardSkipped, worldRoam: k.world.roamOn };
+  }, null, 10000);
+  ok('spot: a trigger pull moves on to the safe spot: App panel hidden, ring and spot message shown (world built in spot mode)', spCard && spSpot && spSpot.spotting && !spSpot.appPanel
+    && spSpot.lines === null && spSpot.ring && spSpot.skipped && spSpot.worldRoam === false, spSpot && `${spSpot.status}; "${spSpot.msg.join(' / ')}"`);
   const tgt = await page.evaluate(async () => {
     const { SafeSpot } = await import('/src/safety/SafeSpot.js');
     const k = window.__app.play, h = k.player.head, S = new SafeSpot();
@@ -613,28 +831,35 @@ try {
     await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [tgt.x, tgt.z]);
     await sleep(1000);
   }
-  const redSeen = await confirmSpot();
-  const redPlay = await waitFor(() => window.__app.play.stepName === 'play', null, 10000);
+  const spSeen = await confirmSpot();
+  report.spot = spSeen;
+  const spPlay = await waitFor(() => window.__app.play.stepName === 'play', null, 10000);
   const rb = await page.evaluate(() => {
-    const a = window.__app, k = a.play, r = a.gfx.renderer, W = a.rec.play.world;
-    return { rebuild: W.rebuild || null, spot: a.rec.play.spot, zone: { ...k.world.zone }, gameZone: { ...k.game.zone }, hook: window.__rb || null,
+    const a = window.__app, k = a.play, r = a.gfx.renderer, W = a.rec.play.world, g = k.game;
+    return { rebuild: W.rebuild || null, spot: a.rec.play.spot, zone: { ...k.world.zone }, gameZone: { ...g.zone }, hook: window.__rb || null, phase: g.phaseName, msg: g.panel.mesh.visible ? g.panel.lines.slice() : null,
       programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries, errors: a.rec.errors.slice(0, 3), appPanel: a.panel.mesh.visible };
   });
-  ok('reduced: the game runs (card, then the spot)', redCard && !!redSpot && !!redPlay, redSeen.join('→'));
-  ok('reduced: a spot 0.5 m away rebuilds the world there, behind the Get ready panel', !!tgt && rb.rebuild && rb.rebuild.movedM > 0.25 && rb.spot.rebuilt
-    && Math.hypot(rb.zone.x - tgt.x, rb.zone.z - tgt.z) < 0.15 && Math.hypot(rb.gameZone.x - rb.zone.x, rb.gameZone.z - rb.zone.z) < 1e-6 && rb.hook && rb.hook.panel && rb.hook.first === 'Get ready' && !rb.appPanel,
+  ok('spot: the trigger in a good spot starts the round there ("Get ready", zone at the spot)', !!spPlay && rb.phase === 'ready' && rb.msg && rb.msg[0] === 'Get ready' && !rb.appPanel
+    && rb.spot && rb.spot.mode === 'spot' && rb.gameZone.r > 0, `${rb.phase}; ${rb.msg && rb.msg.join(' / ')}; spot ${spSeen.join('→')}; ${JSON.stringify(rb.spot)}`);
+  ok('spot: a spot 0.5 m away rebuilds the world there, behind the Get ready panel', !!tgt && rb.rebuild && rb.rebuild.movedM > 0.25 && rb.spot.rebuilt
+    && Math.hypot(rb.zone.x - tgt.x, rb.zone.z - tgt.z) < 0.15 && Math.hypot(rb.gameZone.x - rb.zone.x, rb.gameZone.z - rb.zone.z) < 1e-6 && rb.hook && rb.hook.panel && rb.hook.first === 'Get ready',
     tgt ? `moved ${rb.rebuild && rb.rebuild.movedM} m (status ${tgt.st}); rebuild ${rb.rebuild && rb.rebuild.buildMs} ms; zone (${rb.zone.x.toFixed(2)}, ${rb.zone.z.toFixed(2)})` : 'no clear spot found');
-  ok('reduced: nothing compiled or created by the rebuild', rb.programs === redBefore.programs && rb.textures === redBefore.textures && rb.geometries === redBefore.geometries && rb.errors.length === 0,
-    `${rb.programs}/${rb.textures}/${rb.geometries} (before ${redBefore.programs}/${redBefore.textures}/${redBefore.geometries}) ${rb.errors.join(' | ')}`);
+  ok('spot: nothing compiled or created by the rebuild', rb.programs === spBefore.programs && rb.textures === spBefore.textures && rb.geometries === spBefore.geometries && rb.errors.length === 0,
+    `${rb.programs}/${rb.textures}/${rb.geometries} (before ${spBefore.programs}/${spBefore.textures}/${spBefore.geometries}) ${rb.errors.join(' | ')}`);
+  // the watch's MODE row: whole house now (the world is rebuilt in Roam behind the card, the round starts over)
+  await page.evaluate(() => window.__app.play.watch.select('mode'));
+  const toRoam = await waitFor(() => { const k = window.__app.play; return k.stepName === 'start' && k.game.roam && k.world.roamOn && !k.watch.menuOpen && { switches: k.modeSwitches.slice(), rooms: k.world.stats.rooms }; }, null, 8000);
+  ok('spot: the watch\'s MODE row switches to the whole house (world rebuilt in Roam, back to the card)', !!toRoam && toRoam.switches.length === 1 && toRoam.switches[0].to === 'roam' && toRoam.rooms >= 2,
+    JSON.stringify(toRoam));
   await page.evaluate(() => window.__app.session.end());
   await waitState('menu');
   await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
 
-  // ---- No Space Setup data (a virtual room, where every spot is "unmapped"): the trigger pull that
+  // ---- No Space Setup data (a virtual room, where every spot is "unmapped"), one-spot mode: the trigger pull that
   // dismisses the card must not also confirm the spot (the card's step runs before game.preUpdate in
   // the same frame, so it moves on at the release); a second pull then starts the round there.
   await page.evaluate(() => { const k = window.__app.play; window.__fixture0 = k.fixture; k.fixture = { version: 1, space: 'local-floor', planes: [], meshes: [] }; });
-  await page.click('#bPlay');
+  await page.click('#bSpot');
   const vIn = await waitState('xr');
   const vCard = vIn && await skipCard();
   await sleep(700);
@@ -651,28 +876,28 @@ try {
   const errs = consoleErrors.filter((e) => !/test rejection/.test(e));
   ok('no console errors', errs.length === 0, errs.slice(0, 5).join(' || '));
 
-  // ---- Grip fit escape hatch (fresh page): ?gripPitch=10&gripY=0.01&gripZ=-0.02 on both guns
+  // ---- Grip fit escape hatch (fresh page): ?gripPitch=10&gripY=0.01&gripZ=-0.02 on both guns, as a gun fit (never saved)
   const gp = await browser.newPage();
   await gp.goto(`http://localhost:${port}/?emulate&gripPitch=10&gripY=0.01&gripZ=-0.02`);
   await gp.waitForFunction(() => ['ready', 'failed'].includes(window.__app?.preload?.state), null, { timeout: 120000 });
   const gf = await gp.evaluate(async () => {
     const THREE = await import('three');
+    const { computeFit } = await import('/src/weapons/GunFit.js');
     const k = window.__app.play, out = {};
     for (const id of ['glock', 'akm']) {
-      const v = k.weapons[id].view;
-      const g = new THREE.Vector3(0.2, 1.2, -0.3), op = new THREE.Vector3(), oq = new THREE.Quaternion();
-      v.holdPose(g, new THREE.Quaternion(), op, oq);
-      const f = new THREE.Vector3(0, 0, -1).applyQuaternion(oq);
-      out[id] = { pitchDeg: (Math.atan2(f.y, -f.z) * 180) / Math.PI, palmOff: v.palm.clone().applyQuaternion(oq).add(op).sub(g).length() };
+      const p7 = new Float64Array(7), p3 = new Float64Array(3);
+      computeFit(id, null, p7, p3);
+      const q0 = new THREE.Quaternion(p7[3], p7[4], p7[5], p7[6]), q = k.weapons[id].view.fitQuat;
+      // bore (−Z) pitch in grip space, default vs URL fit
+      const b0 = new THREE.Vector3(0, 0, -1).applyQuaternion(q0), b1 = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+      out[id] = { fit: k.weapons.getFit(id), dDeg: (b0.angleTo(b1) * 180) / Math.PI };
     }
-    return { rep: k.gripReport, out };
+    return { rep: k.gripReport, out, stored: localStorage.getItem('cqcpt.gunfit.v1') };
   });
-  const dPalm = (id, i) => gf.rep.palm[id][i] - pre.grip.palm[id][i];
-  ok('grip fit: URL values applied to both guns and reported', gf.rep.source === 'url' && gf.rep.pitchDeg === 10 && gf.rep.y === 0.01 && gf.rep.z === -0.02 && gf.rep.applied.join() === 'glock,akm'
-    && ['glock', 'akm'].every((id) => Math.abs(dPalm(id, 1) + 0.01) < 0.0015 && Math.abs(dPalm(id, 2) - 0.02) < 0.0015 && Math.abs(dPalm(id, 0)) < 0.0015),
-    JSON.stringify(gf.rep.palm));
-  ok('grip fit: the held gun is pitched 10° about its palm point', ['glock', 'akm'].every((id) => Math.abs(gf.out[id].pitchDeg - 10) < 0.05 && gf.out[id].palmOff < 1e-6),
-    ['glock', 'akm'].map((id) => `${id} ${gf.out[id].pitchDeg.toFixed(2)}°`).join(', '));
+  ok('grip fit: URL values applied to both guns as a gun fit (pitch 10°, up 0.01 m, forward 0.02 m) and reported, never saved', gf.rep.source === 'url'
+    && ['glock', 'akm'].every((id) => gf.out[id].fit.pitch === 10 && Math.abs(gf.out[id].fit.up - 0.01) < 1e-9 && Math.abs(gf.out[id].fit.fwd - 0.02) < 1e-9) && gf.stored === null,
+    JSON.stringify(gf.out));
+  ok('grip fit: the gun is tilted 10° in the hand', ['glock', 'akm'].every((id) => Math.abs(gf.out[id].dDeg - 10) < 0.05), ['glock', 'akm'].map((id) => `${id} ${gf.out[id].dDeg.toFixed(2)}°`).join(', '));
   await gp.close();
 
   // ---- A failed load says why and keeps the probe sessions usable (fresh page, one model missing)

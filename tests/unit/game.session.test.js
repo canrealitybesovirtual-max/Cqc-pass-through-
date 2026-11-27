@@ -81,7 +81,7 @@ function setup({ spawnOk = true } = {}) {
   const session = { visibilityState: 'visible', ended: 0, end() { this.ended++; return Promise.resolve(); } };
   const player = new Player();
   const ctx = { scene, camera, session, input, events, audio, world, player };
-  const game = new GameSession(ctx, { enemies, weapons });
+  const game = new GameSession(ctx, { enemies, weapons, roam: false });
   const hud = new WristHud(ctx, { game, weapons });
   const seen = [];
   for (const type of ['waveStart', 'waveClear', 'roundOver', 'pause']) events.on(type, (p) => { if (REC.on) seen.push([type, { ...p }]); });

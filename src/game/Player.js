@@ -20,6 +20,14 @@ import { headPose, quatForward, quatUp } from './head.js';
  * - extra: `eye` (eye midpoint), `quat`, `eyeHeight` (above the floor),
  *   `standEye` (calibrated standing eye height), `scale` (standEye / 1.70),
  *   `valid` (a pose has been seen).
+ * - Roam (v0.3): `vel` (horizontal head velocity, low-passed 0.3 s, m/s) and
+ *   `speed`; `seated` (sitting: the eye height ≥ 0.36 m × scale below the
+ *   standing eye height, slow, not looking hard down, for 1.5 s; standing
+ *   again within 0.22 m × scale for 0.4 s, the BodyEstimator's numbers).
+ *   `seatedOverride` (true / false) wins when set, so the integrator can feed
+ *   the BodyEstimator's own decision (`player.seatedOverride = body.seated`).
+ *   The height calibration restarts when the world is rebuilt (an `unbounded`
+ *   session has no floor at y = 0 until the world gives one).
  *
  * Proportions are for a 1.70 m eye height (about 1.81 m stature) and scale
  * with the calibrated standing eye height, which is the highest 0.5 s average
@@ -47,6 +55,17 @@ export const BODY = Object.freeze({
   pelvisMinAboveFloor: 0.3,
   hipLagS: 0.35,
   hipMaxOffset: 0.35,
+  /** Velocity low-pass (s) and the single-frame jump that is tracking, not walking (m). */
+  velTau: 0.3,
+  jumpM: 0.25,
+  /** Seated detection (BodyEstimator's design values, × scale). */
+  seatDrop: 0.36,
+  standDrop: 0.22,
+  seatHoldS: 1.5,
+  standHoldS: 0.4,
+  seatMaxSpeed: 0.25,
+  /** Forward y below −this is "looking hard down" (picking something up), not sitting. */
+  seatMaxLookDown: 0.6,
 });
 
 export class Player {
@@ -76,6 +95,17 @@ export class Player {
     this._hipZ = 0;
     this._pose = new Float64Array(7);
     this._v = new Float64Array(6);
+    /** Horizontal head velocity (m/s, low-passed) and its length. */
+    this.vel = new THREE.Vector3();
+    /** @type {number} */ this.speed = 0;
+    this._lx = 0;
+    this._lz = 0;
+    this.seated = false;
+    /** @type {boolean|null} a seated decision from elsewhere (the BodyEstimator); null = detect here */
+    this.seatedOverride = null;
+    this._seatT = 0;
+    /** The world build the height calibration belongs to. */
+    this._worldKey = -1;
   }
 
   /** New session: forget the pose and the height calibration; keep the defaults. */
@@ -83,6 +113,11 @@ export class Player {
     this.valid = false;
     this._samplesS = 0;
     this._calibrated = false;
+    this.vel.set(0, 0, 0);
+    this.speed = 0;
+    this.seated = false;
+    this._seatT = 0;
+    this._worldKey = -1;
     this.standEye = BODY.defaultEye;
     this.scale = BODY.defaultEye / BODY.refEye;
     this.health = 100;
@@ -93,7 +128,7 @@ export class Player {
    * @param {number} dt
    * @param {number} _t
    * @param {XRFrame|null|undefined} _frame
-   * @param {{ camera: any, world?: { built?: boolean, floorY: (x: number, z: number) => number } | null }} ctx
+   * @param {{ camera: any, world?: { built?: boolean, floorY: (x: number, z: number) => number, nav?: { version: number } } | null }} ctx
    */
   update(dt, _t, _frame, ctx) {
     const cam = ctx.camera;
@@ -119,9 +154,17 @@ export class Player {
     const w = ctx.world;
     const floor = w && w.built !== false && typeof w.floorY === 'function' ? w.floorY(P[0], P[2]) : 0;
     this.floorY = Number.isFinite(floor) ? floor : 0;
+    // a new world (a first build in `unbounded`, a realign): the floor may have moved, so calibrate again
+    const key = w && w.built !== false && w.nav && typeof w.nav.version === 'number' ? w.nav.version : -1;
+    if (key !== this._worldKey) {
+      this._worldKey = key;
+      if (!first) { this._samplesS = 0; this._calibrated = false; }
+    }
     const eyeH = P[1] - this.floorY;
     this.eyeHeight = eyeH;
     this.calibrate(dt, eyeH, first);
+    this.velocity(dt, P[0], P[2], first);
+    this.seatStep(dt, eyeH, v[1]);
     const s = this.scale;
 
     // Head sphere centre: head-space (0, up, back) rotated into the world.
@@ -148,6 +191,43 @@ export class Player {
     const py = Math.max(minY, Math.min(stand, crouch));
     this.torsoBottom.set(this._hipX, Math.min(py, this.torsoTop.y), this._hipZ);
     this.torsoRadius = BODY.torsoRadius * s;
+  }
+
+  /**
+   * Horizontal head velocity, low-passed; single-frame jumps (tracking, a reset) are skipped.
+   * @param {number} dt @param {number} x @param {number} z @param {boolean} first
+   */
+  velocity(dt, x, z, first) {
+    if (!first && dt > 0 && dt <= 0.1) {
+      const dx = x - this._lx, dz = z - this._lz;
+      if (dx * dx + dz * dz <= BODY.jumpM * BODY.jumpM) {
+        const k = 1 - Math.exp(-dt / BODY.velTau);
+        this.vel.x += (dx / dt - this.vel.x) * k;
+        this.vel.z += (dz / dt - this.vel.z) * k;
+      }
+    } else if (first) this.vel.set(0, 0, 0);
+    this._lx = x;
+    this._lz = z;
+    this.speed = Math.sqrt(this.vel.x * this.vel.x + this.vel.z * this.vel.z);
+  }
+
+  /**
+   * Seated from the eye height (hysteresis + hold), unless `seatedOverride` says.
+   * @param {number} dt @param {number} eyeH @param {number} fy forward.y
+   */
+  seatStep(dt, eyeH, fy) {
+    const o = this.seatedOverride;
+    if (o === true || o === false) { this.seated = o; this._seatT = 0; return; }
+    if (!this._calibrated || !Number.isFinite(eyeH)) return;
+    const s = this.scale, drop = this.standEye - eyeH;
+    if (!this.seated) {
+      const sitting = drop > BODY.seatDrop * s && this.speed < BODY.seatMaxSpeed && fy > -BODY.seatMaxLookDown;
+      this._seatT = sitting ? this._seatT + dt : 0;
+      if (this._seatT >= BODY.seatHoldS) { this.seated = true; this._seatT = 0; }
+    } else {
+      this._seatT = drop < BODY.standDrop * s ? this._seatT + dt : 0;
+      if (this._seatT >= BODY.standHoldS) { this.seated = false; this._seatT = 0; }
+    }
   }
 
   /**

@@ -139,7 +139,7 @@ test('update allocates nothing (sampling heap profiler)', async () => {
   set(0, 1.7, 0);
   loop(100000);
   let best = Infinity, by = null;
-  for (let r = 0; r < 3 && best > 0; r++) {
+  for (let r = 0; r < 8 && best > 0; r++) { // best of up to 8 (early exit): a JIT deopt under load is one-off, a real allocation shows every time
     const s = new Session();
     s.connect();
     await s.post('HeapProfiler.startSampling', { samplingInterval: 16 });
@@ -157,4 +157,45 @@ test('update allocates nothing (sampling heap profiler)', async () => {
     if (t < best) { best = t; by = b; }
   }
   assert.equal(best, 0, JSON.stringify(by));
+});
+
+test('Roam: horizontal velocity (low-passed), seated detection with hold and hysteresis, override, recalibration on a new world', () => {
+  const { cam, set } = xrCam();
+  const p = new Player();
+  const w = { built: true, floorY: () => 0, nav: { version: 1 } };
+  const ctx = { camera: cam, world: w };
+  let x = 0;
+  for (let i = 0; i < 144; i++) { x += 1.0 * DT; set(x, 1.7, 0); p.update(DT, i * 14, null, ctx); }
+  assert.ok(near(p.vel.x, 1.0, 0.02) && near(p.vel.z, 0, 1e-6), `vel ${p.vel.x}`);
+  assert.ok(near(p.speed, 1.0, 0.02));
+  // a tracking jump is not walking
+  set(x + 2, 1.7, 0); p.update(DT, 3000, null, ctx);
+  assert.ok(p.speed < 1.05);
+  for (let i = 0; i < 144; i++) { set(x + 2, 1.7, 0); p.update(DT, 4000 + i * 14, null, ctx); }
+  assert.ok(p.speed < 0.05);
+  assert.equal(p.seated, false);
+  // sit down (eye 1.7 → 1.15): seated after 1.5 s
+  for (let i = 0; i < 72; i++) { set(x + 2, 1.15, 0); p.update(DT, 7000 + i * 14, null, ctx); }
+  assert.equal(p.seated, false, 'not yet (1 s)');
+  for (let i = 0; i < 50; i++) { set(x + 2, 1.15, 0); p.update(DT, 8100 + i * 14, null, ctx); }
+  assert.equal(p.seated, true);
+  // a crouch to pick something up (looking hard down) does not sit
+  const p2 = new Player();
+  for (let i = 0; i < 144; i++) { set(0, 1.7, 0); p2.update(DT, i * 14, null, ctx); }
+  for (let i = 0; i < 216; i++) { set(0, 1.15, 0, -1.2); p2.update(DT, 3000 + i * 14, null, ctx); }
+  assert.equal(p2.seated, false);
+  // stand up: 0.4 s
+  for (let i = 0; i < 36; i++) { set(x + 2, 1.68, 0); p.update(DT, 9000 + i * 14, null, ctx); }
+  assert.equal(p.seated, false);
+  // the integrator's decision wins
+  p.seatedOverride = true;
+  set(x + 2, 1.7, 0); p.update(DT, 10000, null, ctx);
+  assert.equal(p.seated, true);
+  p.seatedOverride = null;
+  // a new world (unbounded: the floor arrives with the first build) restarts the height calibration
+  const before = p.standEye;
+  w.floorY = () => -0.2;
+  w.nav.version = 2;
+  for (let i = 0; i < 144; i++) { set(x + 2, 1.5, 0); p.update(DT, 11000 + i * 14, null, ctx); }
+  assert.ok(near(p.standEye, 1.7, 0.02), `recalibrated ${before} → ${p.standEye}`);
 });

@@ -3,7 +3,7 @@ import { VERSION } from '../version.js';
 import { Game, S } from './Game.js';
 import { Loop } from './Loop.js';
 import { PLAY_SYSTEMS } from './Play.js';
-import { MODES, attachSession, errText, featuresFor, frameRates, requestXR } from '../xr/XRSession.js';
+import { MODES, attachSession, errText, featuresFor, frameRates, playStyle, requestXR, spaceNote } from '../xr/XRSession.js';
 import { Input } from '../xr/Input.js';
 import { Lifecycle } from '../xr/Lifecycle.js';
 import { LiveDepth } from '../xr/LiveDepth.js';
@@ -19,8 +19,12 @@ import { CAMERA_NEAR, PLAY_NEAR } from '../core/Renderer.js';
 
 /** Systems of the probe-style sessions (probe, bounds, vr, setup). */
 const PROBE_SYSTEMS = ['input', 'probe', 'ui', 'render'];
-/** Modes that run the game (`reduced` is play's fallback request with fewer features). */
-const GAME_MODES = new Set(['play', 'reduced']);
+/**
+ * Modes that run the game: `play` (Roam, the whole house, the default Enter MR),
+ * `spot` (the stationary v0.2 mode, the page's second button) and `reduced`
+ * (play's fallback request with fewer features; Roam rules on local-floor).
+ */
+const GAME_MODES = new Set(['play', 'spot', 'reduced']);
 /** The probe panel sits this far left of straight ahead, so it never hides the test cube. */
 const PROBE_PANEL_YAW = 0.6;
 /** Play asks for this refresh rate (the Quest's AR default is 90 Hz, DEVICE_LOG p1.0). */
@@ -32,8 +36,9 @@ const GESTURE_EVENTS = ['selectstart', 'select', 'squeeze'];
  * Composition root for one page: owns the renderer objects and runs one XR
  * session at a time.
  * - Probe-style sessions: test cube, device probes, info panel (Phase 1).
- * - Play (`play`, `reduced`): the game built at load (`this.play`, a PlayKit
- *   from src/app/Play.js, set by main.js once the preload has built it).
+ * - Play (`play` = Roam, `spot`, `reduced`): the game built at load
+ *   (`this.play`, a PlayKit from src/app/Play.js, set by main.js once the
+ *   preload has built it).
  */
 export class App {
   /**
@@ -73,7 +78,7 @@ export class App {
     this.lifecycle = new Lifecycle({
       onEnd: () => this.ended(),
       onVisibility: (st) => this.visibility(st),
-      onReset: (has) => this.refReset(has),
+      onReset: (e) => this.refReset(e),
       onInputs: (a, r) => { this.probes?.refreshHitSources(); this.probes?.event(`inputs +${a} -${r}`); },
     });
     this.observeLongTasks();
@@ -124,6 +129,8 @@ export class App {
       return;
     }
     session.removeEventListener('end', early);
+    /** The honest line when Roam could not get `unbounded` (the Quest boundary applies): record and page only, never in the headset. */
+    const note = kit ? spaceNote(mode, att.space, att.spaceFallback) : null;
     // Everything after attach is guarded: a bug here must never leave a live
     // session with no lifecycle, no record and the menu stuck in 'entering'.
     try {
@@ -153,14 +160,14 @@ export class App {
       this.stableAt = -1e9;
       this.warmGrowth = 0;
       loop.add({ name: 'input', update: (dt, t, f) => this.input.update(session, f, space, dt) });
-      if (kit) this.startPlay(kit, session, space, rec, perf, loop, cam);
+      if (kit) this.startPlay(kit, session, space, rec, perf, loop, cam, { roam: playStyle(mode) === 'roam', spaceName: att.space, spaceNote: note });
       else this.startProbe(session, space, mode, rec, perf, loop, cam);
     } catch (e) {
       this.abort(session, rec, `start: ${errText(e)}`, e);
       return;
     }
     this.game.send('started');
-    this.page.inXR(mode, !!kit);
+    this.page.inXR(mode, !!kit, note, kit ? playStyle(mode) : '');
     if (this.probes) this.probes.start().catch((e) => this.error(`probe start: ${errText(e)}`));
   }
 
@@ -198,8 +205,9 @@ export class App {
    * Play session: the game built at load, in the contract's system order.
    * @param {import('./Play.js').PlayKit} kit @param {XRSession} session @param {XRReferenceSpace} space @param {any} rec
    * @param {PerfMonitor} perf @param {Loop} loop @param {any} cam
+   * @param {{ roam: boolean, spaceName: string, spaceNote: string|null }} how Roam or spot rules; the space in use; the boundary note
    */
-  startPlay(kit, session, space, rec, perf, loop, cam) {
+  startPlay(kit, session, space, rec, perf, loop, cam, how) {
     this.cube.reset(false);
     this.draw.hideAll();
     this.panel.yawOffset = 0;
@@ -223,12 +231,12 @@ export class App {
       } catch (e) { F.request = `threw: ${errText(e)}`; }
     } else F.request = rates.length ? `${PLAY_HZ} Hz not offered (${rates.join('/')})` : 'no frame-rate API';
     this.watchAudio(kit, session, rec);
-    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [] });
+    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [], ...how });
     for (const s of kit.systems()) loop.add(s);
     loop.add({
       name: 'ui',
       update: (dt, t, f, c) => {
-        kit.hud.update(dt, t, f, c);
+        kit.uiUpdate(dt, t, f, c); // the watch
         // App's opaque "Get ready" panel until the round starts, then GameSession's messages
         const lines = kit.panelLines();
         if (lines) {
@@ -363,8 +371,13 @@ export class App {
     if (this.play && this.play.rec === this.rec) this.play.setVisibility(st);
   }
 
-  /** @param {boolean} hasTransform */
-  refReset(hasTransform) {
+  /**
+   * The reference space was reset (Lifecycle passes the XRReferenceSpaceEvent):
+   * logged; play realigns the world (PlayKit.onReferenceReset).
+   * @param {{ transform?: any }|null} e
+   */
+  refReset(e) {
+    const hasTransform = !!(e && e.transform);
     this.perf?.mark('reset');
     if (this.rec) this.rec.probes.resets = (this.rec.probes.resets || 0) + 1;
     this.probes?.event(`reference space reset (transform: ${hasTransform ? 'yes' : 'no'})`);
@@ -373,7 +386,7 @@ export class App {
       this.cube.placed = false;
       this.panel.placed = false;
     }
-    if (this.play && this.play.rec === this.rec) this.play.onReferenceReset();
+    if (this.play && this.play.rec === this.rec) this.play.onReferenceReset(e);
   }
 
   /** @param {string} msg */

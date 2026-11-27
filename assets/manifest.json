@@ -163,6 +163,28 @@
           "channels": "R occlusion, G roughness, B metalness"
         },
         "gpuBytes": 9786776
+      },
+      "hands": {
+        "nodes": [
+          "hand_r"
+        ],
+        "tris": 3522,
+        "scale": 0.0088,
+        "texture": {
+          "size": [
+            512,
+            256,
+            256
+          ],
+          "bytes": 161342
+        },
+        "indexPose": [
+          15,
+          -6,
+          -30
+        ],
+        "indexPadErrMm": 6.9,
+        "source": "CQC vm-pistol2.glb, allanims t = 0 (tools/assets/hands.mjs)"
       }
     },
     "akm": {
@@ -327,6 +349,29 @@
           "channels": "R occlusion, G roughness, B metalness"
         },
         "gpuBytes": 9786776
+      },
+      "hands": {
+        "nodes": [
+          "hand_r",
+          "hand_l"
+        ],
+        "tris": 7075,
+        "scale": 0.0088,
+        "texture": {
+          "size": [
+            512,
+            256,
+            256
+          ],
+          "bytes": 161342
+        },
+        "indexPose": [
+          9,
+          0,
+          -40
+        ],
+        "indexPadErrMm": 0.7,
+        "source": "CQC vm-ak.glb, allanims t = 0 (tools/assets/hands.mjs)"
       }
     }
   },
@@ -579,8 +624,8 @@
     ]
   },
   "bytes": {
-    "models/glock.glb": 3570720,
-    "models/akm.glb": 4718912,
+    "models/glock.glb": 3767528,
+    "models/akm.glb": 4950640,
     "models/soldier.glb": 2259104,
     "sounds/pistol1.mp3": 9918,
     "sounds/ak1.mp3": 15823,

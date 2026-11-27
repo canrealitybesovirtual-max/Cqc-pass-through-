@@ -17,7 +17,16 @@
  *   while game time runs; usually a map error).
  *
  * It is only as accurate as the map. Boxes come from `world.shapes`
- * (`box` Float32Array, 8 floats per box; `label` 'wall' for wall pieces).
+ * (`box` Float32Array, 8 floats per box; `label` 'wall' for wall pieces;
+ * `flags` SHAPE_* bits when present).
+ *
+ * Roam (`roam = true`, the default play mode): walking past furniture and
+ * through doors is normal, so the head threshold is 0.25 m for door jambs and
+ * lintels (an 0.85 m door puts each jamb about 0.42 m from its centre) and
+ * 0.35 m otherwise; a head that is near asks for `pulseHead` (GameSession
+ * turns it into the watch's obstacle cue) instead of pulsing both hands, and
+ * no outline is drawn (diegetic cues only). `level[p]` (0 at the threshold, 1
+ * at contact) and `headLevel` / `handLevel` grade how near.
  *
  * `writeOutlines()` turns the outline list into line-segment vertices in a
  * caller-owned Float32Array (furniture: the 12 box edges; a wall: a 1.2 m
@@ -30,6 +39,9 @@ import { BOX_STRIDE, boxDistance } from './geom.js';
 export const OBSTACLE = Object.freeze({
   hand: 0.25,
   head: 0.4,
+  /** Roam: the head near a door jamb or lintel / any other box (m). */
+  headJambRoam: 0.25,
+  headRoam: 0.35,
   hyst: 0.05,
   pulse: 0.3,
   pulseMs: 30,
@@ -51,9 +63,17 @@ export const POINT = Object.freeze({ HEAD: 0, LEFT: 1, RIGHT: 2 });
 export const OUTLINE_VERTS = 24;
 
 export class ObstacleWarnings {
-  /** @param {{ maxOutlines?: number }} [o] */
-  constructor({ maxOutlines = OBSTACLE.maxOutlines } = {}) {
+  /** @param {{ maxOutlines?: number, roam?: boolean }} [o] */
+  constructor({ maxOutlines = OBSTACLE.maxOutlines, roam = false } = {}) {
     this.max = maxOutlines;
+    /** Roam thresholds and cues (see the header). */
+    this.roam = roam;
+    /** Nearness per point: 0 at the threshold … 1 touching. */
+    this.level = new Float64Array(3);
+    this.headLevel = 0;
+    this.handLevel = 0;
+    /** The head is near (Roam: the watch's obstacle cue; spot play also pulses both hands). */
+    this.pulseHead = false;
     // points
     this.px = new Float64Array(3);
     this.py = new Float64Array(3);
@@ -125,7 +145,9 @@ export class ObstacleWarnings {
     this.reachT.fill(0);
     this.dist.fill(Infinity);
     this.nearBox.fill(-1);
-    this.any = this.headNear = this.inside = this.pulseL = this.pulseR = false;
+    this.any = this.headNear = this.inside = this.pulseL = this.pulseR = this.pulseHead = false;
+    this.level.fill(0);
+    this.headLevel = this.handLevel = 0;
     this.count = 0;
     this._prevCount = 0;
     this._prevBoxes.fill(-1);
@@ -140,29 +162,37 @@ export class ObstacleWarnings {
    */
   update(dt, shapes, zone = null) {
     if (!(dt >= 0)) dt = 0;
-    this.pulseL = this.pulseR = false;
+    this.pulseL = this.pulseR = this.pulseHead = false;
     this.inside = false;
     this.cN = 0;
     const B = shapes && shapes.box ? shapes.box : null;
-    const n = B ? shapes.count : 0;
+    const n = B && shapes ? shapes.count : 0;
+    const F = shapes && /** @type {any} */ (shapes).flags ? /** @type {Uint8Array} */ (/** @type {any} */ (shapes).flags) : null;
+    const roam = this.roam;
     let any = false;
     for (let p = 0; p < 3; p++) {
-      if (!this.valid[p]) { this.near[p] = 0; this.dist[p] = Infinity; this.nearBox[p] = -1; this.reachOut[p] = 0; continue; }
-      const th = p === POINT.HEAD ? OBSTACLE.head : OBSTACLE.hand;
-      const keep = th + OBSTACLE.hyst;
+      if (!this.valid[p]) { this.near[p] = 0; this.dist[p] = Infinity; this.nearBox[p] = -1; this.reachOut[p] = 0; this.level[p] = 0; continue; }
+      const head = p === POINT.HEAD;
+      const th0 = head ? (roam ? OBSTACLE.headRoam : OBSTACLE.head) : OBSTACLE.hand;
       const x = this.px[p], y = this.py[p], z = this.pz[p];
-      let best = Infinity, bi = -1;
+      // nearest box by its margin to that box's own threshold (Roam: jambs and lintels are allowed closer)
+      let best = Infinity, bi = -1, bestE = Infinity, bestTh = th0;
       for (let i = 0, o = 0; i < n; i++, o += BOX_STRIDE) {
         const d = boxDistance(/** @type {Float32Array} */ (B), o, x, y, z, this._q, 0);
+        const th = head && roam && F && (F[i] & 9) !== 0 ? OBSTACLE.headJambRoam : th0; // SHAPE_JAMB | SHAPE_LINTEL
+        const e = d - th;
         if (d < best) { best = d; bi = i; }
-        if (d < keep) this.addCandidate(i, p, d);
+        if (e < bestE) { bestE = e; bestTh = th; }
+        if (e < OBSTACLE.hyst) this.addCandidate(i, p, d);
       }
       this.dist[p] = best;
       this.nearBox[p] = bi;
       if (best <= 0) this.inside = true;
       const was = this.near[p] === 1;
-      const now = was ? best < keep : best < th;
+      const now = was ? bestE < OBSTACLE.hyst : bestE < 0;
       this.near[p] = now ? 1 : 0;
+      const lv = now ? 1 - (bestE + bestTh) / bestTh : 0;
+      this.level[p] = lv < 0 ? 0 : lv > 1 ? 1 : lv;
       if (now) {
         any = true;
         if (!was) { this.repeatT[p] = 0; this.warnings++; this.ask(p); }
@@ -190,14 +220,27 @@ export class ObstacleWarnings {
     }
     this.any = any;
     this.headNear = this.near[POINT.HEAD] === 1;
+    this.headLevel = this.level[POINT.HEAD];
+    this.handLevel = this.level[POINT.LEFT] > this.level[POINT.RIGHT] ? this.level[POINT.LEFT] : this.level[POINT.RIGHT];
+    if (roam) { this.count = 0; return; } // Roam: diegetic cues only, no outline
     this.pickOutlines();
+  }
+
+  /** @param {boolean} on Roam thresholds and cues */
+  setRoam(on) {
+    if (this.roam === !!on) return;
+    this.roam = !!on;
+    this.reset();
   }
 
   /** @param {number} p */
   ask(p) {
     if (p === POINT.LEFT) this.pulseL = true;
     else if (p === POINT.RIGHT) this.pulseR = true;
-    else { this.pulseL = true; this.pulseR = true; }
+    else {
+      this.pulseHead = true;
+      if (!this.roam) { this.pulseL = true; this.pulseR = true; }
+    }
   }
 
   /** @param {number} box @param {number} p @param {number} d */

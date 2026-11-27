@@ -82,7 +82,9 @@ export function occluderExtents(b, e) {
   if (b.kind === 'wall') {
     if (b.jamb0) x0 += OCC_SHRINK;
     if (b.jamb1) x1 -= OCC_SHRINK;
-    if (b.face < 0) z0 += OCC_SHRINK; else z1 -= OCC_SHRINK;
+    if (b.face < 0) z0 += OCC_SHRINK;
+    else if (b.face > 0) z1 -= OCC_SHRINK;
+    else { z0 += OCC_SHRINK; z1 -= OCC_SHRINK; } // centred slab (Roam): both sides face a room
     if (b.lintel) y0 += OCC_SHRINK;
     if (b.sill) y1 -= OCC_SHRINK;
   } else {

@@ -88,7 +88,7 @@ function setup({ world = houseWorld() } = {}) {
   const session = { visibilityState: 'visible', end() { return Promise.resolve(); } };
   const player = new Player();
   const ctx = { scene, camera, session, space: null, input, events, audio, world, player };
-  const game = new GameSession(ctx, { enemies, weapons });
+  const game = new GameSession(ctx, { enemies, weapons, roam: false });
   const seen = [];
   events.on('pause', (p) => { if (REC.on) seen.push({ ...p }); });
   let t = 0;

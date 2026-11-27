@@ -67,8 +67,9 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
 /** @typedef {'edge'|'sampled'|'player'|'learned'|'normal'} WallSide */
 /**
  * @typedef {{ id: number, ax: number, az: number, bx: number, bz: number, tx: number, tz: number, nx: number, nz: number,
- *   len: number, y0: number, y1: number, openings: Opening[], side: WallSide, flipped: boolean, inferred: boolean }} Wall
- *   (a→b is the face; n points into the room; the slab lies on the −n side; flipped: n is the reverse of the plane normal)
+ *   len: number, y0: number, y1: number, openings: Opening[], side: WallSide, flipped: boolean, inferred: boolean, centred?: boolean }} Wall
+ *   (a→b is the face; n points into the room; the slab lies on the −n side, or centred on the face line when
+ *   `centred`; flipped: n is the reverse of the plane normal)
  */
 /**
  * @typedef {{ id: number, cx: number, cz: number, tx: number, tz: number, nx: number, nz: number, width: number,
@@ -96,9 +97,13 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
  *   mappedFloors: number, inferredWalls: number, pockets: number }} Layout
  */
 /**
- * @typedef {{ doorOpen?: ArrayLike<boolean|undefined|null>|null, defaultDoorOpen?: boolean }} LayoutOptions
+ * @typedef {{ doorOpen?: ArrayLike<boolean|undefined|null>|null, defaultDoorOpen?: boolean, interiorSlab?: 'player'|'centred' }} LayoutOptions
  *   doorOpen[id]: false = that door is closed (ids = layout.doors order, the snapshot's door planes in order);
  *   missing/undefined = defaultDoorOpen (true: every door open, the first-test default).
+ *   interiorSlab: where an interior wall's slab goes (a wall with floor on both sides, side 'normal' / 'learned'):
+ *   'player' (default, stationary play): behind the face the player sees from the start; 'centred' (Roam: the
+ *   player walks round to both sides): centred on the wall plane, ±WALL_T/2, so either face is at most 5 cm off
+ *   the real surface whichever side the player stands on (the walls get `centred: true`, their boxes `face: 0`).
  */
 
 /** Wall slab thickness behind the face (PLAN §6.3). */
@@ -384,9 +389,20 @@ export function buildLayout(snapshot, start, opts = {}) {
   const closed = doors.filter((d) => !d.open).length;
   if (closed) notes.push(`${closed} door(s) closed: not carved, wall solid`);
 
-  // ---- Interior walls (no floor edge, floor on both sides): the face the player sees is the face
-  const byPlayer = resolveFromPlayer(walls, start.x, start.z);
-  if (byPlayer) notes.push(`${byPlayer} interior wall(s) faced to the player`);
+  // ---- Interior walls (no floor edge, floor on both sides): the face the player sees is the face,
+  // or (Roam: the player walks round them) the slab is centred on the plane
+  if (opts.interiorSlab === 'centred') {
+    let nc = 0;
+    for (const w of walls) {
+      if (w.inferred || (w.side !== 'normal' && w.side !== 'learned')) continue;
+      w.centred = true;
+      nc++;
+    }
+    if (nc) notes.push(`${nc} interior wall(s) with a centred slab (Roam)`);
+  } else {
+    const byPlayer = resolveFromPlayer(walls, start.x, start.z);
+    if (byPlayer) notes.push(`${byPlayer} interior wall(s) faced to the player`);
+  }
   for (const w of walls) mergeOpenings(w);
   for (const d of doors) {
     for (const id of d.wallIds) {
@@ -846,6 +862,7 @@ function mergeOpenings(w) {
 function wallPieces(w, out) {
   const c = w.tx, s = w.tz; // axis 1 along the wall; axis 2 = (-s, c) = -n (into the slab)
   const hz = WALL_T / 2;
+  const off = w.centred ? 0 : hz; // slab centre behind the face (or on it)
   /**
    * @param {number} ua @param {number} ub @param {number} y0 @param {number} y1
    * @param {boolean} j0 @param {boolean} j1 @param {boolean} lintel @param {boolean} sill
@@ -854,8 +871,8 @@ function wallPieces(w, out) {
     if (ub - ua < 0.01 || y1 - y0 < 0.01) return;
     const um = (ua + ub) / 2;
     out.push({
-      cx: w.ax + c * um - w.nx * hz, cz: w.az + s * um - w.nz * hz, c, s,
-      hx: (ub - ua) / 2, hz, y0, y1, label: 'wall', kind: 'wall', face: -1,
+      cx: w.ax + c * um - w.nx * off, cz: w.az + s * um - w.nz * off, c, s,
+      hx: (ub - ua) / 2, hz, y0, y1, label: 'wall', kind: 'wall', face: w.centred ? 0 : -1,
       jamb0: j0, jamb1: j1, lintel, sill, navBlock: false, source: w.inferred ? 'inferred' : 'wall', wall: w.id,
     });
   };

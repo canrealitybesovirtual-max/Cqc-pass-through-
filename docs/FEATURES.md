@@ -9,7 +9,7 @@ Each item moves through four statuses: **planned → implemented → desktop-tes
 | `index.html` + import map + vendored three r187 | desktop-tested | No build step |
 | App state machine (`Game`) | desktop-tested | Node tests |
 | Frame loop with per-system timing, dt clamp, try/catch | desktop-tested | IWER e2e |
-| Session modes: play, probe, bounds, reduced, vr | desktop-tested | IWER e2e; device test pending |
+| Session modes: play, probe, bounds, reduced, vr | desktop-tested | IWER e2e; device test pending. v0.3: play = Roam (requests `unbounded`), plus `spot` |
 | Session mode: setup | implemented | Used from Phase 3 (mapping) |
 | Reference-space fallback to `local-floor` | desktop-tested | Node test with fake session |
 | "Tap again (reduced features)" after a rejection | desktop-tested | IWER e2e |
@@ -63,21 +63,21 @@ Desktop means headless Chromium with SwiftShader and Meta's IWER emulator (`NODE
 | Safe-spot step before the round (`game.pickSpot`): ring follows the head, green / amber / red, floor arrow, "Step … m"; trigger confirms (1 s hold when tight); App's panel hidden meanwhile (v0.2.1) | desktop-tested | IWER e2e: the fixture's start point is blocked, the step suggestion leads to a tight spot, the hold confirms it, the round starts there. `rec.play.spot`, `rec.play.safety.spot` |
 | World rebuilt around a spot more than 0.25 m from where it was built, behind the "Get ready" panel (v0.2.1) | desktop-tested | IWER e2e (reduced): 0.51 m move, 2 ms rebuild on desktop, no new programs, textures or geometries; `rec.play.world.rebuild`. Quest build time pending |
 | `rec.play.safety` (pauses, violations, obstacle warnings, spot report) at session end (v0.2.1) | desktop-tested | IWER e2e |
-| Survival waves, safe zone ring and pause, B + Y pause, Y restart, hold Y 2 s to exit, wrist-X exit | desktop-tested | Rules and session in Node tests (builder G); e2e: wave 1 starts, exit by holding Y |
+| Survival waves, safe zone ring and pause, B + Y pause, Y restart, hold Y 2 s to exit, wrist-X exit (v0.3: the wrist X is gone; the watch menu exits; the ring is spot mode only) | desktop-tested | Rules and session in Node tests (builder G); e2e: wave 1 starts, exit by holding Y |
 | Enemies spawn out of view, walk in through doors, shoot (playerHit), die | desktop-tested | IWER e2e and Node tests (builder E). Difficulty is untuned for the headset: they hit a standing player with nearly every round |
-| Glock: draw from the right hip, trigger fires, hit an enemy, A magazine drop, A again = assisted reload, let go at the hip to holster | desktop-tested | IWER e2e drives the real controllers |
+| Glock: draw from the right hip, trigger fires, hit an enemy, A magazine drop, assisted reload (v0.3: hold A 0.8 s with no magazine), let go at the hip to holster | desktop-tested | IWER e2e drives the real controllers (v0.3: aimed along the bore with `weapons.aimRayFor`) |
 | AKM: take from over the right shoulder, selector (stick click), full-auto burst | desktop-tested | IWER e2e |
 | Pouch reload (left hip), rack, slide release, two-handed AKM, Glock cup | desktop-tested | W2's Node tests with the real Input and WeaponSystem; not in the e2e |
 | Combined `ctx.raycast` (world, then enemies up to the world hit) | desktop-tested | e2e: shots hit enemies and walls |
 | Audio: decode before Enter, unlock in the Enter click, positional shots, enemy shots, hits | desktop-tested | Headless Chromium (builder G); levels by ear pending |
 | Audio: unlock again from the XR `selectstart` / `select` / `squeeze` events when the context is not running; context state logged at start, 1 s and end (`rec.audio`) (v0.2.1) | desktop-tested | IWER e2e: a suspended context runs again after a trigger pull (first event `selectstart`). Whether the Quest Browser treats XR input events as user activation for audio is unverified |
-| Wrist HUD (wave, health, kills, ammo) | desktop-tested | IWER e2e: shown on the left grip. Legibility on device pending |
-| Wrist HUD fire mode (SAFE / SEMI / AUTO) on the ammo line (v0.2.1) | desktop-tested | IWER e2e: SEMI after taking the AKM (it is issued on semi now), then SAFE and AUTO after stick clicks. The mode comes from `weapons.ammo().mode` |
+| Wrist HUD (wave, health, kills, ammo) (v0.3: replaced by the watch; `WristHud.js` is no longer used) | desktop-tested | IWER e2e: shown on the left grip. Legibility on device pending |
+| Wrist HUD fire mode (SAFE / SEMI / AUTO) on the ammo line (v0.2.1; v0.3: on the watch's dial) | desktop-tested | IWER e2e: SEMI after taking the AKM (it is issued on semi now), then SAFE and AUTO after stick clicks. The mode comes from `weapons.ammo().mode` |
 | Play asks for 72 Hz at start (`updateTargetFrameRate(72)` when offered); request result, offered rates, measured rate and the rate at the end in `rec.probes.frameRate` (v0.2.1) | desktop-tested | IWER accepts it. Device pending (the AR default is 90 Hz) |
 | Camera near plane 0.02 m in play without depth sensing (0.05 with depth and in probe sessions) (v0.2.1) | desktop-tested | e2e: three's XR camera near = 0.02. Device check pending: the AKM stock should no longer clip through the face |
-| Grip fit escape hatch: `?gripPitch=<deg>&gripY=<m>&gripZ=<m>` on both guns, clamped ±30° / ±0.08 m, effective values in `rec.play.grip` (v0.2.1) | desktop-tested | e2e page with `gripPitch=10&gripY=0.01&gripZ=-0.02`: both guns pitched 10° about the palm point, palm points moved. Applied at the PlayKit level (WeaponView's FIT is frozen): the holstered gun shifts by the same Y / Z. No in-headset adjustment yet |
+| Grip fit escape hatch: `?gripPitch=<deg>&gripY=<m>&gripZ=<m>` on both guns, effective values in `rec.play.grip` (v0.2.1; v0.3: applied as a gun fit over the saved one, clamped ±30° / ±0.04 m, never saved) | desktop-tested | e2e page with `gripPitch=10&gripY=0.01&gripZ=-0.02`: both guns tilted 10° in the hand, up 0.01, forward 0.02; nothing written to storage. The holstered gun no longer moves with the fit |
 | 60 s timing run starts with wave 1 (replaces the Phase 1 A button, now a weapon button) | implemented | Result in `rec.perfRuns` |
-| Draw calls with 4 enemies in view | desktop-tested | 34 per frame for both eyes (17 per eye) in IWER; contract limit 60 |
+| Draw calls with 4 enemies in view | desktop-tested | v0.3: 36 per frame for both eyes (18 per eye) in IWER with the watch, the holster shell and a glove, the slung AKM hidden; contract limit 60 |
 | CPU per frame | desktop-tested | 1.7–2.2 ms average on desktop for the whole frame callback (render 1.2, enemies 0.4–0.6, weapons 0.2–0.3); Quest numbers come from `rec.perfRuns` and `rec.systemsMs` |
 | First-person second pass (`fpScene`) for depth sessions | planned | Play has depth sensing off (DECISIONS), so the gun is drawn in the main scene |
 | "Dynamic occlusion" setting for play (`cfg.depth`) | planned | |
@@ -110,6 +110,66 @@ Desktop means headless Chromium with SwiftShader and Meta's IWER emulator (`NODE
 | Depth attributes read only through a try (Chromium throws without the feature) | desktop-tested | LiveDepth: Node test with a throwing getter; CapabilityLog: same guard, not unit-tested |
 | Everything after `attachSession` guarded: a start error ends the session and returns to the menu with a record | implemented | |
 | Console errors and page errors kept in the diagnostics across reloads | implemented | |
+
+## v0.3: whole house, the watch, gun fit (desktop only)
+
+Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs`, 130 checks) plus `npm test`. **Nothing in this section has run on the Quest yet.** The questions for the headset are at the end.
+
+### Whole house (Roam)
+
+| Item | Status | Notes |
+|---|---|---|
+| Enter MR = Roam: requests `unbounded`, uses it when granted, else `local-floor` with "Whole-house tracking unavailable: the Quest boundary applies" on the page and in `rec.play.roam.spaceNote` (never in the headset) | desktop-tested | IWER grants `unbounded`; the reduced retry shows the note. Whether the Guardian shows, interrupts or fires `visibilitychange` under `unbounded` in the Quest Browser is unknown |
+| Enter MR: one spot (`spot`): the v0.2 stationary mode, `local-floor` only, safe-spot ring, rebuild around the spot | desktop-tested | IWER e2e |
+| No fixed zone: the card's trigger pull starts the round where you stand (no spot step, no ring, no rebuild); no "Get ready" / "Wave n" text in the view | desktop-tested | IWER e2e |
+| World build in Roam: rooms, door graph, interior slabs centred, nav never cropped; edge and door fields baked in slices (4 ms a frame behind the card, 1 ms in play) | desktop-tested | Fixture house: 3 rooms, bake done before the round. Quest build time and bake time (estimated 3.5–5 s at 1 ms) pending |
+| Spawns in another room than the player's (`world.spawnRoamFor`, time-sliced) | desktop-tested | IWER e2e: every spawn in room 3 with the player in room 2 |
+| Running is a watch warning, not a pause (cue from 0.9 m/s) | desktop-tested | IWER e2e at 1.5 m/s: cue 0.95, no pause. Real walking speeds pending |
+| Edge of the mapped floor, walls near the head, tracking: diegetic watch cues (vibration pattern + dial icon); enemies freeze only off the map or with the head inside a box | implemented | RoamSafety and GameSession Node tests (builder R); the edge / obstacle path is not in the e2e. Stairs cue is always 0 (no stair data) |
+| Seated: one decision (BodyEstimator, eye height + stillness) for the holster (right thigh), the Player and the walking rules | implemented | Node tests (builders W, R). Kneeling still for 1.5 s also counts as seated |
+| Reference-space reset during the round: held pause, enemies back in the queue, `world.realign(transform)` behind the pause, one warm draw, resume protocol; before the round: capture again | desktop-tested | IWER e2e with a synthetic transform (and its inverse): realigned in 3–9 ms on desktop, nothing compiled, the round resumes. The real event's transform on the Quest is unverified |
+| Drift watch: 3 Space Setup reference planes checked once a second; over 0.10 m or 2° twice in a row realigns | implemented | DriftWatch Node tests (builder R); IWER has no planes, so the e2e cannot run it. Plane pose stability over 30 min on the Quest pending |
+| `rec.play.roam`: speeds, walked metres, cues, rooms visited, spawn searches, resets, realigns, drift, mode switches, world rooms / doors, space and note | desktop-tested | IWER e2e |
+
+### The watch (replaces the wrist HUD)
+
+| Item | Status | Notes |
+|---|---|---|
+| Steel dive watch on the left wrist: health, rounds + chamber, wave, AKM fire mode, one info line; hands in real time; redraw on change ≤ 2/s through the upload gate | desktop-tested | IWER e2e: SEMI / SAFE / AUTO on the dial. Legibility at 35 cm and the wrist offset on the user's arm pending |
+| Wake on a wrist check (dial toward the eyes, head looking at it) | desktop-tested | IWER e2e with a posed controller. Real wrist poses pending |
+| Menu: point the right ray at the awake dial + trigger (or touch it with the controller tip); a world-placed disc; the open menu pauses the round; RESUME resumes through the 3-2-1 | desktop-tested | IWER e2e: ray + trigger opens it and no shot fires; touch-to-open is in the watch's Node tests only. While the menu is open, GameSession's pause panel stays hidden (verifier fix: "Pull the trigger to resume" sat half behind the disc); the 3-2-1 panel shows after RESUME |
+| RESTART (two taps), DIFFICULTY (enemy preset, saved), MODE (rebuilds the world in the other mode, back to the card), AMMO LINE (saved), EXIT (two taps) | desktop-tested | IWER e2e: RESTART, AMMO LINE saved to `localStorage['cqcpt.settings.v1']`, MODE spot → Roam. DIFFICULTY and EXIT are wired but not driven by the e2e (the watch emits them in its Node tests) |
+| The trigger belongs to the watch while pointing at it or with the menu open: no shot, no resume press, no card skip | desktop-tested | e2e (no shot) and WeaponSystem Node test (`triggerBlocked`) |
+| Watch tick and alert sounds synthesised before Enter | desktop-tested | IWER e2e: both buffers exist. Levels by ear pending |
+| Watch fit on the wrist: `?watchBack`, `?watchOut`, `?watchTilt`, `?watchScale`, `?bracelet=0` | implemented | Settings.js Node tests; no in-headset watch-fit page |
+
+### Gun fit, CQC controls, gloves, lighting
+
+| Item | Status | Notes |
+|---|---|---|
+| Guns held in grip space (GunFit): Glock trigger on the controller's trigger, bore 24–29° below the aim ray (intended: shots go along the bore) | desktop-tested | Node tests and IWER e2e (shots aimed with `aimRayFor` hit). How it feels in the hand pending |
+| In-headset gun fit: watch → GUN FIT draws the chosen gun into the empty right hand (no squeeze needed, game paused), tilt / height / forward with − / + or the right stick, live; SAVE writes the fit per weapon (`localStorage['cqcpt.gunfit.v1']`, from a setTimeout) and logs it (`rec.play.fitSaves`); BACK reverts; after a reload the saved fit is applied | desktop-tested | IWER e2e: +2° saved, back in the holster, reloaded page starts from it (source "saved") |
+| CQC face buttons: A / X magazine release, B / Y slide release or AKM fire mode on either hand that is on the gun; hold A 0.8 s with no magazine = assisted reload; Y and B + Y belong to the game only with free hands | desktop-tested | Node tests (builder W); e2e: A drop, second tap no reload, hold A reloads |
+| Controls on the "Get ready" card (`CONTROLS_CARD`) and the page's How to play | desktop-tested | IWER e2e reads the card |
+| Holster shell at the hip (thigh when seated), anchored by the grip centre; the slung AKM hidden | desktop-tested | Node tests; e2e draws and holsters through it. Legibility when looking down pending |
+| Gloved hands inside the gun GLBs (the gun's shader hook, double-sided): right glove while held, left on the AKM handguard; `?gloves=0` | desktop-tested | IWER e2e: glove shown while the Glock (fit mode) and the AKM are held, hidden when holstered. Double-sided since the verifier pass: the pack glove is an open shell, and from the shooter's eye (behind the hand) the culled cuff read as a thin black wing over the grip; now it reads as a glove with a cuff (one more program, compiled in the warm-up: 24). No watch toggle yet; the left AKM glove sits about 4 cm above the real controller and reads as a flat hand beside the handguard from the eye |
+| Gun–wall push-back (grip → muzzle ray against the world, one haptic tick) | implemented | Node test (builder W); Space Setup boxes only, no side sweep |
+| PMREM room environment before the warm-up (`scene.environment`, intensity 0.55), hemisphere 0.9, sun 1.1; enemy cloth 0.35; `?env=`, `?light=` | desktop-tested | IWER e2e: set before the warm-up, programs flat through play (24 at warm-up). How it looks in passthrough pending |
+| Programs, textures and geometries flat after the warm-up through a Roam round (watch menu, fit mode, gloves, realign, mode switch) | desktop-tested | IWER e2e |
+
+### Not in this build
+
+- The user's chosen extras **10 (automatic diagnostics upload), 8 (home defense), 7 (room clearing)**: not built. The data side for 7 and 8 exists (rooms, door graph, exterior doors); windows are not parsed yet.
+- Walkthrough pre-scan, the silent learner, real-surface physics (Rapier), IndexedDB persistence: not built.
+- A watch toggle for the gloves; a watch-fit page; the pre-scan "rooms found" on the watch.
+
+### Ask in the headset (keep it short)
+
+1. Enter MR: does the Quest boundary still appear when you walk into other rooms? Does the game pause there?
+2. Look at your left wrist: does the watch read the right way up? Touch it with the right controller: does the menu open?
+3. Watch → GUN FIT: is the slide just above your thumb? Nudge it, SAVE, reload the page: is it kept?
+4. Walk briskly: does the watch buzz (no pause)?
+5. Looking down: is the holster legible and the AKM gone from view?
 
 ## Later phases
 

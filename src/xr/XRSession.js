@@ -7,7 +7,12 @@
  * - Every feature is optional; `requiredFeatures` stays empty.
  * - `requestXR` must be called synchronously from a click handler: any `await`
  *   before it can use up the user gesture.
- * - Play never uses `unbounded` (stationary play, system boundary untouched).
+ * - v0.3: Play is Roam, the whole house (the user's choice): it requests
+ *   `unbounded` and uses it when granted (Meta documents it as not limited to
+ *   the Guardian; whether the Guardian still shows under it in the browser is
+ *   unverified on the device), else `local-floor`, where the Quest boundary
+ *   applies (`spaceNote`). There is no fixed safe zone; the game's own walking
+ *   cues replace it. `spot` is the v0.2 stationary session (`local-floor` only).
  * - `bounded-floor` is requested only by the one-off `bounds` probe.
  */
 
@@ -19,7 +24,8 @@ export const BASE = Object.freeze(['local-floor', 'anchors', 'plane-detection', 
 
 /** @type {Readonly<Record<string, ModeDef>>} */
 export const MODES = Object.freeze({
-  play: { sessionMode: 'immersive-ar', features: BASE, roam: false, userOptions: true, label: 'Play' },
+  play: { sessionMode: 'immersive-ar', features: [...BASE, 'unbounded'], roam: true, userOptions: true, label: 'Play (whole house)' },
+  spot: { sessionMode: 'immersive-ar', features: BASE, roam: false, userOptions: true, label: 'Play (one spot)' },
   setup: { sessionMode: 'immersive-ar', features: [...BASE, 'unbounded'], roam: true, userOptions: true, label: 'Setup' },
   probe: { sessionMode: 'immersive-ar', features: [...BASE, 'unbounded', 'depth-sensing', 'layers', 'body-tracking', 'light-estimation'], roam: true, userOptions: false, label: 'Probe' },
   bounds: { sessionMode: 'immersive-ar', features: ['local-floor', 'bounded-floor'], roam: false, userOptions: false, label: 'Boundary probe' },
@@ -70,6 +76,32 @@ export function sessionInit(mode, cfg = {}) {
 export function chooseSpace(mode, enabled, cfg = {}) {
   const m = MODES[mode];
   return m && m.roam && enabled.includes('unbounded') && cfg.space !== 'local-floor' ? 'unbounded' : 'local-floor';
+}
+
+/**
+ * How a game session plays: 'roam' (the whole house, the default) or 'spot'
+ * (stationary, the v0.2 safe zone). The `reduced` retry keeps Roam's rules
+ * (it only lost features, not the user's choice).
+ * @param {string} mode
+ * @returns {'roam'|'spot'}
+ */
+export function playStyle(mode) {
+  return mode === 'spot' ? 'spot' : 'roam';
+}
+
+/**
+ * The one honest line for the session record and the page when Roam could not
+ * get `unbounded`: the Quest boundary then applies (it cannot be hidden from a
+ * web page). Null when nothing needs saying.
+ * @param {string} mode
+ * @param {string} space the reference space in use
+ * @param {string|null} [spaceFallback] attachSession's fallback note
+ * @returns {string|null}
+ */
+export function spaceNote(mode, space, spaceFallback = null) {
+  if (playStyle(mode) !== 'roam' || space === 'unbounded') return null;
+  if (!MODES[mode] || (mode !== 'play' && mode !== 'reduced')) return null;
+  return `Whole-house tracking unavailable${spaceFallback ? ` (${spaceFallback})` : ''}: the Quest boundary applies`;
 }
 
 /**

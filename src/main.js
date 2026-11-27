@@ -6,7 +6,7 @@ import { preload, preloaded, preloadSummary } from './core/Preload.js';
 import { checkSupport } from './debug/CapabilityLog.js';
 import { Diagnostics } from './debug/Diagnostics.js';
 import { HomePage } from './ui/HomePage.js';
-import { PlayKit, gripFitFromParams } from './app/Play.js';
+import { PlayKit, gripFitFromParams, watchFitFromParams } from './app/Play.js';
 import { loadFixture, normalizeSnapshot } from './world/World.js';
 
 const params = new URLSearchParams(location.search);
@@ -53,7 +53,7 @@ async function boot() {
   if (willLoad) page.loading(0, 'starting'); // session buttons wait for the warm-up (it must finish before XR)
   page.bind(app, diag, support);
   // The audio context resumes inside the Enter click (user gesture); harmless when App unlocks it too.
-  page.onEnter = (mode) => { if ((mode === 'play' || mode === 'reduced') && preloaded.audio) preloaded.audio.unlock(); };
+  page.onEnter = (mode) => { if ((mode === 'play' || mode === 'spot' || mode === 'reduced') && preloaded.audio) preloaded.audio.unlock(); };
   app.game.send('ready');
   /** @type {any} */ (window).__app = app; // for chrome://inspect
 
@@ -63,13 +63,19 @@ async function boot() {
     scene: gfx.scene,
     camera: gfx.camera,
     onProgress: (f, label) => page.loading(f, label),
-    // The whole game is built here, once: world (occluder + dev overlay: world.warmMeshes()), player, weapons (views, FX pools), enemy
-    // pool, game session (ring, tint, messages), wrist HUD. The warm-up then compiles, uploads and draws
-    // all of it before Enter MR is enabled; nothing is built or re-keyed after this.
+    // The whole game is built here, once: world (occluder + dev overlay: world.warmMeshes()), player, weapons (views, gloves,
+    // holster, FX pools), enemy pool, game session (ring, tint, messages), the watch (and its sounds). The warm-up then
+    // compiles, uploads and draws all of it (with scene.environment, the PMREM room made in createRenderer) before
+    // Enter MR is enabled; nothing is built or re-keyed after this.
     buildPools: async (assets, audio) => {
       const fixture = await fixtureFor(diag);
-      // ?gripPitch=<deg>&gripY=<m>&gripZ=<m>: the grip fit escape hatch (both guns; logged in rec.play.grip)
-      const kit = new PlayKit({ gfx, assets, audio, input: app.input, fixture, grip: gripFitFromParams(params) });
+      // ?gripPitch=<deg>&gripY=<m>&gripZ=<m>: the grip fit escape hatch (both guns, over the saved fit, never saved; rec.play.grip);
+      // ?gloves=0: no gloved hands; ?watchBack/Out/Tilt/Scale, ?bracelet=0: the watch on the wrist
+      /** @type {Storage|null} */ let storage = null;
+      try { storage = window.localStorage; } catch { storage = null; }
+      const kit = new PlayKit({ gfx, assets, audio, input: app.input, fixture, grip: gripFitFromParams(params),
+        gloves: params.get('gloves') !== '0', watchFit: watchFitFromParams(params), bracelet: params.get('bracelet') !== '0',
+        difficultyFromUrl: params.has('difficulty'), storage });
       app.play = kit;
       kit.setWarm(true); // every pool shown (and culling off) for the warm-up draw
       return kit.warmObjects();

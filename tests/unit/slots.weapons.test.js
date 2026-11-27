@@ -59,6 +59,16 @@ function model(id) {
   mag.position.fromArray(M.magLocalSeat);
   const scene = new THREE.Group();
   scene.add(gun, mag);
+  // gloved hands as the GLB brings them (v0.3): own material, _part on the index tip
+  const handMat = new THREE.MeshStandardMaterial({ name: 'hand' });
+  for (const n of id === 'akm' ? ['hand_r', 'hand_l'] : ['hand_r']) {
+    const hg = new THREE.BoxGeometry(0.04, 0.1, 0.08);
+    hg.translate(0, n === 'hand_r' ? -0.07 : -0.03, n === 'hand_r' ? M.grip.pos[2] : -0.13);
+    hg.setAttribute('_part', new THREE.Float32BufferAttribute(new Float32Array(hg.attributes.position.count).fill(0).map((_, i) => (i < 4 ? 2 : 0)), 1));
+    const h = new THREE.Mesh(hg, handMat);
+    h.name = n;
+    scene.add(h);
+  }
   return { scene, gun, mag, manifest: M };
 }
 
@@ -148,13 +158,24 @@ const v3 = (x, y, z) => new THREE.Vector3(x, y, z);
 const holsterPoint = (W) => v3(W.body.holster.p[0], W.body.holster.p[1], W.body.holster.p[2]);
 const backPoint = (W) => v3(W.body.back.p[0], W.body.back.p[1], W.body.back.p[2]);
 const AIM_POS = v3(0.2, 1.4, -0.45);
+const GROT = { right: new THREE.Quaternion().setFromRotationMatrix(G.right), left: new THREE.Quaternion().setFromRotationMatrix(G.left) };
+/**
+ * The aim-ray orientation that holds weapon `w` with the gun at `gunQ` (default: level, bore along −Z):
+ * grip = ray · G, gun = grip · fit  ⇒  ray = gunQ · fit⁻¹ · G⁻¹.
+ */
+const rayFor = (w, gunQ = new THREE.Quaternion()) => gunQ.clone().multiply(w.view.fitQuat.clone().invert()).multiply(GROT.right.clone().invert());
+/** Left-hand grip position and ray orientation that put w's hand magazine root at P with orientation magQ. */
+function magHand(w, P, magQ) {
+  const lg = magQ.clone().multiply(w.view.magHoldQuat.clone().invert());
+  return { p: P.clone().sub(w.view.magHoldPos.clone().applyQuaternion(lg)), q: lg.clone().multiply(GROT.left.clone().invert()) };
+}
 
-/** Draw the Glock and bring it up to aim straight ahead (trigger released). */
+/** Draw the Glock and bring it up to aim straight ahead, level (trigger released). */
 function drawGlock(S) {
   S.R.pose(holsterPoint(S.W), new THREE.Quaternion());
   S.R.set(1, 1);
   S.step(3);
-  S.R.pose(AIM_POS, new THREE.Quaternion());
+  S.R.pose(AIM_POS, rayFor(S.W.glock));
   S.step(30);
 }
 /** One trigger press and release, then wait out the slide's 55 ms cycle. */
@@ -162,31 +183,34 @@ function fireOnce(S) {
   S.R.set(0, 1); S.step(1); S.R.set(0, 0); S.step(7);
 }
 
-test('guns start in their slots: Glock on the right hip, AKM on the back', () => {
+test('guns start in their slots: Glock in its holster shell on the right hip, AKM slung out of sight', () => {
   const S = setup();
   const { W } = S;
   assert.equal(W.glock.carry.state, CARRY_SLOT);
   assert.equal(W.akm.carry.state, CARRY_SLOT);
-  const palm = W.glock.view.toWorld(W.glock.view.palm, v3());
-  assert.ok(palm.distanceTo(holsterPoint(W)) < 1e-6, 'Glock palm point on the holster socket');
-  assert.ok(palm.x > 0.15 && palm.y > 0.9 && palm.y < 1.1);
+  const gc = W.glock.view.toWorld(W.glock.view.gripCentre, v3());
+  assert.ok(gc.distanceTo(holsterPoint(W)) < 1e-6, 'Glock grip centre on the holster socket');
+  assert.ok(gc.x > 0.15 && gc.y > 0.9 && gc.y < 1.1);
   const mz = W.glock.view.toWorld(W.glock.view.muzzle, v3());
-  assert.ok(mz.y < palm.y - 0.1, 'holstered muzzle points down');
-  const ak = W.akm.view.toWorld(W.akm.view.palm, v3());
+  assert.ok(mz.y < gc.y - 0.1, 'holstered muzzle points down');
+  const ak = W.akm.view.toWorld(W.akm.view.gripCentre, v3());
   assert.ok(ak.distanceTo(backPoint(W)) < 1e-6 && ak.z > 0.1, 'AKM grip behind the shoulder');
-  assert.ok(W.glock.view.root.visible && W.akm.view.root.visible);
+  assert.ok(W.glock.view.root.visible, 'holstered Glock shows');
+  assert.equal(W.akm.view.root.visible, false, 'a rifle on your back is out of sight');
+  assert.ok(W.holster.visible && W.holster.position.distanceTo(W.glock.view.root.position) < 1e-9 && W.holster.quaternion.angleTo(W.glock.view.root.quaternion) < 1e-9,
+    'holster shell at the holstered gun root');
   assert.deepEqual(W.ammo(), { weapon: 'glock', mag: 17, chambered: 1, mode: 'semi' });
   assert.equal(W.ammo(), W.ammo(), 'one reused object');
 });
 
-test('palm point: on the grip axis, 6.0 cm under the Glock bore and 8.8 cm under the AKM bore (CQC hold)', () => {
+test('palm point = the grip origin in gun space (GunFit defaults); the grip axis runs up the handle', () => {
   const S = setup();
-  for (const [w, below] of [[S.W.glock, 0.060], [S.W.akm, 0.088]]) {
-    const M = w.view.manifest, p = w.view.palm;
-    assert.ok(Math.abs(p.y + below) < 1e-9);
-    const g = v3(...M.grip.pos), up = v3(...M.grip.up).normalize();
-    const d = p.clone().sub(g);
-    assert.ok(d.clone().cross(up).length() < 1e-9, 'palm on the manifest grip axis');
+  for (const [w, want] of [[S.W.glock, [-0.008, -0.0463, 0.0298]], [S.W.akm, [-0.008, -0.0548, 0.1771]]]) {
+    assert.ok(w.view.palm.distanceTo(v3(...want)) < 3e-4, `${w.id} palm ${w.view.palm.toArray()}`);
+    const p = w.view.palm.clone().applyQuaternion(w.view.fitQuat).add(w.view.fitPos);
+    assert.ok(p.length() < 1e-9, 'fit · palm = grip origin');
+    const up = v3(...w.view.manifest.grip.up).normalize().applyQuaternion(w.view.fitQuat);
+    assert.ok(up.distanceTo(v3(0, 0, -1)) < 2e-3, 'grip axis along grip −Z');
   }
 });
 
@@ -217,9 +241,17 @@ test('draw: grab within 0.13 m of the holster, tick on entry; 0.15 s into the fi
   const v = W.glock.view;
   const palm = v.toWorld(v.palm, v3());
   assert.ok(palm.distanceTo(AIM_POS) < 1e-5, `palm at the grip origin (${palm.distanceTo(AIM_POS)})`);
+  // held in GRIP space: the bore is the grip frame's (0, −0.9297, −0.3683), 24.4° below the IWER aim ray
+  const gripQ = q.clone().multiply(GROT.right);
   const bore = v.dirWorld(v3(0, 0, -1), v3());
+  assert.ok(bore.angleTo(v3(0, -0.9297, -0.3683).applyQuaternion(gripQ)) < 1e-3, 'bore from the grip fit');
   const ray = v3(0, 0, -1).applyQuaternion(q);
-  assert.ok(bore.angleTo(ray) < 1e-5, 'bore parallel to the aim ray (CQC aimPitch 0)');
+  const deg = (bore.angleTo(ray) * 180) / Math.PI;
+  assert.ok(Math.abs(deg - 24.4) < 0.6, `bore ${deg.toFixed(1)}° off the aim ray`);
+  // the trigger pad sits on the controller's trigger (grip (0.008, −0.0384, −0.022))
+  const pad = v.toWorld(v3(0, -0.040, -0.014), v3());
+  const want = v3(0.008, -0.0384, -0.022).applyQuaternion(gripQ).add(AIM_POS);
+  assert.ok(pad.distanceTo(want) < 1e-3, `trigger pad ${pad.distanceTo(want)}`);
 });
 
 test('the trigger is gated after the draw until released; a shot goes along the bore and hits the wall', () => {
@@ -231,7 +263,7 @@ test('the trigger is gated after the draw until released; a shot goes along the 
   R.pose(holsterPoint(W), new THREE.Quaternion());
   R.set(1, 1);
   S.step(3);
-  R.pose(AIM_POS, new THREE.Quaternion());
+  R.pose(AIM_POS, rayFor(W.glock));
   S.step(30);
   assert.equal(n, 0, 'no shot with the trigger held through the draw');
   R.set(0, 0); S.step(2);
@@ -288,7 +320,7 @@ test('an enemy hit emits enemyHit with the part damage and the bullet direction'
   assert.equal(S.W.fx.decals.count, 0, 'no wall decal for an enemy hit');
 });
 
-test('A drops the magazine (pooled, falls to the floor, one landing sound); A again = assisted reload in 1.2 s', () => {
+test('A drops the magazine (pooled, 1.1 m/s, falls to the floor, one landing sound); a tap with none does nothing; hold A 0.8 s = assisted reload', () => {
   const S = setup();
   const { W, R } = S;
   drawGlock(S);
@@ -304,11 +336,16 @@ test('A drops the magazine (pooled, falls to the floor, one landing sound); A ag
   assert.equal(S.sounds.filter((s) => s.key === 'magDrop').length, 1, 'landing sound once');
   assert.deepEqual(W.ammo(), { weapon: 'glock', mag: -1, chambered: 1, mode: 'semi' });
   R.set(4, 1); S.step(1); R.set(4, 0);
-  S.step(Math.floor(1.0 / DT));
+  S.step(Math.ceil(1.5 / DT));
+  assert.equal(W.glock.inst.magSeated, false, 'a second tap no longer reloads (CQC: reloads by hand)');
+  R.set(4, 1); S.step(Math.ceil(0.7 / DT));
+  assert.equal(W.glock.assistT, -1, 'not before 0.8 s');
+  S.step(Math.ceil(0.15 / DT)); R.set(4, 0);
+  S.step(Math.floor(0.9 / DT));
   assert.equal(W.glock.inst.magSeated, false, 'not yet');
   assert.ok(W.glock.view.mag.visible === false);
   S.step(Math.ceil(0.25 / DT));
-  assert.equal(W.glock.inst.magSeated, true, 'assisted reload done after 1.2 s');
+  assert.equal(W.glock.inst.magSeated, true, 'assisted reload done 1.2 s after the hold');
   assert.equal(W.glock.inst.magRounds, 17);
   assert.ok(S.sounds.some((s) => s.key === 'glockMagIn'));
 });
@@ -325,16 +362,17 @@ test('pouch → magazine in the left hand → aligned and pushed home seats it',
   assert.equal(W.handMag, W.glock, 'fresh magazine in the left hand');
   assert.ok(W.glock.view.handMag.visible);
   assert.ok(L.pulses.some(([a]) => a === HAPTIC.pouch[0]));
-  // bring it under the well, aligned with the gun (left hand frame = the gun's orientation)
+  // bring it under the well, aligned with the gun
   const g = W.glock, v = g.view;
-  const palmW = v.toWorld(v.palm, v3());
+  const seatW = v.toWorld(v.magSeat, v3());
   const axisW = v.dirWorld(v.magAxis, v3());
   const q = g.view.root.quaternion.clone();
-  L.pose(palmW.clone().addScaledVector(axisW, -0.12).add(v3(0.015, 0, 0)), q);
+  const at = (d, off = v3()) => { const h = magHand(g, seatW.clone().addScaledVector(axisW, d).add(off), q); L.pose(h.p, h.q); };
+  at(-0.12, v3(0.015, 0, 0));
   S.step(2);
   assert.equal(g.well.state, 1, 'captured by the well 12 cm below, 1.5 cm off');
   assert.equal(g.inst.magSeated, false, 'not seated until pushed');
-  for (let d = -0.12; d <= 0.0; d += 0.01) { L.pose(palmW.clone().addScaledVector(axisW, d), q); S.step(1); }
+  for (let d = -0.12; d <= 0.0; d += 0.01) { at(d); S.step(1); }
   assert.equal(g.inst.magSeated, true, 'pushed home');
   assert.equal(g.inst.magRounds, 17);
   assert.equal(W.handMag, null);
@@ -353,9 +391,9 @@ test('a magazine let go before it seats falls; one held at the wrong angle never
   L.pose(v3(W.body.pouch.p[0], W.body.pouch.p[1], W.body.pouch.p[2]), new THREE.Quaternion());
   L.set(1, 1); S.step(2);
   const g = W.glock, v = g.view;
-  const palmW = v.toWorld(v.palm, v3()), axisW = v.dirWorld(v.magAxis, v3());
+  const seatW = v.toWorld(v.magSeat, v3()), axisW = v.dirWorld(v.magAxis, v3());
   const crooked = g.view.root.quaternion.clone().multiply(new THREE.Quaternion().setFromAxisAngle(v3(1, 0, 0), 1.0));
-  for (let d = -0.12; d <= 0.0; d += 0.01) { L.pose(palmW.clone().addScaledVector(axisW, d), crooked); S.step(1); }
+  for (let d = -0.12; d <= 0.0; d += 0.01) { const h = magHand(g, seatW.clone().addScaledVector(axisW, d), crooked); L.pose(h.p, h.q); S.step(1); }
   assert.equal(g.inst.magSeated, false, '57° off: never seats');
   L.set(1, 0); S.step(1);
   assert.equal(W.handMag, null);
@@ -401,7 +439,7 @@ test('last round locks the slide; new magazine + B (slide release) chambers', ()
   const U = g.view.uPart.value;
   assert.ok(U[48 + 13] !== 0 || U[48 + 14] !== 0, 'slide stop part raised');
   R.set(4, 1); S.step(1); R.set(4, 0); S.step(1);   // drop the empty
-  R.set(4, 1); S.step(1); R.set(4, 0);              // assisted reload
+  R.set(4, 1); S.step(Math.ceil(0.85 / DT)); R.set(4, 0);   // hold A: assisted reload
   S.step(Math.ceil(1.3 / DT));
   assert.equal(g.inst.magSeated, true);
   assert.equal(g.inst.slide, SLIDE_LOCKED, 'still locked after the reload');
@@ -424,8 +462,8 @@ test('holster: let go within 0.24 m → 0.34 s arc into the holster; elsewhere �
   S.step(Math.ceil(SLOTS.holsterS / DT) + 1);
   assert.equal(W.glock.carry.state, CARRY_SLOT);
   assert.ok(S.sounds.some((s) => s.key === 'holsterIn'));
-  const palm = W.glock.view.toWorld(W.glock.view.palm, v3());
-  assert.ok(palm.distanceTo(holsterPoint(W)) < 1e-5);
+  const gc = W.glock.view.toWorld(W.glock.view.gripCentre, v3());
+  assert.ok(gc.distanceTo(holsterPoint(W)) < 1e-5);
   // drop it in front
   drawGlock(S);
   R.set(1, 0);
@@ -461,7 +499,8 @@ test('AKM: over the right shoulder, issued on semi (fires), selector semi → sa
   S.step(3);
   assert.equal(W.held, W.akm, 'AKM taken off the back');
   assert.ok(S.sounds.some((s) => s.key === 'cloth'));
-  R.pose(AIM_POS, new THREE.Quaternion());
+  assert.ok(W.akm.view.root.visible, 'visible once taken');
+  R.pose(AIM_POS, rayFor(W.akm));
   S.step(30);
   // issued on semi (gap audit F3: on safe the trigger did nothing and the rifle read as broken)
   assert.equal(W.akm.inst.mode, 'semi');
@@ -489,7 +528,7 @@ test('AKM: over the right shoulder, issued on semi (fires), selector semi → sa
   const dir = v3(-Math.sin(0.17), -0.1, -Math.cos(0.17)).normalize();
   L.pose(AIM_POS.clone().addScaledVector(dir, span), new THREE.Quaternion());
   S.step(3);
-  const palmToSup = v.toWorld(v.support, v3()).sub(v.toWorld(v.palm, v3())).normalize();
+  const palmToSup = v.toWorld(v.supportTarget, v3()).sub(v.toWorld(v.palm, v3())).normalize();
   assert.ok(palmToSup.angleTo(dir) < 0.01, `rifle aims along right grip → left hand: ${palmToSup.angleTo(dir)}`);
   // one second of full auto
   const n0 = shots;
@@ -592,6 +631,67 @@ test('pause blocks firing but the gun still follows the hand', () => {
   assert.equal(n, 1);
 });
 
+test('triggerBlocked (the watch has the trigger): no shot while set; the gun still follows the hand', () => {
+  const S = setup();
+  const { W } = S;
+  drawGlock(S);
+  let n = 0;
+  S.events.on('shot', () => { n++; });
+  W.triggerBlocked = true;
+  fireOnce(S);
+  assert.equal(n, 0);
+  W.triggerBlocked = false;
+  fireOnce(S);
+  assert.equal(n, 1);
+});
+
+test('fitHold (the watch\'s GUN FIT page): draws into the empty hand and keeps it without the squeeze; switches guns; null puts it back', () => {
+  const S = setup();
+  const { W, R } = S;
+  R.pose(AIM_POS, new THREE.Quaternion());
+  S.step(2);
+  assert.equal(W.held, null);
+  W.fitHold('glock');
+  assert.equal(W.held, W.glock);
+  assert.equal(W.fitHolding, 'glock');
+  S.step(60); // no squeeze: it stays in the hand
+  assert.equal(W.held, W.glock);
+  assert.equal(W.glock.carry.state, CARRY_HAND);
+  assert.equal(W.glock.view.handR.visible, true, 'the glove shows');
+  W.fitHold('akm'); // the gun the mode drew goes back, the AKM comes
+  S.step(2);
+  assert.equal(W.held, W.akm);
+  assert.equal(W.fitHolding, 'akm');
+  assert.equal(W.glock.carry.inHand, false);
+  W.fitHold(null);
+  S.step(1);
+  assert.equal(W.held, null);
+  assert.equal(W.fitHolding, null);
+  S.step(90);
+  assert.equal(W.akm.carry.state, CARRY_SLOT, 'back on the back, not dropped');
+  assert.equal(W.glock.carry.state, CARRY_SLOT);
+});
+
+test('fitHold keeps a gun the player drew (and a squeezed grip keeps it after the fit page)', () => {
+  const S = setup();
+  const { W, R } = S;
+  drawGlock(S);
+  W.fitHold('akm'); // the player's own Glock stays; the fit page edits the AKM's numbers
+  assert.equal(W.held, W.glock);
+  assert.equal(W.fitHolding, 'glock');
+  R.set(1, 0);
+  S.step(10); // released, but the fit mode holds it
+  assert.equal(W.held, W.glock);
+  R.set(1, 1);
+  S.step(2);
+  W.fitHold(null); // squeezed: stays in the hand
+  S.step(5);
+  assert.equal(W.held, W.glock);
+  R.set(1, 0);
+  S.step(5); // normal let-go away from the hip: dropped, it returns by itself
+  assert.equal(W.held, null);
+});
+
 test('reset re-issues both guns and clears the effects; a gun in the hand stays there', () => {
   const S = setup();
   const { W } = S;
@@ -606,6 +706,241 @@ test('reset re-issues both guns and clears the effects; a gun in the hand stays 
   assert.equal(W.akm.carry.state, CARRY_SLOT);
 });
 
+test('grip fit: setFit nudges the held gun about the trigger pad; the holstered gun never moves; save / load / report', () => {
+  const S = setup();
+  const { W, R } = S;
+  const holstered = W.glock.view.root.position.clone();
+  W.setFit('glock', { pitch: 10, up: 0.01, fwd: 0 }, 'edit');
+  S.step(1);
+  assert.ok(W.glock.view.root.position.distanceTo(holstered) < 1e-9, 'slots anchor the grip centre, not the palm');
+  drawGlock(S);
+  const v = W.glock.view;
+  assert.ok(v.toWorld(v.palm, v3()).distanceTo(AIM_POS) < 1e-5, 'palm still at the grip origin');
+  const bore = v.dirWorld(v3(0, 0, -1), v3());
+  // rayFor() was made with the nudged fit, so the gun is level: nudge = the same hand pose 10° muzzle-up
+  W.setFit('glock', { pitch: 0, up: 0.01, fwd: 0 }, 'edit');
+  S.step(2);
+  const bore0 = v.dirWorld(v3(0, 0, -1), v3());
+  assert.ok(Math.abs((bore.angleTo(bore0) * 180) / Math.PI - 10) < 0.05 && bore.y > bore0.y, 'pitch +10° = muzzle up 10°');
+  assert.deepEqual(W.getFit('glock'), { pitch: 0, up: 0.01, fwd: 0 });
+  const clamped = W.setFit('akm', { pitch: 45, up: -0.2, fwd: 0.01 }, 'edit');
+  assert.deepEqual({ ...clamped }, { pitch: 30, up: -0.04, fwd: 0.01 });
+  const json = W.fitsJSON();
+  const S2 = setup();
+  assert.equal(S2.W.loadFits(json), true);
+  assert.equal(S2.W.fitSource, 'saved');
+  assert.deepEqual(S2.W.getFit('akm'), { pitch: 30, up: -0.04, fwd: 0.01 });
+  assert.ok(S2.W.akm.view.fitPos.distanceTo(W.akm.view.fitPos) < 1e-9);
+  assert.equal(S2.W.loadFits('{garbage'), false);
+  assert.equal(S2.W.fitSource, 'default');
+  const rep = W.fitReport();
+  assert.equal(rep.fitVersion, 2);
+  assert.equal(rep.source, 'edit');
+  assert.equal(rep.edits, 3);
+  assert.equal(rep.glock.quat.length, 4);
+  assert.ok(rep.rayRel.right && Math.abs(rep.rayRel.right.rayPitchDeg - 45) < 0.5 && Math.abs(rep.rayRel.right.rayYawDeg) > 6,
+    `learned grip → ray: ${JSON.stringify(rep.rayRel.right)}`);
+  R.set(1, 0); S.step(1);
+});
+
+test('CQC face buttons: X / Y work with the left hand on the gun; B on the AKM is the selector; free-hand X / Y do nothing', () => {
+  const S = setup();
+  const { W, L, R } = S;
+  R.pose(backPoint(W).addScaledVector(v3(...W.body.backAxis), 0.1), new THREE.Quaternion());
+  R.set(1, 1); S.step(3);
+  R.pose(AIM_POS, rayFor(W.akm)); S.step(30);
+  const a = W.akm;
+  assert.equal(a.inst.mode, 'semi');
+  // free left hand: X / Y belong to the game, not the gun
+  L.set(5, 1); S.step(1); L.set(5, 0); S.step(1);
+  L.set(4, 1); S.step(1); L.set(4, 0); S.step(1);
+  assert.equal(a.inst.mode, 'semi');
+  assert.equal(a.inst.magSeated, true);
+  assert.equal(W.onGunLeft, false);
+  // B on the AKM: selector (it has no slide release)
+  R.set(5, 1); S.step(1); R.set(5, 0); S.step(1);
+  assert.equal(a.inst.mode, 'safe');
+  // left hand on the handguard: Y = selector, X = magazine release
+  L.pose(a.view.toWorld(a.view.support, v3()), new THREE.Quaternion());
+  L.set(1, 1); S.step(2);
+  assert.equal(W.onGunLeft, true);
+  assert.equal(W.busyLeft, true);
+  assert.equal(W.busyRight, true);
+  L.set(5, 1); S.step(1); L.set(5, 0); S.step(1);
+  assert.equal(a.inst.mode, 'auto', 'Y on the gun works the selector');
+  L.pulses.length = 0;
+  L.set(4, 1); S.step(1); L.set(4, 0); S.step(1);
+  assert.equal(a.inst.magSeated, false, 'X on the gun drops the magazine');
+  assert.ok(L.pulses.some(([v, ms]) => v === HAPTIC.magCatch[0] && ms === HAPTIC.magCatch[1]), 'catch felt in the pressing hand');
+  assert.equal(W.fx.mags.akm.count, 1);
+  // the magazine leaves the well at 1.1 m/s (CQC) plus the gun's motion (still here)
+  const V = W.fx.mags.akm.vel;
+  const sp = Math.hypot(V[0], V[1], V[2]);
+  assert.ok(sp > 1.0 && sp < 1.3, `drop speed ${sp}`);
+});
+
+test('B on the Glock releases a locked slide only; the right stick still works the AKM selector', () => {
+  const S = setup();
+  const { W, R } = S;
+  drawGlock(S);
+  R.set(5, 1); S.step(1); R.set(5, 0); S.step(5);
+  assert.equal(W.glock.inst.chamber, 1, 'nothing happens on a closed slide');
+  assert.equal(W.glock.inst.mode, 'semi');
+});
+
+test('AKM magazine strip: a free left hand squeezing the lower 75 % of the seated magazine takes it with its rounds; it must leave the well first', () => {
+  const S = setup();
+  const { W, L, R } = S;
+  R.pose(backPoint(W).addScaledVector(v3(...W.body.backAxis), 0.1), new THREE.Quaternion());
+  R.set(1, 1); S.step(3);
+  R.pose(AIM_POS, rayFor(W.akm)); S.step(30);
+  const a = W.akm, v = a.view;
+  R.set(0, 1); S.step(1); R.set(0, 0); S.step(8);   // one shot: 29 + 1
+  assert.equal(a.inst.magRounds, 29);
+  const low = v.toWorld(v3(v.magCentre.x + v.mag.position.x, v.magCentre.y - v.magHalf.y * 0.5 + v.mag.position.y, v.magCentre.z + v.mag.position.z + v.magHalf.z + 0.03), v3());
+  L.pose(low, new THREE.Quaternion());
+  L.pulses.length = 0;
+  L.set(1, 1); S.step(2);
+  assert.equal(a.inst.magSeated, false, 'stripped');
+  assert.equal(W.handMag, a);
+  assert.equal(W.handMagRounds, 29, 'with its rounds');
+  assert.equal(W.fx.mags.akm.count, 0, 'into the hand, not onto the floor');
+  assert.ok(L.pulses.some(([x, ms]) => x === HAPTIC.strip[0] && ms === HAPTIC.strip[1]));
+  assert.ok(S.sounds.some((s) => s.key === 'akMagOut'));
+  S.step(10);
+  assert.ok(v.handMag.visible);
+  assert.equal(a.inst.magSeated, false, 'not re-seated in the same grab');
+  // squeezing at the top of the magazine (near the well) is not a strip
+  const S2 = setup();
+  S2.R.pose(backPoint(S2.W).addScaledVector(v3(...S2.W.body.backAxis), 0.1), new THREE.Quaternion());
+  S2.R.set(1, 1); S2.step(3); S2.R.pose(AIM_POS, rayFor(S2.W.akm)); S2.step(30);
+  const v2 = S2.W.akm.view;
+  S2.L.pose(v2.toWorld(v3(0, v2.magCentre.y + v2.magHalf.y + v2.mag.position.y + 0.04, v2.mag.position.z), v3()), new THREE.Quaternion());
+  S2.L.set(1, 1); S2.step(2);
+  assert.equal(S2.W.akm.inst.magSeated, true, 'top of the magazine: no strip');
+});
+
+test('rack reach: AKM 0.10 m (Glock 0.085), +0.02 unchambered or locked; a tick when a free hand comes into reach', () => {
+  const S = setup();
+  const { W, L, R } = S;
+  drawGlock(S);
+  const g = W.glock, v = g.view;
+  const rp = v.toWorld(v.rackLocal(0, v3()), v3());
+  const side = v.dirWorld(v3(1, 0, 0), v3());
+  L.pose(rp.clone().addScaledVector(side, 0.095), new THREE.Quaternion());
+  L.pulses.length = 0;
+  S.step(2);
+  assert.equal(L.pulses.length, 0, '9.5 cm: out of the Glock reach');
+  g.inst.reset(17, false);   // unchambered: +2 cm
+  S.step(2);
+  assert.ok(L.pulses.some(([x, ms]) => x === HAPTIC.rackHover[0] && ms === HAPTIC.rackHover[1]), 'hover tick');
+  const n = L.pulses.length;
+  S.step(5);
+  assert.equal(L.pulses.length, n, 'one tick per entry');
+  L.set(1, 1); S.step(1);
+  assert.equal(W.lRole, 1, 'rack grip at 9.5 cm with an empty chamber');
+  L.set(1, 0); S.step(2);
+  assert.equal(W._rackReach(W.akm), 0.10);
+});
+
+test('gun–wall push-back: the bore never passes through a wall; the gun slides back along it with one tick, and returns', async () => {
+  const S = setup();
+  const { W, R } = S;
+  drawGlock(S);
+  const v = W.glock.view;
+  const free = v.root.position.clone();
+  // walk the hand up to the wall at z = −5: the palm 6 cm from it
+  R.pulses.length = 0;
+  const near = v3(AIM_POS.x, AIM_POS.y, -5 + 0.06);
+  R.pose(near, rayFor(W.glock));
+  S.step(3);
+  const mz = v.toWorld(v.muzzle, v3());
+  assert.ok(mz.z >= -5 + 0.019, `muzzle stays 2 cm off the wall: z ${mz.z}`);
+  assert.ok(W.glock.wallPush > 0.05, `slid back ${W.glock.wallPush}`);
+  const back = v.dirWorld(v3(0, 0, 1), v3());
+  const expect = near.clone().sub(v.palm.clone().applyQuaternion(v.root.quaternion)).addScaledVector(back, W.glock.wallPush);
+  assert.ok(v.root.position.distanceTo(expect) < 1e-4, 'along the bore');
+  assert.equal(R.pulses.filter(([x, ms]) => x === HAPTIC.wall[0] && ms === HAPTIC.wall[1]).length, 1, 'one haptic tick');
+  S.step(10);
+  assert.equal(R.pulses.filter(([x]) => x === HAPTIC.wall[0]).length, 1, 'no repeat while touching');
+  // allocation-free while pushing
+  REC.on = false;
+  let i = 0;
+  const run = (n) => { for (let k = 0; k < n; k++, i++) { near.z = -5 + 0.05 + 0.03 * Math.sin(i * 0.1); R.pose(near, rayFor(W.glock)); S.step(1); } };
+  near.z = -5 + 0.06;
+  const rq = rayFor(W.glock);
+  const run2 = (n) => { for (let k = 0; k < n; k++, i++) { near.z = -5 + 0.05 + 0.03 * Math.sin(i * 0.1); R.pose(near, rq); S.step(1); } };
+  run2(2000);
+  const { bytes, by } = await sampled(() => run2(4000));
+  REC.on = true;
+  assert.equal(bytes, 0, JSON.stringify(by));
+  void run;
+  // away from the wall it slides forward again
+  R.pose(AIM_POS, rayFor(W.glock));
+  S.step(60);
+  assert.ok(W.glock.wallPush < 1e-4 && v.root.position.distanceTo(free) < 1e-3, 'back in the hand');
+});
+
+test('seated: the holster (and its shell) move onto the right thigh; the slung AKM stays reachable over the shoulder', () => {
+  const S = setup();
+  const { W, R, ctx } = S;
+  const standing = holsterPoint(W);
+  ctx.player.eye.y = 1.2;
+  S.step(Math.ceil(1.6 / DT));
+  assert.equal(W.body.seated, true);
+  S.step(Math.ceil(0.5 / DT));
+  const seated = holsterPoint(W);
+  assert.ok(seated.y < standing.y - 0.3 && seated.z < standing.z - 0.05, `thigh socket ${seated.toArray()} vs hip ${standing.toArray()}`);
+  const mzDir = W.glock.view.dirWorld(v3(0, 0, -1), v3());
+  assert.ok(mzDir.z < -0.9, 'muzzle toward the knee');
+  assert.ok(W.holster.position.distanceTo(W.glock.view.root.position) < 1e-9);
+  R.pose(holsterPoint(W), new THREE.Quaternion()); R.set(1, 1); S.step(3);
+  assert.equal(W.held, W.glock, 'drawn from the thigh');
+  assert.ok(W.holster.visible, 'the empty holster stays');
+  assert.equal(W.fitReport().seated, true);
+  W.setStance('standing'); S.step(Math.ceil(0.5 / DT));
+  assert.equal(W.body.seated, false);
+});
+
+test('gloves: the right one while held, the left one with the left hand on the AKM handguard; shared program key; off on request', () => {
+  const S = setup();
+  const { W, L, R } = S;
+  const g = W.glock.view, a = W.akm.view;
+  assert.ok(g.handR && a.handR && a.handL && !g.handL, 'hands taken from the GLB scenes');
+  assert.equal(g.handR.parent, g.root, 'child of the gun root (moves with recoil)');
+  assert.equal(g.handR.material.customProgramCacheKey(), PART_KEY, 'same program key as the gun');
+  for (const h of [g.handR, a.handR, a.handL]) assert.equal(h.material.side, THREE.DoubleSide, 'double-sided from load: the glove shell is open at the cuff');
+  const shader = { uniforms: {}, vertexShader: THREE.ShaderLib.physical.vertexShader, fragmentShader: THREE.ShaderLib.physical.fragmentShader };
+  g.handR.material.onBeforeCompile(shader, null);
+  assert.equal(shader.uniforms.uPart, g.uPart, 'the index tip follows the trigger part');
+  assert.equal(g.handR.visible, false, 'holstered: no glove');
+  drawGlock(S);
+  assert.equal(g.handR.visible, true, 'held: glove');
+  W.setGloves(false); S.step(1);
+  assert.equal(g.handR.visible, false, 'gloves off');
+  W.setGloves(true); S.step(1);
+  R.set(1, 0); S.step(40);
+  assert.equal(g.handR.visible, false, 'let go: no glove');
+  R.pose(backPoint(W).addScaledVector(v3(...W.body.backAxis), 0.1), new THREE.Quaternion());
+  R.set(1, 1); S.step(3);
+  R.pose(AIM_POS, rayFor(W.akm)); S.step(30);
+  assert.equal(a.handR.visible, true);
+  assert.equal(a.handL.visible, false, 'no left glove without the support hand');
+  assert.equal(W.supportGlove, false, 'support glove off by default until re-posed');
+  W.supportGlove = true;
+  L.pose(a.toWorld(a.support, v3()), new THREE.Quaternion()); L.set(1, 1); S.step(3);
+  assert.equal(a.handL.visible, true, 'left glove on the handguard');
+  L.set(1, 0); S.step(2);
+  assert.equal(a.handL.visible, false);
+  // aimRayFor: the e2e driver's way to point the held bore
+  const q = new THREE.Quaternion(), dir = v3(0.1, 0.2, -1).normalize();
+  assert.ok(W.aimRayFor(dir.x, dir.y, dir.z, q));
+  R.pose(AIM_POS, q); S.step(3);
+  assert.ok(a.dirWorld(v3(0, 0, -1), v3()).angleTo(dir) < 1e-3, 'bore along the asked direction');
+  const up = a.dirWorld(v3(0, 1, 0), v3());
+  assert.ok(Math.abs(up.x) < 0.02, 'upright (no cant)');
+});
+
 const PROFILED = ['/src/weapons/WeaponSystem.js', '/src/weapons/WeaponView.js', '/src/weapons/WeaponFX.js', '/src/player/BodyEstimator.js', '/src/player/Slots.js', '/src/player/Handling.js'];
 
 /**
@@ -617,6 +952,9 @@ async function sampled(run) {
   let best = Infinity, by = null, events = 0;
   for (let r = 0; r < 5 && best > 0; r++) {
     globalThis.gc?.();
+    // after a GC, code that embedded objects of earlier tests is deoptimised lazily; let it
+    // re-optimise before sampling, so only steady-state per-frame allocations count
+    if (r > 0) run();
     const ses = new Session();
     ses.connect();
     await ses.post('HeapProfiler.startSampling', { samplingInterval: 16 });
@@ -722,9 +1060,10 @@ test('a full handling cycle allocates only the boxed numbers handed to the audio
       if (c >= 310 && c < 320) { L.pose(pouch(), Q0); L.set(1, c >= 312 ? 1 : 0); }
       if (c >= 320 && c < 400) {
         const d = -0.06 + (c - 320) * 0.001;
-        v.toWorld(v.palm, tmp2).addScaledVector(v.dirWorld(v.magAxis, tmp), d);
+        v.toWorld(v.magSeat, tmp2).addScaledVector(v.dirWorld(v.magAxis, tmp), d);
         lq.copy(v.root.quaternion);
-        L.pose(tmp2, lq);
+        const h = magHand(w, tmp2, lq);
+        L.pose(h.p, h.q);
       }
       if (c >= 400 && c < 420) { v.toWorld(v.rackLocal(0, tmp), tmp2); L.pose(tmp2, Q0); L.set(1, c >= 402 ? 1 : 0); }
       if (c >= 420 && c < 440) { v.toWorld(v.rackLocal((c - 420) / 19, tmp), tmp2); L.pose(tmp2, Q0); }
@@ -736,7 +1075,7 @@ test('a full handling cycle allocates only the boxed numbers handed to the audio
       R.pose(AIM_POS, q);
       if (c >= 650 && c < 900) R.set(0, (c % 12) < 2 ? 1 : 0);
       if (c === 900 || c === 910) R.set(4, 1);
-      if (c === 901 || c === 911) R.set(4, 0);
+      if (c === 901 || c === 990) R.set(4, 0);   // tap: drop; hold 0.9 s: assisted reload
       if (c >= 1080 && c < 1150) R.pose(holsterPoint(W), Q0);
     } else if (c === 1150) R.set(1, 0);
     if (c === 1199) { W.akm.inst.reset(30, true, 'auto'); W.glock.inst.reset(); }

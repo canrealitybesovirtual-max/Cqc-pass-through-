@@ -6,7 +6,8 @@
 export class Lifecycle {
   /**
    * @param {{ onEnd: () => void, onVisibility: (state: string) => void,
-   *   onReset: (hasTransform: boolean) => void, onInputs: (added: number, removed: number) => void }} cb
+   *   onReset: (e: { transform?: XRRigidTransform|null }|null) => void, onInputs: (added: number, removed: number) => void }} cb
+   *   onReset gets the XRReferenceSpaceEvent itself (its `transform`: the new origin in the old space, or null)
    */
   constructor(cb) {
     this.cb = cb;
@@ -14,7 +15,7 @@ export class Lifecycle {
     /** @type {XRReferenceSpace|null} */ this.space = null;
     this._end = () => this.cb.onEnd();
     this._vis = () => this.session && this.cb.onVisibility(this.session.visibilityState);
-    this._reset = (/** @type {any} */ e) => this.cb.onReset(!!(e && e.transform));
+    this._reset = (/** @type {any} */ e) => this.cb.onReset(e || null);
     this._inputs = (/** @type {any} */ e) => this.cb.onInputs(e.added ? e.added.length : 0, e.removed ? e.removed.length : 0);
   }
 
