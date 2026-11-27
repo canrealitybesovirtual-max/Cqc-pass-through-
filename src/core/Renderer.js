@@ -36,10 +36,19 @@ export function createRenderer({ dev }) {
   const hemi = new THREE.HemisphereLight(0xdfe8ff, 0x3a3026, 1.6);
   const sun = new THREE.DirectionalLight(0xffffff, 1.4);
   sun.position.set(0.6, 1.0, 0.4);
+  // Two pooled point lights for muzzle flashes (player + nearest enemy). They always
+  // exist with intensity 0 so the light count (part of every program key) never changes.
+  /** @type {THREE.PointLight[]} */
+  const flashLights = [0, 1].map(() => {
+    const l = new THREE.PointLight(0xffc27a, 0, 4, 2);
+    l.castShadow = false;
+    scene.add(l);
+    return l;
+  });
   scene.add(hemi, sun);
 
   // Only used outside XR; inside XR three.js drives its own ArrayCamera.
   const camera = new THREE.PerspectiveCamera(70, 1, 0.05, 50);
 
-  return { renderer, scene, camera, gl, canvas };
+  return { renderer, scene, camera, gl, canvas, hemi, sun, flashLights };
 }
