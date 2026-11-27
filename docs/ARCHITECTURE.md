@@ -11,61 +11,81 @@ Quest 3 mixed-reality tactical FPS. three.js r187 (`WebGLRenderer`, WebGL2) and 
   - Nothing compiles, uploads or decodes mid-play.
   - Storage is written only at session end or pause.
   - Work over 2 ms goes to a worker.
-- **Pure logic stays testable.** Modules in `app/Game.js`, `xr/XRSession.js`, `debug/PerfMonitor.js` and `util/` import neither three.js nor the DOM, so `node --test` covers them.
+- **Pure logic stays testable.** Modules in `app/Game.js`, `xr/XRSession.js`, `xr/LiveDepth.js`, `debug/PerfMonitor.js`, `util/` and the pure parts of `world/`, `weapons/`, `player/`, `enemies/`, `game/` import neither three.js nor the DOM, so `node --test` covers them.
 
-## Phase 1 runtime
+## Runtime (v0.2)
 
 ```
 index.html ── import map: three → vendor/three/three.module.js, three/addons/ → vendor/three/addons/
-  └ src/main.js            boot: optional IWER (?emulate), support check, renderer, App, HomePage, preload
-     ├ core/Preload.js     before Enter: Assets.load → AudioEngine.decodeAll → buildPools hook → warmUp
+  └ src/main.js            boot: optional IWER (?emulate), support check, renderer, App, HomePage, preload;
+     │                     buildPools hook = new PlayKit (the whole game, once); ?emulate fixture / snapshot replay
+     ├ core/Preload.js     before Enter: Assets.load → AudioEngine.decodeAll → buildPools → warmUp
      ├ core/Warmup.js      warmUp (pre-XR compile + uploads + draw), warmXR (one XR-frame draw), assertStable
-     └ app/App.js          composition root; one XR session at a time
+     └ app/App.js          composition root; one XR session at a time; probe-style or play sessions
         ├ app/Game.js      state machine boot → menu → entering → xr → menu (+ pause reasons)
-        ├ app/Loop.js      XR frame loop; systems timed by PerfMonitor; dt clamp; per-frame try/catch
+        ├ app/Loop.js      XR frame loop; systems get (dt, t, frame, ctx); timed by PerfMonitor; dt clamp;
+        │                  per-frame try/catch; LiveDepth.update + explicit clear + render
+        ├ app/Play.js      PlayKit: Ctx, events, world, player, weapons, enemies, game, HUD (built at load);
+        │                  per session: capture → build → XR warm draw → round
         ├ core/Renderer.js WebGL2 context (xrCompatible) + WebGLRenderer + fixed light set
         ├ xr/XRSession.js  modes (play, setup, probe, bounds, reduced, vr), feature lists, attach
-        ├ xr/Input.js      controller buttons → per-hand state + press edges (allocation-free)
+        ├ xr/Input.js      controller buttons, grip + ray poses → per-hand state + press edges (allocation-free)
         ├ xr/Lifecycle.js  end, visibilitychange, reference-space reset, input changes
-        ├ debug/CapabilityLog.js  what was asked and granted; layer; GL extensions
-        ├ debug/Probes.js  device probes: Space Setup, anchors, hit-test, depth, light, body, bounds,
-        │                  frame-rate switch, 60 s timing runs, explicit-clear toggle, grip exit
-        ├ debug/PerfMonitor.js    rings, histograms, hitch log, run gate
-        ├ debug/Diagnostics.js    localStorage (at session end) + copy / download / share JSON
-        ├ debug/DebugDraw.js      controller rays, hit-test reticle
-        ├ debug/TestCube.js       world-locked test cube (+ grid in VR)
-        ├ ui/CanvasPanel.js       in-headset text panel: redraw on change, no mipmaps, tag-along
-        └ ui/HomePage.js          2D page: load bar, start buttons, retry, diagnostics summary
+        ├ xr/LiveDepth.js  keeps three's depth texture on this frame's texture; depth diagnostics
+        ├ xr/DepthOcclusion.js  soft-edge live-depth occlusion (opt-in, not wired)
+        ├ world/           Space Setup snapshot, layout, analytic shapes, nav grid, A*, spawns, occluder
+        ├ game/            Player, survival rules, GameSession (ring, tint, messages)
+        ├ weapons/, player/  WeaponSystem (both guns, slots, hands, shots, FX), mechanism, recoil, body estimate
+        ├ enemies/         EnemyManager (pool, brain, procedural animation, hit capsules, muzzle flash)
+        ├ audio/           AudioEngine (voice pool, HRTF, reverb, occlusion)
+        ├ ui/              CanvasPanel, WristHud, HomePage
+        └ debug/           CapabilityLog, Probes, PerfMonitor, Diagnostics, DebugDraw, TestCube, DepthView
 ```
+
+### Two kinds of session
+
+| | Probe-style (`probe`, `bounds`, `vr`) | Play (`play`, and `reduced`, its fallback request) |
+|---|---|---|
+| Systems (PerfMonitor names) | `input`, `probe`, `ui`, `render` | `input`, `world`, `player`, `weapons`, `enemies`, `game`, `audio`, `ui`, `render` (CONTRACTS order) |
+| Content | test cube, controller rays, hit-test reticle, info panel (34° left of ahead), depth picture (Y) | the game; App's opaque "Get ready" panel until the round starts |
+| Buttons | A timing run, B rate, X clear, Y depth picture, both grips exit | weapon buttons (A, B, stick, trigger, grips); hold Y 2 s or wrist X 1 s exits |
+| Timing run | A (60 s) | starts with wave 1 (60 s) |
+| Record extras | `probes.*`, `probes.liveDepth` | `spaceSnapshot`, `play` (capture, world build + report, round summary), `warmXR`, `systemsMs` |
 
 ### Frame order
 
-Each XR frame runs these systems in order, each timed separately:
+Each XR frame runs the session's systems in order, each timed separately; `renderer.info` is reset once per frame. The Loop passes the shared Ctx (CONTRACTS "Ctx"; null in probe sessions) as the 4th argument. The `render` step runs `LiveDepth.update` (only when depth was granted), the explicit clear when depth sensing is on, then `renderer.render`.
 
-1. `input`
-2. `probe`: probes, then the test cube
-3. `ui`: rebuilds the panel text only when `probes.rev` changes; follow; flush
-4. `render`: an explicit clear when depth sensing is on, then `renderer.render`
+In play, the `player` step also runs `game.preUpdate` (GameSession's pause and freeze decisions, through its PauseManager) so they come before `weapons` and `enemies`; `enemies` is stepped with dt = 0 while `game.freezeEnemies` is set. `game.update` then runs in its own step after the enemies.
 
-Each system is timed separately, and `renderer.info` is reset once per frame.
+### Play session start
 
-### Session start
+1. The click handler calls `requestXR` synchronously (the user gesture); `audio.unlock()` runs in the same click.
+2. When the promise resolves: the `Loop` starts **before** `setSession`, `attachSession` sets space, scale and foveation and calls `setSession`; everything after it is in one try: a start error ends the session and returns to the menu with a record.
+3. `PlayKit.begin`: Ctx gets the session and space; the player resets; the capture gate resets.
+4. `world` system, frame by frame:
+    1. **capture:** once the Space Setup plane count has been stable for 0.5 s (or after 3 s), `captureSnapshot(frame, space)` copies planes and meshes (`?emulate`: the house fixture). The snapshot goes into `rec.spaceSnapshot`.
+    2. **build:** `world.build(snapshot, head)` once, synchronously, behind App's opaque "Get ready" panel.
+    3. **warm:** next frame, every pool is drawn once into the XR framebuffer (`warmXR`, before that frame's render, which clears and draws over it) and the baseline moves to include XR's own resources.
+    4. **start:** the frame after, `game.start(world.zone)`: the safe zone is where you stand; GameSession shows "Get ready", then the waves.
+5. Session end: the round summary goes into `rec.play`, the record is saved, every pool is reset and hidden.
 
-1. The click handler calls `requestXR` synchronously, so the user gesture is kept.
-2. When the promise resolves:
-    1. The `Loop` starts **before** `setSession`, because three.js stops its window rAF loop on `sessionstart`. The loop ignores calls without an `XRFrame`.
-    2. `attachSession` requests the reference space first, falling back to `local-floor`.
-    3. It then sets the space, scale and foveation, and calls `setSession`.
-3. The capability log is collected, and the lifecycle listeners and probes are attached.
+### Shared runtime context (Ctx)
+
+Built once by PlayKit: `renderer, scene, camera (renderer.xr.getCamera()), session, space, input, events, audio, world, assets, gfx.flashLights, player, raycast`. `raycast` is the world first (walls, furniture, floor, ceiling) and then the enemies, limited to the world hit's distance; both write the hit record only on a hit. EnemyManager applies `enemyHit` itself (bound to the event bus), so WeaponSystem gets no `enemies` option.
 
 ### Preload and warm-up (before Enter)
 
 1. `main.js` starts `preload()` (`core/Preload.js`) once the support check shows AR or VR. The page shows "Loading n%"; every session button stays disabled until the warm-up has drawn, because its default-framebuffer draw must not overlap XR.
-2. `Assets.load` (75 % of the bar), then `AudioEngine.decodeAll` (10 %; the context stays suspended until `audio.unlock()` inside the Enter click, which `HomePage.onEnter` does for play modes), then the `buildPools(assets, audio)` hook, then `warmUp` (15 %).
+2. `Assets.load` (75 % of the bar), then `AudioEngine.decodeAll` (10 %; the context stays suspended until `audio.unlock()` inside the Enter click), then the `buildPools` hook: `new PlayKit(...)` builds the world (and runs `world.warmUp()` so the session's build runs on optimised code), the player, WeaponSystem (both guns, FX pools), EnemyManager (6 prebuilt soldiers), GameSession, WristHud; `setWarm(true)` shows every pool. Then `warmUp` (15 %), then `setWarm(false)`.
 3. `warmUp(renderer, scenes, objects)`: orphans are attached to the main scene (its fixed light set is part of every program key) and `setColorAt(0, white)` primes instanced pools; `compile` per scene (`compileAsync` only when `KHR_parallel_shader_compile` exists, which the Quest lacks); `initTexture` per texture, one per frame and ≥ 30 ms apart; one `render` per scene to the default framebuffer with every drawable, ancestor and LOD level forced visible and culling off; then every flag is restored and the orphans detached. The program, texture and geometry counts become the baseline.
 4. Enter MR is enabled only when this succeeded. On failure the page shows the error and keeps the probe sessions usable.
 5. The result is `preloaded` (exported by `core/Preload.js`, also `window.__app.preload`): `assets`, `audio`, `warm` (the baseline), `warmed` (the objects drawn), and a summary in the diagnostics JSON (`preload`).
-6. In a play session App calls `warmXR(renderer, scene, camera, pools)` inside the first XR frame (before the frame's render, behind the opaque "Get ready" panel) and `assertStable(renderer)` in dev builds.
+6. Dev builds call `assertStable` once a second during play (after the XR warm draw) and record any growth in `rec.warmGrowth`.
+
+### Live depth (probe sessions; play with the future "Dynamic occlusion" setting)
+
+three r187 draws its occlusion pass (a full-screen quad writing `gl_FragDepth`) when `depth-sensing` is granted with `gpu-optimized` usage and `getDepthInformation` returns a valid texture. It wraps that texture ONCE, on the first valid frame. `LiveDepth` wraps the binding's `getDepthInformation` at session start, sees the depth information three asks for in its own frame setup, and before each render points three's ExternalTexture at this frame's texture (`sourceTexture`; nothing compiles or uploads). It also turns off the quad's colour writes (its shader never writes a colour). It counts valid frames and texture changes for the probe panel and `rec.probes.liveDepth`. The probe's depth picture (`debug/DepthView.js`, warmed at load) draws the same texture as a colour ramp.
 
 ### Known three.js r187 behaviours we design around (verified in source)
 
@@ -74,12 +94,15 @@ Each system is timed separately, and `renderer.info` is reset once per frame.
 - `getFoveation()` returns three's own cached value. The capability log reads the layer instead.
 - `setAnimationLoop` while presenting also starts the window rAF loop, hence the start order above.
 - three dispatches a `planesdetected` event object every frame when `frame.detectedPlanes` exists. This is a small amount of garbage inside three.
+- `WebXRDepthSensing.init` wraps the first valid depth texture once and never refreshes it (the camera-access path does refresh); its quad's fragment shader writes no colour. See "Live depth".
+- The depth quad's `ShaderMaterial` and `PlaneGeometry` are created lazily on the first depth frame, so a probe session compiles one program then (play sessions have no depth). `reset()` at session end drops them without `dispose()`, so the geometry count grows by one per depth session.
 
 ## Hosting and testing
 
 - **Production:** a Render static site from `main` (`render.yaml`). It sends `Cache-Control: no-cache` and `Permissions-Policy: xr-spatial-tracking=(self)`. The origin must never change, because rooms and anchors belong to it.
 - **Desktop:**
     - `npm test` runs the Node unit tests.
-    - `node tests/e2e/emulate.mjs` runs Playwright with IWER.
-    - `node tools/serve.mjs` then `http://localhost:8080/?emulate` runs the page in the emulator.
-- **Headset:** open the Render URL in the Quest Browser and follow the on-page Phase 1 tests. Then copy the diagnostics JSON into the chat.
+    - `NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs` runs Playwright with IWER: preload, probe (with fake per-frame depth), a play round (draw, fire, hit, reload, AKM), VR, the reduced retry and a failed load. It prints the play session's CPU per frame and draw calls.
+    - `NODE_PATH=$(npm root -g) node tests/e2e/depth-occlusion.mjs` checks the soft-occlusion shaders on the GPU path.
+    - `node tools/serve.mjs` then `http://localhost:8080/?emulate` runs the page in the emulator (the house fixture). `?emulate&snapshot=<url>` plays in a saved snapshot or a diagnostics export (your real house); `?emulate&replay` uses the newest snapshot in this browser's diagnostics.
+- **Headset:** open the Render URL in the Quest Browser and follow the on-page tests. Then copy the diagnostics JSON into the chat.

@@ -45,8 +45,8 @@ Desktop means headless Chromium with SwiftShader and Meta's IWER emulator (`NODE
 | Preload before Enter: assets, audio decode, the whole game built, warm-up, with "Loading n%" | desktop-tested | IWER e2e: reaches 100 %; every session button disabled while loading; Enter MR enabled only after the warm-up draw. Device load time pending |
 | The game built once at load (`src/app/Play.js`): world + occluder, player, both guns + FX pools, 6-soldier pool, game session, wrist HUD | desktop-tested | IWER e2e: every pool is in the warm-up draw, then hidden again |
 | Load failure: error shown, Enter MR off, probe sessions usable | desktop-tested | IWER e2e with a missing model |
-| `warmUp`: compile, one upload per frame ≥ 30 ms apart, forced-visible default-framebuffer draw, flags restored, baseline | desktop-tested | 17 programs, 24 textures, 21 geometries, 38 drawables in IWER |
-| `warmXR`: one draw of every pool inside the first XR frames of a play session, behind the opaque "Get ready" panel | desktop-tested | IWER e2e: 38 drawables, 0 new programs |
+| `warmUp`: compile, one upload per frame ≥ 30 ms apart, forced-visible default-framebuffer draw, flags restored, baseline | desktop-tested | 18 programs, 24 textures, 24 geometries, 41 drawables in IWER (the count moves as modules add meshes) |
+| `warmXR`: one draw of every pool inside the first XR frames of a play session, behind the opaque "Get ready" panel | desktop-tested | IWER e2e: 41 drawables, 0 new programs |
 | Programs, textures and geometries flat through a play round | desktop-tested | IWER e2e (draw, fire, hits, reload, AKM burst, 4 enemies). Dev builds check once a second and record growth in `rec.warmGrowth`. Device check pending |
 
 ### Play session
@@ -57,6 +57,7 @@ Desktop means headless Chromium with SwiftShader and Meta's IWER emulator (`NODE
 | Space Setup capture once (plane count stable 0.5 s, or 3 s) → `captureSnapshot` → `rec.spaceSnapshot` | implemented | Capture code Node-tested by the world builder; IWER has no scene data, so `?emulate` plays in `tests/fixtures/house.json`. Device test pending |
 | World build at session start (walls, doors, furniture boxes, nav grid, spawns, depth-only occluder) behind "Get ready" | desktop-tested | Fixture house in IWER (5 ms build on desktop). Real-house build time on Quest pending. `rec.play.world.report` lists what was built |
 | Desktop replay of a captured house: `?emulate&snapshot=<url>` (a snapshot or a diagnostics export) or `?emulate&replay` | implemented | Not in the e2e |
+| GameSession's pause and freeze decisions before weapons and enemies (`game.preUpdate` in the player step; enemies stepped with dt = 0 while `freezeEnemies`) | desktop-tested | IWER e2e. The pause rules themselves (`src/safety/`) were being reworked by another builder during this integration; the spot-confirmation step (`game.pickSpot`) is not wired: the round starts where you stand |
 | Survival waves, safe zone ring and pause, Y restart, hold Y 2 s to exit, wrist-X exit | desktop-tested | Rules and session in Node tests (builder G); e2e: wave 1 starts, exit by holding Y |
 | Enemies spawn out of view, walk in through doors, shoot (playerHit), die | desktop-tested | IWER e2e and Node tests (builder E). Difficulty is untuned for the headset: they hit a standing player with nearly every round |
 | Glock: draw from the right hip, trigger fires, hit an enemy, A magazine drop, A again = assisted reload, let go at the hip to holster | desktop-tested | IWER e2e drives the real controllers |
@@ -67,7 +68,7 @@ Desktop means headless Chromium with SwiftShader and Meta's IWER emulator (`NODE
 | Wrist HUD (wave, health, kills, ammo) | desktop-tested | IWER e2e: shown on the left grip. Legibility on device pending |
 | 60 s timing run starts with wave 1 (replaces the Phase 1 A button, now a weapon button) | implemented | Result in `rec.perfRuns` |
 | Draw calls with 4 enemies in view | desktop-tested | 34 per frame for both eyes (17 per eye) in IWER; contract limit 60 |
-| CPU per frame | desktop-tested | ~1.7–1.8 ms on desktop for the whole frame callback; Quest numbers come from `rec.perfRuns` and `rec.systemsMs` |
+| CPU per frame | desktop-tested | 1.7–2.2 ms average on desktop for the whole frame callback (render 1.2, enemies 0.4–0.6, weapons 0.2–0.3); Quest numbers come from `rec.perfRuns` and `rec.systemsMs` |
 | First-person second pass (`fpScene`) for depth sessions | planned | Play has depth sensing off (DECISIONS), so the gun is drawn in the main scene |
 | "Dynamic occlusion" setting for play (`cfg.depth`) | planned | |
 

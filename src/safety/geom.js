@@ -114,7 +114,8 @@ export function nearestFootprint(shapes, x, z, maxY, idxOut = null) {
 
 /**
  * Is the straight walk a→b free of box footprints (starting below `maxY`,
- * grown by `pad`)? Box `skip` is ignored (−1 = none).
+ * grown by `pad`)? A box the start point already touches (within `pad`) is
+ * ignored, so a player standing against a wall can still be sent away from it.
  * @param {{ box: Float32Array, count: number }|null|undefined} shapes
  * @param {number} ax @param {number} az @param {number} bx @param {number} bz
  * @param {number} maxY @param {number} pad
@@ -124,6 +125,7 @@ export function walkClear(shapes, ax, az, bx, bz, maxY, pad) {
   const B = shapes.box, n = shapes.count;
   for (let i = 0, o = 0; i < n; i++, o += BOX_STRIDE) {
     if (!(B[o + 6] < maxY)) continue;
+    if (footprintDistance(B, o, ax, az) <= pad) continue;
     if (segmentHitsFootprint(B, o, ax, az, bx, bz, pad)) return false;
   }
   return true;

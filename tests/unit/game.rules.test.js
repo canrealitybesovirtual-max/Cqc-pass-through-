@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Session } from 'node:inspector/promises';
 import { MSG, PAUSE, PHASE, RULES, SurvivalRules } from '../../src/game/Rules.js';
+import { pauseIndex } from '../../src/safety/PauseManager.js';
 
 /**
  * Bytes the V8 sampling heap profiler attributes to each function of `file`
@@ -208,7 +209,7 @@ test('Y tap does nothing outside round over; holding Y 2 s exits once, in any ph
   assert.deepEqual(b.h.exits, ['holdY']);
 });
 
-test('safe zone: head beyond r pauses; resume after 0.5 s inside, then 3-2-1; leaving again restarts it', () => {
+test('safe zone: head beyond r pauses; resume = 0.5 s inside, the Resume press, then 3-2-1; leaving again restarts it', () => {
   const { rules, h } = make();
   rules.start();
   run(rules, RULES.readyS + 0.05);
@@ -232,6 +233,13 @@ test('safe zone: head beyond r pauses; resume after 0.5 s inside, then 3-2-1; le
   run(rules, 0.4, { dist: 0.5 });
   assert.equal(rules.msg, MSG.HOLD);
   run(rules, 0.15, { dist: 0.5 });
+  assert.equal(rules.msg, MSG.RESUME, 'then the Resume press (PLAN §6.2)');
+  assert.equal(rules.msgN, pauseIndex(PAUSE.ZONE), 'the cause, for the second line');
+  run(rules, 2, { dist: 0.5 });
+  assert.equal(rules.paused, true, 'no resume without the press');
+  assert.equal(rules.msg, MSG.RESUME);
+  rules.press();
+  rules.update(DT, 0.5, true, false);
   assert.equal(rules.msg, MSG.COUNT);
   assert.equal(rules.msgN, 3);
   run(rules, 1.0, { dist: 0.5 });
@@ -240,7 +248,10 @@ test('safe zone: head beyond r pauses; resume after 0.5 s inside, then 3-2-1; le
   rules.update(DT, 0.9, true, false);
   assert.equal(rules.msg, MSG.ZONE);
   assert.equal(rules.paused, true);
+  rules.press(); // too early: not waiting for it yet, ignored
   run(rules, 0.55, { dist: 0.2 });
+  assert.equal(rules.msg, MSG.RESUME);
+  rules.press();
   run(rules, 2.9, { dist: 0.2 });
   assert.equal(rules.paused, true);
   run(rules, 0.2, { dist: 0.2 });
@@ -251,7 +262,7 @@ test('safe zone: head beyond r pauses; resume after 0.5 s inside, then 3-2-1; le
   assert.ok(rules.spawned > spawned, 'the wave carries on');
 });
 
-test('visibility blur pauses; a frame gap (interrupt) pauses and runs the same resume', () => {
+test('visibility blur pauses; a frame gap (interrupt) pauses and runs the same resume (with the press)', () => {
   const { rules, h } = make();
   rules.start();
   run(rules, 1);
@@ -260,12 +271,18 @@ test('visibility blur pauses; a frame gap (interrupt) pauses and runs the same r
   assert.equal(rules.msg, MSG.PAUSED);
   assert.deepEqual(h.pauses, [[true, PAUSE.HIDDEN]]);
   assert.equal(rules.phase, PHASE.READY, 'the get-ready clock stopped');
-  run(rules, RULES.insideS + RULES.countdownS + 0.1);
+  run(rules, RULES.insideS + 0.05);
+  assert.equal(rules.msg, MSG.RESUME);
+  rules.press();
+  run(rules, RULES.countdownS + 0.1);
   assert.equal(rules.paused, false);
   rules.interrupt();
   assert.equal(rules.paused, true);
   assert.equal(h.pauses.length, 3);
-  run(rules, RULES.insideS + RULES.countdownS + 0.1);
+  assert.deepEqual(h.pauses[2], [true, PAUSE.GAP]);
+  run(rules, RULES.insideS + 0.05);
+  rules.press();
+  run(rules, RULES.countdownS + 0.1);
   assert.equal(rules.paused, false);
   assert.equal(h.pauses.length, 4);
 });
@@ -307,6 +324,7 @@ test('per-frame paths allocate nothing (sampling heap profiler)', async () => {
   const loop = (n) => {
     for (let i = 0; i < n; i++) {
       rules.update(DT, (i % 700) / 500, (i % 5000) > 30, (i % 900) < 20);
+      if (i % 37 === 0) rules.press(); // the resume path too
       if (h.living > 2) { h.living--; rules.kill(i % 3 === 0); events++; }
       if (i % 20000 === 19999) { rules.damage(100); events++; } // deaths …
       if (i % 20000 === 100) { rules.start(); events++; } // … and restarts

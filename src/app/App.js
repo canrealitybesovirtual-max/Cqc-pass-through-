@@ -207,7 +207,7 @@ export class App {
         // App's opaque "Get ready" panel until the round starts, then GameSession's messages
         const lines = kit.panelLines();
         if (lines) {
-          if (t - this.panelAt >= 500) { this.panelAt = t; this.panel.setLines(lines); }
+          if (lines !== this.panel.lines) this.panel.setLines(/** @type {string[]} */ (lines));
           this.panel.follow(cam, dt);
           this.panel.flush();
         } else if (this.panel.mesh.visible) this.panel.mesh.visible = false;

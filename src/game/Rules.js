@@ -1,4 +1,6 @@
 // @ts-check
+import { PAUSE, PauseManager, RESUME, SAFETY, VIOLATION, pauseIndex } from '../safety/PauseManager.js';
+
 /**
  * Survival rules (pure: no three.js, no DOM, so Node tests drive it with fakes).
  * CONTRACTS.md "Game, audio, HUD" → GameSession.
@@ -9,12 +11,20 @@
  * - Wave n has 2 + n enemies, at most 4 alive at once, spawned one at a time
  *   (1.5–3.5 s apart, seeded) through `host.spawn()`; a failed spawn retries
  *   after 0.5 s.
- * - Pause is orthogonal to the phase. Reasons: the head beyond the safe-zone
- *   radius, or the session not visible (blurred / hidden / a frame gap). While
- *   paused nothing advances and damage is ignored. Resume = every reason gone
- *   for 0.5 s, then a 3-2-1 countdown; a reason coming back restarts that.
+ * - Pause is orthogonal to the phase and decided by ONE PauseManager
+ *   (src/safety/PauseManager.js, `rules.pm`): the head beyond the safe-zone
+ *   radius, the session not visible, tracking lost, no controller, an input
+ *   source removed, running, a frame gap, a manual pause (B+Y / wrist), a
+ *   reference-space reset. While paused nothing advances and damage is
+ *   ignored. Resume (PLAN §6.2): every reason gone, the head within 0.7 r for
+ *   0.5 s with tracking fine for 0.4 s, a Resume press (`press()`), then a
+ *   3-2-1 countdown; a reason coming back restarts that. The `update`
+ *   arguments feed the zone and visibility; GameSession feeds the rest into
+ *   `rules.pm` before `update`.
+ * - Enemies freeze (`freeze`: no new spawns, the enemy system is stepped with
+ *   dt = 0) while paused, beyond 0.9 r, or with a mapped obstacle near.
  * - Y: a short tap (< 0.6 s) on round over restarts; holding 2 s exits, in any
- *   phase, paused or not.
+ *   phase, paused or not (and during the spot choice, `setup`).
  *
  * The host gets synchronous callbacks; every hot path is allocation-free.
  */
@@ -22,8 +32,8 @@
 export const PHASE = Object.freeze({ IDLE: 0, READY: 1, WAVE: 2, BREAK: 3, OVER: 4 });
 export const PHASE_NAME = Object.freeze(['idle', 'ready', 'wave', 'break', 'over']);
 
-/** Pause reason bits. */
-export const PAUSE = Object.freeze({ NONE: 0, ZONE: 1, HIDDEN: 2 });
+/** Pause reason bits (re-exported from the PauseManager). */
+export { PAUSE };
 
 /** What the floating message panel should show (`rules.msg`, `rules.msgN`). */
 export const MSG = Object.freeze({
@@ -37,6 +47,11 @@ export const MSG = Object.freeze({
   HOLD: 7, // back inside, waiting 0.5 s
   COUNT: 8, // n = 3, 2, 1
   EXITING: 9, // holding Y
+  RESUME: 10, // "Pull the trigger to resume"; n = bit index of the cause
+  CENTRE: 11, // back inside, but not yet within 0.7 r
+  TRACKING: 12, // tracking lost
+  CONTROLLER: 13, // no controller
+  RESET: 14, // view recentred, waiting for the world to be realigned
 });
 
 export const RULES = Object.freeze({
@@ -52,9 +67,9 @@ export const RULES = Object.freeze({
   spawnRetryS: 0.5,
   zoneR: 0.8,
   /** Back inside means 3 cm inside the edge, so standing on the line does not flicker. */
-  zoneHyst: 0.03,
-  insideS: 0.5,
-  countdownS: 3,
+  zoneHyst: SAFETY.hyst,
+  insideS: SAFETY.insideS,
+  countdownS: SAFETY.countdownS,
   exitHoldS: 2,
   restartTapS: 0.6,
   /** Holding Y longer than this shows "keep holding to exit". */
@@ -79,13 +94,14 @@ export const RULES = Object.freeze({
 export class SurvivalRules {
   /**
    * @param {RulesHost} host
-   * @param {{ seed?: number, zoneR?: number }} [o]
+   * @param {{ seed?: number, zoneR?: number, requirePress?: boolean }} [o] requirePress: false skips the Resume press (tools only)
    */
-  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR } = {}) {
+  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR, requirePress = true } = {}) {
     this.host = host;
     this.seed = seed >>> 0 || 1;
     this.rng = this.seed;
-    /** @type {number} */ this.zoneR = zoneR;
+    /** Every pause decision: PauseManager (feed its inputs before update). */
+    this.pm = new PauseManager({ zoneR, requirePress });
     /** @type {number} PHASE */ this.phase = PHASE.IDLE;
     /** @type {number} */ this.health = RULES.maxHealth;
     this.wave = 0;
@@ -99,17 +115,8 @@ export class SurvivalRules {
     this.spawnFails = 0;
     /** READY / BREAK countdown (s). */
     this.phaseT = 0;
-    // pause
-    this.paused = false;
-    /** Reasons active this frame (PAUSE bits). */
-    this.reasons = 0;
-    this.zoneOut = false;
-    this.hidden = false;
-    /** Seconds with no reason since the last one cleared (−1 = a reason is active). */
-    this.insideT = -1;
-    /** Countdown left (s); −1 = not counting. */
-    this.countT = -1;
-    this.countN = 0;
+    /** A setup step runs while idle (the spot choice): holding Y exits then too. */
+    this.setup = false;
     // Y button
     this.yHeldS = 0;
     this.yWas = false;
@@ -121,6 +128,18 @@ export class SurvivalRules {
     /** @type {number} MSG */ this.msg = MSG.NONE;
     this.msgN = 0;
   }
+
+  get zoneR() { return this.pm.zoneR; }
+  set zoneR(r) { this.pm.zoneR = r; }
+  get paused() { return this.pm.paused; }
+  /** Level pause reasons right now (PAUSE bits). */
+  get reasons() { return this.pm.reasons; }
+  /** Enemies frozen (paused, beyond 0.9 r, or an obstacle near). */
+  get freeze() { return this.pm.freeze; }
+  /** Enemies and effects hidden (paused, not counting down). */
+  get hidden() { return this.pm.hidden; }
+  get countN() { return this.pm.countN; }
+  get countT() { return this.pm.countT; }
 
   /** A fresh round: full health, wave 0, "Get ready". Also used for restart. */
   start() {
@@ -160,34 +179,41 @@ export class SurvivalRules {
   update(dt, zoneDist, visible, yPressed) {
     if (!(dt >= 0)) dt = 0;
     this.buttonY(dt, yPressed);
+    const pm = this.pm;
+    pm.setZone(zoneDist);
+    pm.setVisible(visible);
+    // Reasons are tracked in every phase but only pause an active round.
+    if (pm.update(dt, this.active)) this.host.pause(pm.paused, pm.paused ? pm.cause : PAUSE.NONE);
     if (this.phase === PHASE.IDLE) { this.refreshMsg(); return; }
-
-    // Pause reasons are tracked in every phase but only pause an active round.
-    const r = this.zoneR;
-    this.zoneOut = this.zoneOut ? zoneDist > r - RULES.zoneHyst : zoneDist > r;
-    this.hidden = !visible;
-    this.reasons = (this.zoneOut ? PAUSE.ZONE : 0) | (this.hidden ? PAUSE.HIDDEN : 0);
-    if (this.active) this.pauseStep(dt);
-    else if (this.paused) this.clearPause();
-
-    if (!this.paused) this.phaseStep(dt);
+    if (!pm.paused) this.phaseStep(dt);
     this.refreshMsg();
   }
 
   /**
-   * Frames stopped for a while (headset off, system menu, a reference-space
-   * reset): pause now and run the normal resume (0.5 s + 3-2-1).
+   * Pause now for an event (PAUSE.MANUAL, RESET, GAP, INPUT, RUNNING); the
+   * normal resume protocol follows.
+   * @param {number} bit
+   * @returns {boolean} true when this started a pause
    */
-  interrupt() {
-    if (!this.active) return;
-    if (!this.paused) {
-      this.paused = true;
-      this.host.pause(true, PAUSE.HIDDEN);
-    }
-    this.insideT = 0;
-    this.countT = -1;
+  pauseNow(bit) {
+    if (!this.active) return false;
+    const started = this.pm.trigger(bit);
+    if (started) this.host.pause(true, bit);
     this.refreshMsg();
+    return started;
   }
+
+  /** Frames stopped for a while (headset off, the system menu, a hitch): pause now. */
+  interrupt() { this.pauseNow(PAUSE.GAP); }
+
+  /** The Resume press (a trigger pull); counts only while "Pull the trigger to resume" shows. */
+  press() { this.pm.press(); }
+
+  /** Keep `bit` (e.g. PAUSE.RESET) blocking the resume until `release(bit)`. @param {number} bit */
+  hold(bit) { this.pm.hold(bit); }
+
+  /** @param {number} bit */
+  release(bit) { this.pm.release(bit); }
 
   /**
    * Player damage. Ignored while paused or outside a round.
@@ -226,7 +252,7 @@ export class SurvivalRules {
   buttonY(dt, y) {
     if (y) {
       this.yHeldS += dt;
-      if (!this.exitDone && this.yHeldS >= RULES.exitHoldS && this.phase !== PHASE.IDLE) {
+      if (!this.exitDone && this.yHeldS >= RULES.exitHoldS && (this.phase !== PHASE.IDLE || this.setup)) {
         this.exitDone = true;
         this.host.exit('holdY');
       }
@@ -237,41 +263,7 @@ export class SurvivalRules {
     this.yWas = y;
   }
 
-  /** @param {number} dt */
-  pauseStep(dt) {
-    if (this.reasons !== 0) {
-      if (!this.paused) {
-        this.paused = true;
-        this.host.pause(true, this.reasons & PAUSE.ZONE ? PAUSE.ZONE : PAUSE.HIDDEN);
-      }
-      this.insideT = -1;
-      this.countT = -1;
-      return;
-    }
-    if (!this.paused) return;
-    if (this.countT < 0) {
-      this.insideT = this.insideT < 0 ? dt : this.insideT + dt;
-      if (this.insideT >= RULES.insideS) {
-        this.countT = RULES.countdownS;
-        this.countN = Math.ceil(this.countT);
-      }
-      return;
-    }
-    this.countT -= dt;
-    if (this.countT <= 0) {
-      this.clearPause();
-      this.host.pause(false, PAUSE.NONE);
-      return;
-    }
-    this.countN = Math.ceil(this.countT);
-  }
-
-  clearPause() {
-    this.paused = false;
-    this.insideT = -1;
-    this.countT = -1;
-    this.countN = 0;
-  }
+  clearPause() { this.pm.reset(); }
 
   /** @param {number} dt */
   phaseStep(dt) {
@@ -286,9 +278,11 @@ export class SurvivalRules {
         if (this.phaseT <= 0) this.startWave();
         break;
       case PHASE.WAVE: {
-        if (this.spawned < this.total && this.living() < RULES.maxAlive) {
+        // frozen (beyond 0.9 r, or an obstacle near): no new enemies
+        if (this.spawned < this.total && this.living() < RULES.maxAlive && !this.pm.freeze) {
           this.spawnT -= dt;
           if (this.spawnT <= 0) {
+            if (this.pm.paused) this.pm.violation(VIOLATION.SPAWN);
             if (this.host.spawn()) {
               this.spawned++;
               this.spawnT = RULES.spawnGapMinS + (RULES.spawnGapMaxS - RULES.spawnGapMinS) * this.rand();
@@ -346,14 +340,21 @@ export class SurvivalRules {
   refreshMsg() {
     let m = this.timedMsg, n = this.timedN;
     if (this.phase === PHASE.IDLE) { m = MSG.NONE; n = 0; }
-    if (this.paused) {
+    const pm = this.pm;
+    if (pm.paused) {
       n = 0;
-      if (this.reasons & PAUSE.ZONE) m = MSG.ZONE;
-      else if (this.reasons & PAUSE.HIDDEN) m = MSG.PAUSED;
-      else if (this.countT >= 0) { m = MSG.COUNT; n = this.countN; }
+      const lv = pm.reasons, held = pm.latched & pm.held;
+      if (lv & PAUSE.ZONE) m = MSG.ZONE;
+      else if (lv & PAUSE.TRACKING) m = MSG.TRACKING;
+      else if (lv & PAUSE.HIDDEN) m = MSG.PAUSED;
+      else if (lv & PAUSE.CONTROLLER) m = MSG.CONTROLLER;
+      else if (held & PAUSE.RESET) m = MSG.RESET;
+      else if (pm.state === RESUME.COUNT) { m = MSG.COUNT; n = pm.countN; }
+      else if (pm.state === RESUME.READY) { m = MSG.RESUME; n = pauseIndex(pm.cause); }
+      else if (!pm.innerIn) m = MSG.CENTRE;
       else m = MSG.HOLD;
     }
-    if (this.yHeldS >= RULES.exitHintS && !this.exitDone && this.phase !== PHASE.IDLE) { m = MSG.EXITING; n = 0; }
+    if (this.yHeldS >= RULES.exitHintS && !this.exitDone && (this.phase !== PHASE.IDLE || this.setup)) { m = MSG.EXITING; n = 0; }
     this.msg = m;
     this.msgN = n;
   }

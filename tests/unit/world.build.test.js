@@ -10,8 +10,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { Session } from 'node:inspector/promises';
 import { WorldCore } from '../../src/world/WorldCore.js';
-import { NAV_DOOR, NAV_FURN, NAV_ZONE } from '../../src/world/NavGrid.js';
+import { NAV_DOOR, NAV_FURN, NAV_POCKET, NAV_VIRTUAL, NAV_ZONE } from '../../src/world/NavGrid.js';
 import { PATH_PENDING } from '../../src/world/PathPlanner.js';
 import { OCC_INDICES_PER_BOX, writeOccluderBoxes } from '../../src/world/Occluder.js';
 import { SnapshotBuilder } from '../../src/world/SnapshotBuilder.js';
@@ -129,9 +130,12 @@ test('nav: door gaps carved through both wall slabs; the bedroom is one door awa
   assert.equal(g.region[g.index(4.0, -2.0)], g.region[g.index(2.6, -2.6)]);
   assert.equal(g.doors[g.index(2.6, -2.6)], 0);
   assert.equal(g.doors[g.index(4.0, -2.0)], 1);
-  // The hallway door is carved too, but there is no floor behind it.
+  // The hallway door is carved too; it leads into unmapped space, so a small virtual pocket lies behind it.
   assert.ok(g.flags[g.index(-1.15, -3.2)] & NAV_DOOR);
-  assert.ok(!g.isWalkable(-1.15, -3.7));
+  assert.ok(g.isReachable(-1.15, -4.0), 'pocket behind the hallway door');
+  assert.ok(g.flags[g.index(-1.15, -4.0)] & NAV_POCKET && g.flags[g.index(-1.15, -4.0)] & NAV_VIRTUAL);
+  assert.ok(!g.isWalkable(-1.15, -5.4), 'nothing beyond the 2 m pocket');
+  assert.ok(!g.isWalkable(-2.4, -4.0), 'nor beside it');
   // Furniture + 0.25 m and the player zone (0.8 + 1.2 m).
   assert.ok(g.flags[g.index(4.4, -1.0)] & NAV_FURN);
   assert.ok(!g.isWalkable(4.4, -1.0), '0.2 m from the bed');
@@ -207,7 +211,7 @@ test('findSpawn: recent spawns are avoided; impossible distances fail; same seed
   assert.deepEqual(sa, sb);
 });
 
-test('findSpawn and raycast do not allocate', () => {
+test('findSpawn and raycast do not allocate (sampling heap profiler, world code only)', async () => {
   const w = world();
   const h = hit(), out = { x: 0, z: 0 };
   const run = (n) => {
@@ -219,12 +223,22 @@ test('findSpawn and raycast do not allocate', () => {
       if ((i & 63) === 0) { w.update(0, i * 1000); w.findSpawn(0, 0, Math.cos(a), Math.sin(a), 3, out); }
     }
   };
-  run(5000);
-  globalThis.gc?.();
-  const before = process.memoryUsage().heapUsed;
+  run(100000); // past JIT tiering (interpreted and baseline code box doubles)
+  const session = new Session();
+  session.connect();
+  await session.post('HeapProfiler.enable');
+  await session.post('HeapProfiler.startSampling', { samplingInterval: 128 });
   run(50000);
-  const grew = process.memoryUsage().heapUsed - before;
-  assert.ok(grew < 1_000_000, `heap grew ${grew} bytes`);
+  const { profile } = await session.post('HeapProfiler.stopSampling');
+  session.disconnect();
+  let bytes = 0;
+  const sites = [];
+  const walk = (node) => {
+    if (node.selfSize && node.callFrame.url.includes('/src/world/')) { bytes += node.selfSize; sites.push(`${node.callFrame.functionName}:${node.callFrame.lineNumber + 1}`); }
+    for (const c of node.children) walk(c);
+  };
+  walk(profile.head);
+  assert.ok(bytes < 4096, `world code allocated ~${bytes} bytes in 50,000 rounds at ${sites.join(', ')}`);
 });
 
 test('occluder: every wall piece and box, door openings left open, boxes shrunk 2 cm, faces outward', () => {
@@ -281,7 +295,7 @@ test('no snapshot, no floor, or a bad snapshot → a virtual open room around th
     assert.equal(w.spawner.lastTier, 1, 'nothing hides: out of view');
     const dx = out.x - 1, dz = out.z - 2, d = Math.hypot(dx, dz);
     assert.ok(d >= 4);
-    assert.ok(-dz / d < Math.cos(Math.PI / 3), 'outside ±60° of the view');
+    assert.ok(-dz / d <= Math.cos((100 * Math.PI) / 180) + 1e-6, 'outside ±100° of the view');
   }
   const w = new WorldCore();
   w.build({ version: 9 }, { x: 0, z: 0 });
@@ -358,7 +372,7 @@ test('a rotated house: walls, a door and a z-up mesh at 30° yaw', () => {
   assert.equal(w.nav.doors[w.nav.index(rx, rz)], 1);
 });
 
-test('interior walls follow the normal convention the floor-edge walls show', () => {
+test('interior walls the player sees are faced to the player, whatever the normal convention', () => {
   // One floor polygon over two rooms; every wall normal points OUT of its room (the opposite of the builder default).
   const make = (outward) => {
     const b = new SnapshotBuilder();
@@ -374,7 +388,7 @@ test('interior walls follow the normal convention the floor-edge walls show', ()
   for (const outward of [false, true]) {
     const w = make(outward);
     const inner = w.layout.walls[4];
-    assert.equal(inner.side, outward ? 'learned' : 'normal');
+    assert.equal(inner.side, 'player', 'the player in room A sees it: faced to the player');
     const h = hit();
     assert.ok(w.raycast(2, 1.5, 2, 1, 0, 0, 10, h) && near(h.x, 4.0), `from room A the face is at x = 4 (${h.x})`);
     assert.ok(w.raycast(6, 1.5, 2, -1, 0, 0, 10, h) && near(h.x, 4.1), `the slab is behind it (${h.x})`);

@@ -73,11 +73,12 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
 /**
  * @typedef {{ id: number, cx: number, cz: number, tx: number, tz: number, nx: number, nz: number, width: number,
  *   y0: number, y1: number, walls: number, wallIds: number[], offsets: number[], walkable: boolean, open: boolean,
- *   side: 'both'|'front'|'back'|'none', leadsTo: 'mapped'|'unmapped'|'virtual'|'none', pocket: number, passable: boolean }} Door
+ *   side: 'both'|'front'|'back'|'none', leadsTo: 'mapped'|'unmapped'|'virtual'|'none', pocket: number, passable: boolean, inZone: boolean }} Door
  *   n: the door plane's normal (front = +n); walls/wallIds: matched walls; offsets: door centre to each matched
  *   wall face along that wall's n (m, + = room side); walkable: the frame could pass a person (bottom near the
  *   floor, ≥ 1.5 m tall, ≥ 0.4 m wide); side: which sides of the plane have mapped floor; pocket: the pocket's floor
- *   index (-1 none); passable: set by WorldCore after the nav bake (an enemy fits through and it is reachable).
+ *   index (-1 none); passable / inZone: set by WorldCore after the nav bake (an enemy fits through it, floor on
+ *   both sides, the player zone ignored / the player zone (r + 1.2 m) covers part of its gap this session).
  */
 /**
  * @typedef {{ cx: number, cz: number, c: number, s: number, hx: number, hz: number, y0: number, y1: number,
@@ -801,7 +802,7 @@ function makeDoor(p, fy, id) {
   const walkable = y0 < f + 0.25 && y1 - y0 >= 1.5 && width >= 0.4;
   return {
     id, cx, cz, tx, tz, nx, nz, width, y0, y1, walls: 0, wallIds: [], offsets: [], walkable, open: true,
-    side: 'none', leadsTo: 'none', pocket: -1, passable: false,
+    side: 'none', leadsTo: 'none', pocket: -1, passable: false, inZone: false,
   };
 }
 

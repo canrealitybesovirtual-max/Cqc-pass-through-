@@ -214,9 +214,13 @@ export class WorldCore {
       h = nh;
     }
     nav.reset(ox, oz, w, h);
-    for (let k = 0; k < L.floors.length; k++) {
-      const f = L.floors[k];
-      nav.fillPolygon(f.pts, f.n, NAV_INSIDE | (f.virtual ? NAV_VIRTUAL : 0) | (f.pocket ? NAV_POCKET : 0), k < 127 ? k : -1);
+    // Mapped floors first; virtual floors (patch, pockets) only where no mapped floor is.
+    for (let pass = 0; pass < 2; pass++) {
+      for (let k = 0; k < L.floors.length; k++) {
+        const f = L.floors[k];
+        if (f.virtual !== (pass === 1)) continue;
+        nav.fillPolygon(f.pts, f.n, NAV_INSIDE | (f.virtual ? NAV_VIRTUAL : 0) | (f.pocket ? NAV_POCKET : 0), k < 127 ? k : -1, f.virtual);
+      }
     }
     for (const b of L.boxes) {
       if (b.kind === 'wall') {
@@ -230,34 +234,39 @@ export class WorldCore {
       if (d.walkable && d.open) nav.fillBox(d.cx, d.cz, d.tx, d.tz, d.width / 2, DOOR_DEPTH, 0, NAV_DOOR, NAV_WALL);
     }
     nav.computeClearance(NAV_WALL | NAV_OBST);
+    for (const d of L.doors) {
+      if (!d.walkable || !d.open) continue;
+      // Each matched wall's slab, in door-local z (−(p − centre)·n): face at offset·σ, back 0.10 m beyond.
+      /** @type {number[]} */ const bands = [];
+      for (let k = 0; k < d.wallIds.length; k++) {
+        const w = L.walls[d.wallIds[k]];
+        const sg = w.nx * d.nx + w.nz * d.nz >= 0 ? 1 : -1;
+        const a = d.offsets[k] * sg, b = (d.offsets[k] + WALL_T) * sg;
+        bands.push(Math.min(a, b), Math.max(a, b));
+      }
+      if (!bands.length) bands.push(-DOOR_DEPTH, DOOR_DEPTH);
+      nav.refineDoorClearance(d.cx, d.cz, d.tx, d.tz, d.width / 2, DOOR_DEPTH, bands);
+    }
     nav.fillDisc(sx, sz, r + ZONE_EXTRA, NAV_ZONE);
     nav.finalize(this.agentClearance, sx, sz, Math.min(this.agentClearance, DOOR_CLEARANCE));
     if (nav.startCell < 0) notes.push('no walkable floor near the player: enemies cannot reach you');
-    for (const d of L.doors) d.passable = this.doorPassable(L, d);
+    for (const d of L.doors) {
+      d.passable = this.doorPassable(L, d);
+      d.inZone = nav.countInBox(d.cx, d.cz, d.tx, d.tz, d.width / 2, DOOR_DEPTH, NAV_ZONE, 0) > 0;
+    }
   }
 
   /**
-   * Can an enemy walk through this door? An open, walkable door whose gap
-   * through every matched wall slab holds a walkable cell connected to the
-   * player, with walkable floor 0.55–1.05 m out on both sides (so a door into
-   * unmapped space is passable only with its pocket).
+   * Can an enemy walk through this door (whatever the player zone)? An open,
+   * walkable door with a connected chain of cells an enemy fits in, from
+   * 0.55 m in front of it to 0.55 m behind it (so a door into unmapped space
+   * is passable only with its pocket).
    * @param {import('./Layout.js').Layout} L
    * @param {import('./Layout.js').Door} d
    */
   doorPassable(L, d) {
     if (!d.walkable || !d.open) return false;
-    const nav = this.nav, hw = d.width / 2;
-    if (d.wallIds.length === 0 && nav.countInBox(d.cx, d.cz, d.tx, d.tz, hw, 0.1, NAV_DOOR | NAV_WALK, true) === 0) return false;
-    for (let k = 0; k < d.wallIds.length; k++) {
-      const w = L.walls[d.wallIds[k]];
-      const v = -d.offsets[k] - WALL_T / 2; // slab centre, along the wall normal from the door centre
-      if (nav.countInBox(d.cx + w.nx * v, d.cz + w.nz * v, d.tx, d.tz, hw, 0.06, NAV_WALK, true) === 0) return false;
-    }
-    for (let sg = -1; sg <= 1; sg += 2) {
-      const x = d.cx + d.nx * 0.8 * sg, z = d.cz + d.nz * 0.8 * sg;
-      if (nav.countInBox(x, z, d.tx, d.tz, hw + 0.3, 0.25, NAV_WALK, true) === 0) return false;
-    }
-    return true;
+    return this.nav.doorConnects(d.cx, d.cz, d.tx, d.tz, d.width / 2, DOOR_DEPTH);
   }
 
   /**
@@ -380,7 +389,7 @@ export class WorldCore {
       })),
       doors: L.doors.map((d) => ({
         id: d.id, c: [c2(d.cx), c2(d.cz)], width: c2(d.width), bottom: c2(d.y0 - this.floorY(d.cx, d.cz)), y: [c2(d.y0), c2(d.y1)],
-        walls: d.wallIds.slice(), offsets: d.offsets.map(c2), walkable: d.walkable, passable: d.passable, open: d.open,
+        walls: d.wallIds.slice(), offsets: d.offsets.map(c2), walkable: d.walkable, passable: d.passable, inZone: d.inZone, open: d.open,
         side: d.side, leadsTo: d.leadsTo, pocket: d.pocket >= 0,
       })),
       furniture: L.furniture.map((b) => ({

@@ -578,7 +578,8 @@ export class Probes {
       const dOn = (g.enabledFeatures || []).includes('depth-sensing');
       if (LD && LD.active && LD.valid > 0) out.push(`✓ ${LD.line()} · clear ${this.loop.explicitClear ? 'ON' : 'OFF'} [X] · picture [Y]`);
       else if (LD && !LD.active && dOn) out.push(`! ${LD.line()}`);
-      else out.push(D ? `${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear}` : D.state}` : `• Depth: ${dOn ? (LD ? LD.line() : 'waiting…') : 'not granted'}`);
+      else if (D) out.push(`${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear}` : D.state}`);
+      else out.push(`• ${dOn ? (LD ? LD.line() : 'Depth: waiting…') : 'Depth: not granted'}`);
       const L = P.light, B = P.body;
       out.push(`• Light: ${L ? (L.estimate ? (typeof L.estimate === 'string' ? L.estimate : 'estimate ✓') : L.probe) : '-'} · Body: ${B ? (B.firstBody ? `✓ ${B.firstBody.joints} joints` : B.granted ? 'waiting…' : 'not granted') : '-'}`);
     }

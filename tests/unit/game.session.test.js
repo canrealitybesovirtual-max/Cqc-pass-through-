@@ -47,7 +47,7 @@ function hand() {
   return {
     pulses,
     present: true, hasGrip: true, grip: new THREE.Matrix4().toArray(new Float32Array(16)),
-    a: false, aDown: false, b: false,
+    a: false, aDown: false, b: false, triggerDown: false, triggerHeld: false,
     source: { gamepad: { hapticActuators: [{ pulse: (v, ms) => { if (REC.on) pulses.push([v, ms]); } }] } },
   };
 }
@@ -95,18 +95,20 @@ function setup({ spawnOk = true } = {}) {
     }
   };
   const secs = (s) => step(Math.round(s / DT));
-  return { ctx, game, hud, world, enemies, weapons, audio, events, input, session, player, seen, head, step, secs, scene };
+  /** One trigger pull (the Resume press). */
+  const pull = () => { input.right.triggerDown = true; step(); input.right.triggerDown = false; };
+  return { ctx, game, hud, world, enemies, weapons, audio, events, input, session, player, seen, head, step, secs, scene, pull };
 }
 
 test('construction: ring, one tint quad and the message panel exist from the start; transparent from creation', () => {
   const { game, scene, hud } = setup();
   const names = scene.children.map((o) => o.name);
-  for (const n of ['game-zone-ring', 'game-damage-tint', 'game-message', 'wrist-hud']) assert.ok(names.includes(n), n);
+  for (const n of ['game-zone-ring', 'game-damage-tint', 'game-message', 'wrist-hud', 'safety-outline', 'safety-arrow', 'safety-veil']) assert.ok(names.includes(n), n);
   assert.equal(game.ring.material.transparent, true);
   assert.equal(game.tint.material.transparent, true);
   assert.equal(game.tint.material.opacity, 0);
   assert.equal(game.tint.material.depthTest, false);
-  assert.equal(game.warmMeshes().length, 3);
+  assert.equal(game.warmMeshes().length, 5, 'ring, tint, panel + the safety outline and floor arrow');
   assert.equal(hud.warmMeshes().length, 1);
   game.setWarm(true);
   assert.ok(game.warmMeshes().every((m) => m.visible));
@@ -203,7 +205,7 @@ test('death: roundOver with wave and kills, card "Round over — Y to restart"; 
   assert.equal(weapons.resets, 2);
 });
 
-test('safe zone: leaving pauses ("Return to your spot", red ring), back in → 0.5 s → 3-2-1 → resume', () => {
+test('safe zone: leaving pauses ("Return to your spot", red ring), back in → 0.5 s → trigger → 3-2-1 → resume', () => {
   const S = setup();
   const { game, seen, head } = S;
   S.step(2);
@@ -218,6 +220,10 @@ test('safe zone: leaving pauses ("Return to your spot", red ring), back in → 0
   assert.ok(game.ring.visible);
   head(0, 1.7, 0);
   S.secs(0.6);
+  assert.deepEqual(game.panel.lines, ['Pull the trigger to resume', 'You left your spot']);
+  S.secs(1);
+  assert.equal(game.paused, true, 'no resume without the trigger (PLAN §6.2)');
+  S.pull();
   assert.deepEqual(game.panel.lines, ['3']);
   S.secs(1.0);
   assert.deepEqual(game.panel.lines, ['2']);
@@ -238,17 +244,24 @@ test('visibility blur and a frame gap both pause; Lifecycle visibility works too
   assert.deepEqual(seen.at(-1), ['pause', { paused: true, reason: 'hidden' }]);
   assert.deepEqual(game.panel.lines, ['Paused']);
   session.visibilityState = 'visible';
-  S.secs(4);
+  S.secs(0.6);
+  S.pull();
+  S.secs(3.1);
   assert.equal(game.paused, false);
   S.step(1, 2000); // no frames for 2 s (headset off)
   assert.equal(game.paused, true);
-  S.secs(4);
+  assert.deepEqual(seen.at(-1), ['pause', { paused: true, reason: 'gap' }]);
+  S.secs(0.6);
+  S.pull();
+  S.secs(3.1);
   assert.equal(game.paused, false);
   game.setVisibility('hidden');
   S.step();
   assert.equal(game.paused, true);
   game.setVisibility('visible');
-  S.secs(4);
+  S.secs(0.6);
+  S.pull();
+  S.secs(3.1);
   assert.equal(game.paused, false);
 });
 
@@ -357,7 +370,7 @@ test('wrist HUD: on the left grip, shows wave / health / kills / ammo; look + X 
 test('materials never change program-key state during play', () => {
   const S = setup();
   const { game, events, head } = S;
-  const mats = [game.ring.material, game.tint.material, game.panel.mesh.material];
+  const mats = [game.ring.material, game.tint.material, game.panel.mesh.material, game.view.outline.material, game.view.arrow.material];
   const before = mats.map((m) => [m.version, m.transparent, m.alphaTest, m.depthTest]);
   S.step(2);
   game.start();
@@ -368,7 +381,7 @@ test('materials never change program-key state during play', () => {
     S.step();
   }
   assert.deepEqual(mats.map((m) => [m.version, m.transparent, m.alphaTest, m.depthTest]), before);
-  assert.deepEqual([game.ring.material, game.tint.material, game.panel.mesh.material], mats, 'same material objects');
+  assert.deepEqual([game.ring.material, game.tint.material, game.panel.mesh.material, game.view.outline.material, game.view.arrow.material], mats, 'same material objects');
 });
 
 test('per-frame game + HUD + player paths allocate nothing (sampling heap profiler)', async () => {
@@ -385,15 +398,18 @@ test('per-frame game + HUD + player paths allocate nothing (sampling heap profil
       if (i % 200 === 0) events.emit('playerHit', hit); // tint fades, HUD redraws, ring
       if (i % 3000 === 0) { S.head(0.9, 1.7, 0); cycle++; } // zone pause …
       if (i % 3000 === 300) S.head(0, 1.7, 0); // … and resume
+      if (i % 3000 === 400) { S.input.right.triggerDown = true; S.step(); S.input.right.triggerDown = false; } // the Resume press
       S.step();
       if (game.health < 50) { game.rules.health = 100; }
     }
   };
-  loop(20000);
+  // long enough for TurboFan to finish optimising preUpdate even while the other test files run in parallel
+  // (until then its frames run in the interpreter, which boxes doubles)
+  loop(60000);
   assert.equal(game.phase, PHASE.WAVE);
   assert.ok(enemies.n > 0 && cycle > 0);
   let best = Infinity, by = null;
-  for (let r = 0; r < 3 && best > 0; r++) {
+  for (let r = 0; r < 5 && best > 0; r++) {
     const s = new Session();
     s.connect();
     await s.post('HeapProfiler.startSampling', { samplingInterval: 16 });
@@ -401,7 +417,8 @@ test('per-frame game + HUD + player paths allocate nothing (sampling heap profil
     const { profile } = await s.post('HeapProfiler.stopSampling');
     s.disconnect();
     const b = {};
-    const files = ['/src/game/GameSession.js', '/src/ui/WristHud.js', '/src/game/Rules.js', '/src/game/Player.js', '/src/game/head.js', '/src/game/UploadGate.js'];
+    const files = ['/src/game/GameSession.js', '/src/ui/WristHud.js', '/src/game/Rules.js', '/src/game/Player.js', '/src/game/head.js', '/src/game/UploadGate.js',
+      '/src/safety/PauseManager.js', '/src/safety/ObstacleWarnings.js', '/src/safety/SafeSpot.js', '/src/safety/SafetyView.js', '/src/safety/geom.js'];
     const walk = (n) => {
       const u = n.callFrame.url;
       if (n.selfSize > 0 && files.some((f) => u.endsWith(f))) b[n.callFrame.functionName] = (b[n.callFrame.functionName] || 0) + n.selfSize;

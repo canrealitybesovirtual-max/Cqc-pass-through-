@@ -39,10 +39,28 @@ const waitState = async (s, ms = 8000) => { const t = Date.now(); while (Date.no
 const waitFor = async (fn, arg, ms = 10000, every = 150) => { const t = Date.now(); while (Date.now() - t < ms) { const v = await page.evaluate(fn, arg); if (v) return v; await sleep(every); } return null; };
 const button = (hand, id, v) => page.evaluate(([h, b, x]) => window.__iwer.controllers[h].updateButtonValue(b, x), [hand, id, v]);
 const press = async (hand, id, holdMs = 150) => { await button(hand, id, 1); await sleep(holdMs); await button(hand, id, 0); await sleep(150); };
+/**
+ * SwiftShader frames are slow (100–300 ms), and a long frame pauses the round like a real hitch.
+ * Resume the way the player does (a trigger pull once the pause allows it), then wait out the countdown.
+ * Returns the pause causes seen, for the report.
+ */
+const resumeIfPaused = async (ms = 20000) => {
+  const seen = new Set();
+  const t = Date.now();
+  while (Date.now() - t < ms) {
+    const p = await page.evaluate(() => { const k = window.__app.play; return { paused: k.weapons.paused || k.game.paused, reasons: k.game.rules.reasons }; });
+    if (!p.paused) return [...seen];
+    seen.add(p.reasons);
+    await press('left', 'trigger', 120); // the left trigger: never fires the gun in the right hand
+    await sleep(400);
+  }
+  return [...seen, 'still paused'];
+};
 
 /** Page helpers: move a controller so its GRIP lands on a world point; aim its ray; read the pixel under the cube. */
 const installHelpers = () => page.evaluate(async () => {
   const THREE = await import('three');
+  window.__CARRY_HAND = (await import('/src/player/Slots.js')).CARRY_HAND;
   const app = window.__app, dev = window.__iwer;
   window.__h = {
     THREE,
@@ -258,6 +276,18 @@ try {
   const before = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
   await page.click('#bPlay');
   ok('play: entered xr', await waitState('xr'));
+  // SwiftShader frames take 100–300 ms (the headset: 11 ms), and the round pauses on any frame gap
+  // over 250 ms like a real hitch. The player and game systems (GameSession's pause decisions run
+  // after the player) see a clock whose steps are capped at 200 ms, so the emulator's slowness is not
+  // taken for hitches; everything else runs on real time.
+  await page.evaluate(() => {
+    let vt = 0, last = -1;
+    const clock = (t) => { if (t !== last) { vt = last < 0 ? t : vt + Math.min(t - last, 200); last = t; } return vt; };
+    for (const name of ['player', 'game']) {
+      const sys = window.__app.loop.systems.find((x) => x.name === name), orig = sys.update;
+      sys.update = (dt, t, f, c) => orig(dt, clock(t), f, c);
+    }
+  });
   const ready = await waitFor(() => window.__app.play.stepName === 'play', null, 15000);
   const g0 = await page.evaluate(() => {
     const a = window.__app, k = a.play, rec = a.rec;
@@ -280,6 +310,8 @@ try {
   const spawned = await waitFor(() => { const k = window.__app.play; return k.game.wave >= 1 && k.enemies.stats.spawned > 0; }, null, 12000);
   const e0 = await page.evaluate(() => { const k = window.__app.play, a = k.enemies.brain.agents.find((x) => x.active); return a && { x: a.x, z: a.z, walk: k.world.nav.isWalkable(a.x, a.z), d: Math.hypot(a.x - k.player.head.x, a.z - k.player.head.z) }; });
   ok('play: wave 1 starts and an enemy spawns on walkable floor, away from the player', !!spawned && e0 && e0.walk && e0.d >= 2.5, e0 && `at (${e0.x.toFixed(2)}, ${e0.z.toFixed(2)}), ${e0.d.toFixed(1)} m away`);
+  const runInfo = await page.evaluate(() => ({ running: window.__app.perf.running, label: window.__app.perf.runLabel }));
+  ok('play: a 60 s timing run starts with wave 1', runInfo.running && runInfo.label === 'play wave 1', JSON.stringify(runInfo));
   await sleep(1500);
   const e1 = await page.evaluate(() => { const k = window.__app.play, a = k.enemies.brain.agents.find((x) => x.active); return a && { x: a.x, z: a.z, poses: k.enemies.stats.poses }; });
   const moved = e0 && e1 ? Math.hypot(e1.x - e0.x, e1.z - e0.z) : 0;
@@ -311,6 +343,8 @@ try {
     await sleep(250);
     await page.evaluate(() => { const k = window.__app.play, a = k.enemies.brain.agents.find((x) => x.active && x.alive); if (a) window.__h.aimAt('right', [a.x, a.y + 1.2, a.z]); });
     await sleep(150);
+    const causes = await resumeIfPaused();
+    if (causes.length) report.pausesResumed = (report.pausesResumed || []).concat(causes);
     await press('right', 'trigger', 200);
     await sleep(250);
     hits = await page.evaluate((h0) => window.__app.play.weapons.stats.enemyHits - h0, shots0.enemyHits);
@@ -348,12 +382,15 @@ try {
   await press('right', 'thumbstick');
   const mode = await page.evaluate(() => window.__app.play.weapons.akm.inst.mode);
   ok('play: right stick click moves the AKM selector off safe', mode === 'auto', `mode ${mode}`);
-  const a0 = await page.evaluate(() => window.__app.play.weapons.stats.shots);
   await page.evaluate(() => window.__h.aimAt('right', [0.16, 1.3, -5]));
-  await sleep(200);
+  await waitFor(() => { const w = window.__app.play.weapons; return w.akm.carry.state === window.__CARRY_HAND && w.akm.gate.open; }, null, 8000);
+  const causes2 = await resumeIfPaused();
+  if (causes2.length) report.pausesResumed = (report.pausesResumed || []).concat(causes2);
+  const a0 = await page.evaluate(() => window.__app.play.weapons.stats.shots);
   await press('right', 'trigger', 700);
-  const a1 = await page.evaluate(() => ({ shots: window.__app.play.weapons.stats.shots, mag: window.__app.play.weapons.akm.inst.magRounds }));
-  ok('play: AKM full auto fires a burst while the trigger is held', a1.shots - a0 >= 3, `${a1.shots - a0} rounds in 0.7 s; ${a1.mag} left`);
+  const a1 = await page.evaluate(() => { const k = window.__app.play, w = k.weapons; return { shots: w.stats.shots, mag: w.akm.inst.magRounds,
+    why: { paused: w.paused, game: k.game.phaseName, gamePaused: k.game.paused, carry: w.akm.carry.state, gate: w.akm.gate.open, mode: w.akm.inst.mode, held: w.held && w.held.id } }; });
+  ok('play: AKM full auto fires a burst while the trigger is held', a1.shots - a0 >= 3, `${a1.shots - a0} rounds in 0.7 s; ${a1.mag} left${a1.shots - a0 >= 3 ? '' : `; ${JSON.stringify(a1.why)}`}`);
 
   // A 4-enemy scene in view: draw calls (both eyes, IWER renders two passes like the Quest)
   await page.evaluate(() => {
@@ -389,7 +426,7 @@ try {
   // Exit: hold Y for 2 s (the game ends the session from a timeout, never inside the frame callback)
   await page.evaluate(() => { window.__iwer.controllers.right.updateButtonValue('squeeze', 0); window.__iwer.controllers.right.updateButtonValue('trigger', 0); });
   await button('left', 'y-button', 1);
-  const exited = await waitState('menu', 6000);
+  const exited = await waitState('menu', 20000); // 2 s of game time: dt is clamped to 0.1 s per (slow) emulator frame
   await button('left', 'y-button', 0);
   ok('play: holding Y exits', exited);
   const d2 = await page.evaluate(() => JSON.parse(window.__app.diag.json()));

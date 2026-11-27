@@ -167,10 +167,14 @@ test('queries do not allocate', () => {
     }
   };
   run(20000);
-  globalThis.gc?.();
-  const before = process.memoryUsage().heapUsed;
-  run(100000);
-  const grew = process.memoryUsage().heapUsed - before;
+  // least growth over 3 windows: one window can catch JIT tiering or GC timing under parallel test load
+  let grew = Infinity;
+  for (let k = 0; k < 3 && grew >= 1_000_000; k++) {
+    globalThis.gc?.();
+    const before = process.memoryUsage().heapUsed;
+    run(100000);
+    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
+  }
   assert.ok(grew < 1_000_000, `heap grew ${grew} bytes`);
   assert.ok(acc > 0);
   assert.equal(NAV_WALK, 64);

@@ -13,54 +13,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WorldCore } from '../../src/world/WorldCore.js';
 import { NAV_WALK } from '../../src/world/NavGrid.js';
-import { SnapshotBuilder } from '../../src/world/SnapshotBuilder.js';
+import { userHouse } from './world.houses.js';
 
-const H1 = 2.6, H2 = 2.55, F2 = 0.015;
-
-function bigHouse() {
-  const b = new SnapshotBuilder({ yaw: (17 * Math.PI) / 180, ox: -3, oz: 2 });
-  const f1 = [[0, 0], [12, 0], [12, 4], [9, 10], [0, 10]];
-  const f2 = [[12.1, 0], [16.1, 0], [16.1, 3.6], [14, 3.6], [12.1, 3.6]];
-  b.floor(f1, 0).floor(f2, F2).ceiling(f1, H1).ceiling(f2, H2);
-  // Perimeter walls (CCW floors: the left normal points in), 10 cm past each corner.
-  for (let i = 0; i < 5; i++) { const [ax, az] = f1[i], [bx, bz] = f1[(i + 1) % 5]; b.wall(ax, az, bx, bz, 0, H1, { extend: 0.1 }); }
-  b.wall(12.1, 0, 16.1, 0, F2, H2, { extend: 0.1 }).wall(16.1, 0, 16.1, 3.6, F2, H2, { extend: 0.1 })
-    .wall(16.1, 3.6, 12.1, 3.6, F2, H2, { extend: 0.1 }).wall(12.1, 3.6, 12.1, 0, F2, H2, { extend: 0.1 });
-  // Interior walls inside the big floor polygon (normals point either way).
-  b.wall(4, 0, 4, 10, 0, H1);
-  b.wall(8, 0, 8, 10, 0, H1, { flip: true });
-  b.wall(0, 5, 4, 5, 0, H1);
-  b.wall(4, 6, 8, 6, 0, H1, { flip: true });
-  b.wall(8, 3, 12, 3, 0, H1);
-  b.wall(0, 8.5, 4, 8.5, 0, H1, { label: null }); // sealed closet, unlabelled
-  b.wall(6, 0, 6, 2.2, 0, H1); // a stub: open passage beside it
-  // Doors: A–C, C–D (via F), A–B, C–D, E–F, E–G (between the two floors, one plane over both walls).
-  b.door(4, 2, 4, 2.9, 0, 2.03);
-  b.door(8, 6, 8, 6.9, 0, 2.03);
-  b.door(1.5, 5, 2.4, 5, 0, 2.03);
-  b.door(5, 6, 5.85, 6, 0, 2.03);
-  b.door(10, 3, 10.9, 3, 0, 2.03);
-  b.door(12.05, 1, 12.05, 1.9, 0, 2.03);
-  b.vertical('wall art', 0, 2, 0, 3, 1.2, 1.9).vertical('wall art', 9, 0, 10, 0, 1.3, 1.8);
-  // Furniture: a top plane + a volume for each (some yawed, some labels null).
-  const furn = [
-    ['couch', 0.5, 1.5, 0.45, 1.0, 0.85, 0], ['table', 2.6, 3.8, 0.5, 0.3, 0.74, 0.2], ['table', 0.5, 4.4, 0.25, 0.25, 0.5, 0],
-    ['shelf', 3.1, 0.25, 0.6, 0.2, 1.9, 0], ['bed', 0.85, 7.4, 0.8, 1.0, 0.55, 0], ['shelf', 3.72, 7.6, 0.22, 0.6, 1.6, 0],
-    ['table', 3.3, 5.6, 0.4, 0.25, 0.72, 0.1], ['couch', 7.1, 0.5, 0.8, 0.45, 0.8, 0], ['table', 5.0, 4.0, 0.6, 0.4, 0.75, -0.25],
-    ['table', 7.0, 3.5, 0.4, 0.4, 0.7, 0], ['shelf', 4.25, 4.75, 0.2, 0.75, 1.8, 0], ['bed', 7.07, 8.87, 0.87, 1.07, 0.6, 0],
-    ['table', 5.0, 8.5, 0.5, 0.35, 0.75, 0.3], ['shelf', 4.25, 8.75, 0.2, 0.75, 2.0, 0], ['table', 10, 1.2, 0.5, 0.3, 0.76, 0],
-    ['shelf', 8.7, 0.25, 0.6, 0.2, 1.2, 0], ['table', 9.5, 5.0, 0.6, 0.4, 0.75, 0.15], ['table', 9.0, 8.0, 0.4, 0.3, 0.7, 0],
-    ['shelf', 8.25, 8.25, 0.2, 0.75, 1.9, 0], ['bed', 15.22, 1.05, 0.82, 1.0, 0.55, 0], ['table', 13.2, 3.0, 0.4, 0.25, 0.72, 0],
-    ['shelf', 12.35, 3.0, 0.2, 0.5, 1.5, 0],
-  ];
-  furn.forEach(([label, cx, cz, hx, hz, h, yaw], i) => {
-    b.top(i === 6 ? null : label, cx, cz, hx, hz, h, yaw);
-    b.box(i === 5 ? null : label, cx, cz, hx, hz, 0, h, { yaw, zUp: i % 4 === 1 });
-  });
-  b.box('lamp', 3.6, 4.6, 0.15, 0.15, 0, 1.6).box('plant', 11.4, 2.5, 0.15, 0.15, 0, 0.9);
-  b.box('global mesh', 8, 5, 8.2, 5.1, 0, H1, { vertexCount: 35794 * 3 });
-  return b;
-}
+const F2 = 0.015;
+const bigHouse = () => userHouse();
 
 const now = () => performance.now();
 

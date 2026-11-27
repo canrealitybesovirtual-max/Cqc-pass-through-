@@ -15,18 +15,21 @@ const BOX_STRIDE = 8;
 
 /** @typedef {{ pts: Float64Array, n: number, y: number, x0: number, x1: number, z0: number, z1: number }} FlatPoly */
 
-// Slab-test result scratch (module level: no allocation per query).
+// Slab-test result scratch (module level: no allocation per query). The entry
+// distance goes through a typed array: a double returned from a call that is
+// not inlined is boxed (a heap number per hit).
 let hitAxis = 0;
 let hitSign = 0;
+const ENTRY = new Float64Array(1);
 
 /**
- * Entry distance of a ray into box `o` (offset into `b`).
+ * Entry of a ray into box `o` (offset into `b`); the distance is left in ENTRY[0].
  * @param {Float32Array} b
  * @param {number} o
  * @param {number} ox @param {number} oy @param {number} oz
  * @param {number} dx @param {number} dy @param {number} dz
  * @param {number} tmax
- * @returns {number} t ≥ 0 on entry, -1 for a miss, -2 when the origin is inside
+ * @returns {number} 1 on entry (t ≥ 0 in ENTRY[0]), -1 for a miss, -2 when the origin is inside
  */
 function boxEntry(b, o, ox, oy, oz, dx, dy, dz, tmax) {
   const c = b[o + 2], s = b[o + 3], hx = b[o + 4], hz = b[o + 5];
@@ -67,7 +70,8 @@ function boxEntry(b, o, ox, oy, oz, dx, dy, dz, tmax) {
   if (tn < 0) return -2;
   hitAxis = axis;
   hitSign = sign;
-  return tn;
+  ENTRY[0] = tn;
+  return 1;
 }
 
 /**
@@ -75,7 +79,7 @@ function boxEntry(b, o, ox, oy, oz, dx, dy, dz, tmax) {
  * @param {number} ox @param {number} oy @param {number} oz
  * @param {number} dx @param {number} dy @param {number} dz
  * @param {number} best
- * @returns {number} nearest t < best inside a polygon, or Infinity
+ * @returns {number} 1 when a polygon is hit closer than `best` (its t in ENTRY[0]), else 0
  */
 function polyHit(polys, ox, oy, oz, dx, dy, dz, best) {
   let t = Infinity;
@@ -87,7 +91,9 @@ function polyHit(polys, ox, oy, oz, dx, dy, dz, best) {
     if (x < p.x0 || x > p.x1 || z < p.z0 || z > p.z1) continue;
     if (pointInPolygon(p.pts, p.n, x, z)) t = ti;
   }
-  return t;
+  if (t === Infinity) return 0;
+  ENTRY[0] = t;
+  return 1;
 }
 
 export class ShapeSet {
@@ -152,17 +158,16 @@ export class ShapeSet {
     let best = max, bi = -1, axis = 0, sign = 0;
     const B = this.box;
     for (let i = 0, o = 0; i < this.count; i++, o += BOX_STRIDE) {
-      const t = boxEntry(B, o, ox, oy, oz, dx, dy, dz, best);
-      if (t >= 0 && t < best) { best = t; bi = i; axis = hitAxis; sign = hitSign; }
+      if (boxEntry(B, o, ox, oy, oz, dx, dy, dz, best) === 1 && ENTRY[0] < best) { best = ENTRY[0]; bi = i; axis = hitAxis; sign = hitSign; }
     }
     /** -1 box, 1 floor, 2 ceiling */
     let kind = bi >= 0 ? -1 : 0;
     if (dy < -1e-9) {
-      let t = polyHit(this.floors, ox, oy, oz, dx, dy, dz, best);
+      let t = polyHit(this.floors, ox, oy, oz, dx, dy, dz, best) === 1 ? ENTRY[0] : Infinity;
       if (t === Infinity) { const tf = (this.floorY0 - oy) / dy; if (tf > 0 && tf < best) t = tf; }
       if (t < best) { best = t; kind = 1; }
     } else if (dy > 1e-9) {
-      let t = polyHit(this.ceilings, ox, oy, oz, dx, dy, dz, best);
+      let t = polyHit(this.ceilings, ox, oy, oz, dx, dy, dz, best) === 1 ? ENTRY[0] : Infinity;
       if (t === Infinity && this.ceilingY === this.ceilingY) { const tc = (this.ceilingY - oy) / dy; if (tc > 0 && tc < best) t = tc; }
       if (t < best) { best = t; kind = 2; }
     }

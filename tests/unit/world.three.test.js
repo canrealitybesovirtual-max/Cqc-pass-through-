@@ -98,3 +98,67 @@ test('warmUp runs every build path and leaves the world unbuilt', () => {
   assert.equal(w.built, true);
   assert.equal(w.stats.walls, 8);
 });
+
+test('dev overlay: one LineSegments built at construction, hidden by default, filled in place by build', () => {
+  const w = new World();
+  const o = w.overlay;
+  assert.ok(o instanceof THREE.LineSegments);
+  assert.ok(o.material instanceof THREE.LineBasicMaterial);
+  assert.equal(o.material.vertexColors, true);
+  assert.equal(o.material.depthTest, true);
+  assert.equal(o.material.depthWrite, false);
+  assert.equal(o.visible, false, 'hidden by default');
+  assert.equal(o.frustumCulled, false);
+  assert.ok(o.renderOrder > w.occluder.renderOrder, 'drawn after the occluder: lines behind real walls are hidden');
+  assert.equal(o.geometry.drawRange.count, 2, 'a placeholder segment for the warm-up draw');
+  assert.deepEqual(w.warmMeshes(), [w.occluder, o]);
+  const { geometry, material } = o;
+  const pos = geometry.attributes.position, col = geometry.attributes.color;
+  const v0 = pos.version;
+  w.build(house(), { x: 0, z: 0 }, { doors: [true, true, false] });
+  assert.equal(o.geometry, geometry);
+  assert.equal(o.material, material);
+  assert.equal(geometry.attributes.position, pos);
+  assert.equal(geometry.attributes.color, col);
+  assert.ok(pos.version > v0, 'marked for upload (the warmXR draw after build uploads it)');
+  const L = w.layout;
+  assert.equal(w.overlayVerts, L.boxes.length * 24 + L.doors.length * 8 + L.pockets * 8);
+  assert.equal(geometry.drawRange.count, w.overlayVerts);
+  assert.equal(o.visible, false, 'still hidden after build');
+  w.setOverlay(true);
+  assert.equal(o.visible, true);
+  assert.equal(o.material, material, 'toggling is a visibility flag only');
+  // A virtual room has no occluder edges: nothing to show.
+  w.build(null, { x: 0, z: 0 });
+  assert.equal(geometry.drawRange.count, 0);
+  assert.equal(o.visible, false);
+  w.build(house(), { x: 0, z: 0 });
+  assert.equal(o.visible, true, 'the overlay setting survives a rebuild');
+  w.setOverlay(false);
+  assert.equal(o.visible, false);
+  const r = w.report();
+  assert.equal(r.occluderBoxes, w.occluderBoxes);
+  assert.equal(r.overlaySegments, w.overlayVerts / 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), r);
+});
+
+test('a closed door in World: the occluder has no hole there; rebuild() rewrites the same buffers', () => {
+  const w = new World();
+  w.build(house(), { x: 0, z: 0 });
+  const m = w.occluder;
+  const geo = m.geometry, pos = geo.attributes.position;
+  m.updateMatrixWorld(true);
+  const rc = new THREE.Raycaster();
+  const through = () => {
+    rc.set(new THREE.Vector3(-1.15, 1.0, 0), new THREE.Vector3(0, 0, -1));
+    rc.far = 4;
+    return rc.intersectObject(m).length === 0;
+  };
+  assert.ok(through(), 'open hallway door: no occluder in the opening');
+  assert.ok(w.setDoorOpen(2, false));
+  w.rebuild();
+  assert.equal(m.geometry, geo);
+  assert.equal(geo.attributes.position, pos);
+  assert.equal(through(), false, 'closed: the wall occludes across the door');
+  assert.equal(w.stats.closedDoors, 1);
+});

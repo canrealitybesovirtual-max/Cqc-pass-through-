@@ -37,6 +37,8 @@ export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons'
 export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4 });
 const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play'];
 
+const CAPTURE_LINES = Object.freeze(['Get ready', 'Reading your room…', 'Stand where you want to fight']);
+
 /** Enemy pool size (GameSession keeps at most 4 alive; 2 more for bodies still lying there). */
 export const MAX_ENEMIES = 6;
 /** A 60 s timing run starts with wave 1 (replaces Phase 1's A button, which is a weapon button now). */
@@ -106,7 +108,9 @@ export class PlayKit {
     if (this.audio && typeof this.audio.bind === 'function') this.audio.bind(this.events);
 
     this.gate = new CaptureGate();
-    this.step = STEP.IDLE;
+    /** @type {readonly string[]} the panel after the build (made once per build) */
+    this.builtLines = CAPTURE_LINES;
+    /** @type {number} STEP */ this.step = STEP.IDLE;
     /** @type {SpaceSnapshot|null} */ this.snapshot = null;
     this.captureStats = { planes: 0, meshes: 0, skippedPlanes: 0, skippedMeshes: 0 };
     /** @type {any} */ this.rec = null;
@@ -125,7 +129,7 @@ export class PlayKit {
       }
     });
     this.events.on('pause', (/** @type {{ paused: boolean, reason: string }} */ p) => {
-      if (this.perf) this.perf.mark(p.paused ? `pause ${p.reason}` : 'resume');
+      if (this.perf) this.perf.mark(!p.paused ? 'resume' : p.reason === 'zone' ? 'pause zone' : p.reason === 'hidden' ? 'pause hidden' : 'pause');
     });
   }
 
@@ -210,6 +214,7 @@ export class PlayKit {
     const buildMs = performance.now() - tb;
     this.buildAtMs = Math.round(t - this.t0);
     if (this.perf) this.perf.mark('world build');
+    this.builtLines = ['Get ready', this.world.describe()];
     if (this.rec) {
       // the user's real house, replayable on desktop (?emulate&snapshot=…)
       this.rec.spaceSnapshot = snap;
@@ -250,14 +255,22 @@ export class PlayKit {
     this.step = STEP.PLAY;
   }
 
-  /** The systems for the Loop, in the contract order ('input' and 'render' are App's / Loop's). */
+  /**
+   * The systems for the Loop, in the contract order ('input' and 'render' are App's / Loop's).
+   * GameSession decides pauses and enemy freezes in `preUpdate`, right after the player and
+   * before weapons and enemies run; frozen enemies are stepped with dt = 0.
+   */
   systems() {
-    const c = this.ctx;
+    const c = this.ctx, game = /** @type {any} */ (this.game);
+    const pre = typeof game.preUpdate === 'function';
     return [
       { name: 'world', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.worldUpdate(dt, t, f, c) },
-      { name: 'player', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.player.update(dt, t, f, c) },
+      { name: 'player', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => {
+        this.player.update(dt, t, f, c);
+        if (pre) game.preUpdate(dt, t, f, c);
+      } },
       { name: 'weapons', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.weapons.update(dt, t, f, c) },
-      { name: 'enemies', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.enemies.update(dt, t, f, c) },
+      { name: 'enemies', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.enemies.update(game.freezeEnemies ? 0 : dt, t, f, c) },
       { name: 'game', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.game.update(dt, t, f, c) },
       { name: 'audio', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => { if (this.audio) this.audio.update(dt, t, f, c); } },
     ];
@@ -295,10 +308,10 @@ export class PlayKit {
     if (this.rec && this.rec.errors && this.rec.errors.length < 50) this.rec.errors.push(msg);
   }
 
-  /** Lines for App's opaque panel before the round starts (null = hide it). */
+  /** Lines for App's opaque panel before the round starts (null = hide it). Cached arrays: no allocation per frame. */
   panelLines() {
-    if (this.step === STEP.CAPTURE) return ['Get ready', 'Reading your room…', 'Stand where you want to fight'];
-    if (this.step === STEP.WARM || this.step === STEP.START) return ['Get ready', this.world.describe()];
+    if (this.step === STEP.CAPTURE) return CAPTURE_LINES;
+    if (this.step === STEP.WARM || this.step === STEP.START) return this.builtLines;
     return null;
   }
 

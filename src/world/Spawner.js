@@ -69,6 +69,8 @@ export class SpawnFinder {
     this.recent = new Float64Array(4 * 3);
     this.recentHead = 0;
     this.spawnClear = 0.35;
+    /** A pocket is small: at most this many candidates each (the most open), so it does not outweigh real rooms. */
+    this.maxPerPocket = 3;
     this.minPathBeyondZone = 4.0;
     this.eyeHeight = 1.6;
     /** Fallback tier: only outside ±100° of the view direction. */
@@ -137,9 +139,20 @@ export class SpawnFinder {
     }
     if (found === 0) this.virtualFallback = false;
     /** @type {number[]} */ const doorSide = [], room = [];
+    /** @type {Map<number, number[]>} */ const pockets = new Map();
     for (let b = 0; b < best.length; b++) {
       const i = best[b];
-      if (i >= 0) (nav.doors[i] > 0 ? doorSide : room).push(i);
+      if (i < 0) continue;
+      if ((nav.flags[i] & NAV_POCKET) !== 0) {
+        const f = nav.floorIdx[i];
+        let list = pockets.get(f);
+        if (!list) pockets.set(f, (list = []));
+        list.push(i);
+      } else (nav.doors[i] > 0 ? doorSide : room).push(i);
+    }
+    for (const list of pockets.values()) {
+      list.sort((a, b) => nav.clr[b] - nav.clr[a] || a - b);
+      for (let k = 0; k < list.length && k < this.maxPerPocket; k++) (nav.doors[list[k]] > 0 ? doorSide : room).push(list[k]);
     }
     const all = doorSide.concat(room);
     const step = all.length > this.max ? all.length / this.max : 1;

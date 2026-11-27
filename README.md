@@ -2,7 +2,7 @@
 
 A mixed-reality tactical FPS for Meta Quest 3, played in your real house through passthrough. It is built with three.js and WebXR and runs in the Quest Browser.
 
-**Status:** Phase 1. The project is set up, and a probe session measures what your Quest's browser supports. See [docs/FEATURES.md](docs/FEATURES.md).
+**Status:** v0.2, the first playable test slice: survival waves in your Space Setup room with a Glock and an AKM, desktop-tested in the emulator, not yet played on the headset. A probe session measures what your Quest's browser supports. See [docs/FEATURES.md](docs/FEATURES.md).
 
 - **Play:** open the site in the Quest Browser and tap **Enter MR**.
 - **Develop:**

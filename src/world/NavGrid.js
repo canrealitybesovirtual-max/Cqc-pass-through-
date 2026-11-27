@@ -227,8 +227,9 @@ export class NavGrid {
    * @param {number} n
    * @param {number} bits
    * @param {number} floorIndex written to cells that have none yet (-1 = don't)
+   * @param {boolean} [skipMapped] leave cells a mapped floor already covers (INSIDE without VIRTUAL) untouched
    */
-  fillPolygon(pts, n, bits, floorIndex) {
+  fillPolygon(pts, n, bits, floorIndex, skipMapped = false) {
     let z0 = Infinity, z1 = -Infinity, x0 = Infinity, x1 = -Infinity;
     for (let i = 0; i < n; i++) {
       x0 = Math.min(x0, pts[2 * i]); x1 = Math.max(x1, pts[2 * i]);
@@ -242,6 +243,7 @@ export class NavGrid {
         const x = this.ox + (ix + 0.5) * this.cell;
         if (!pointInPolygon(pts, n, x, z)) continue;
         const i = iz * this.w + ix;
+        if (skipMapped && (this.flags[i] & (NAV_INSIDE | NAV_VIRTUAL)) === NAV_INSIDE) continue;
         this.flags[i] |= bits;
         if (floorIndex >= 0 && this.floorIdx[i] < 0) this.floorIdx[i] = floorIndex;
       }
@@ -290,16 +292,20 @@ export class NavGrid {
   }
 
   /**
-   * Count the cells whose centre lies in an oriented box and whose flags hold
-   * every bit of `mask` (build-time diagnostics, e.g. walkable door cells).
-   * With `reachable`, only walkable cells in a region connected to the player.
+   * Count the cells whose centre lies in an oriented box (build-time
+   * diagnostics, after finalize) that pass a test:
+   * - mode 0: flags hold every bit of `mask`;
+   * - mode 1: also walkable and in a region connected to the player;
+   * - mode 2: an enemy centre fits there, ignoring the player zone (on a floor
+   *   or door gap, no wall or furniture, clearance ≥ the agent / door
+   *   clearance); `mask` is ignored.
    * @param {number} cx @param {number} cz @param {number} c @param {number} s
    * @param {number} hx @param {number} hz
    * @param {number} mask
-   * @param {boolean} [reachable]
+   * @param {0|1|2} [mode]
    * @returns {number}
    */
-  countInBox(cx, cz, c, s, hx, hz, mask, reachable = false) {
+  countInBox(cx, cz, c, s, hx, hz, mask, mode = 0) {
     const rx = Math.abs(c) * hx + Math.abs(s) * hz, rz = Math.abs(s) * hx + Math.abs(c) * hz;
     const ix0 = Math.max(0, Math.floor((cx - rx - this.ox) * this.inv)), ix1 = Math.min(this.w - 1, Math.floor((cx + rx - this.ox) * this.inv));
     const iz0 = Math.max(0, Math.floor((cz - rz - this.oz) * this.inv)), iz1 = Math.min(this.h - 1, Math.floor((cz + rz - this.oz) * this.inv));
@@ -310,9 +316,14 @@ export class NavGrid {
         const dx = this.ox + (ix + 0.5) * this.cell - cx;
         const lx = dx * c + dz * s, lz = dz * c - dx * s;
         if (lx < -hx || lx > hx || lz < -hz || lz > hz) continue;
-        const i = iz * this.w + ix;
-        if ((this.flags[i] & mask) !== mask) continue;
-        if (reachable && ((this.flags[i] & NAV_WALK) === 0 || this.reach[this.region[i]] !== 1)) continue;
+        const i = iz * this.w + ix, f = this.flags[i];
+        if (mode === 2) {
+          if ((f & (NAV_INSIDE | NAV_DOOR)) === 0 || (f & (NAV_WALL | NAV_FURN | NAV_OBST)) !== 0) continue;
+          if (this.clr[i] < ((f & NAV_DOOR) !== 0 ? this.doorClear : this.agentClear)) continue;
+        } else {
+          if ((f & mask) !== mask) continue;
+          if (mode === 1 && ((f & NAV_WALK) === 0 || this.reach[this.region[i]] !== 1)) continue;
+        }
         n++;
       }
     }
@@ -349,6 +360,128 @@ export class NavGrid {
       for (let x = 0; x < w; x++) {
         const d2 = d[x];
         this.clr[row + x] = d2 <= 0 ? 0 : d2 >= BIG ? 1e3 : Math.max(0, Math.sqrt(d2) * cell - 0.5 * cell);
+      }
+    }
+  }
+
+  /**
+   * An enemy centre fits at cell i, whatever the player zone (on a floor or
+   * door gap, no wall or furniture, clearance ≥ the agent / door clearance).
+   * Valid after finalize.
+   * @param {number} i
+   */
+  fits(i) {
+    const f = this.flags[i];
+    if ((f & (NAV_INSIDE | NAV_DOOR)) === 0 || (f & (NAV_WALL | NAV_FURN | NAV_OBST)) !== 0) return false;
+    return this.clr[i] >= ((f & NAV_DOOR) !== 0 ? this.doorClear : this.agentClear);
+  }
+
+  /**
+   * Can an enemy walk through a door gap, whatever the player zone? Flood fill
+   * over cells an enemy fits in (8-connected, no corner cutting, like the
+   * planner) inside the door's surroundings (|local x| ≤ hw + 0.3,
+   * |local z| ≤ hd + 0.7), from the cells 0.2–0.7 m beyond the carve on one
+   * side to the same band on the other. Build time (allocates a small set).
+   * @param {number} cx @param {number} cz @param {number} c @param {number} s door centre and tangent
+   * @param {number} hw @param {number} hd half width, half carve depth
+   */
+  doorConnects(cx, cz, c, s, hw, hd) {
+    const w = this.w, h = this.h, cell = this.cell;
+    const ex = hw + 0.3, ez = hd + 0.7, band = hd + 0.2;
+    /** @param {number} i @returns {number} door-local z, or NaN outside the surroundings */
+    const local = (i) => {
+      const ix = i % w, iz = (i - ix) / w;
+      const dx = this.ox + (ix + 0.5) * cell - cx, dz = this.oz + (iz + 0.5) * cell - cz;
+      const lx = dx * c + dz * s, lz = dz * c - dx * s;
+      return lx < -ex || lx > ex || lz < -ez || lz > ez ? NaN : lz;
+    };
+    const rx = Math.abs(c) * ex + Math.abs(s) * ez, rz = Math.abs(s) * ex + Math.abs(c) * ez;
+    const ix0 = Math.max(0, Math.floor((cx - rx - this.ox) * this.inv)), ix1 = Math.min(w - 1, Math.floor((cx + rx - this.ox) * this.inv));
+    const iz0 = Math.max(0, Math.floor((cz - rz - this.oz) * this.inv)), iz1 = Math.min(h - 1, Math.floor((cz + rz - this.oz) * this.inv));
+    /** @type {number[]} */ const queue = [];
+    const seen = new Set();
+    for (let iz = iz0; iz <= iz1; iz++) {
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const i = iz * w + ix, lz = local(i);
+        if (lz >= band && this.fits(i)) { seen.add(i); queue.push(i); }
+      }
+    }
+    for (let q = 0; q < queue.length; q++) {
+      const i = queue[q], ix = i % w, iz = (i - ix) / w;
+      for (let k = 0; k < 8; k++) {
+        const jx = ix + NDX[k], jz = iz + NDZ[k];
+        if (jx < 0 || jz < 0 || jx >= w || jz >= h) continue;
+        const j = jz * w + jx;
+        if (seen.has(j)) continue;
+        const lz = local(j);
+        if (lz !== lz || !this.fits(j)) continue;
+        if (k >= 4 && (!this.fits(iz * w + jx) || !this.fits(jz * w + ix))) continue;
+        if (lz <= -band) return true;
+        seen.add(j);
+        queue.push(j);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Exact clearance inside one carved door gap (after computeClearance). On a
+   * 0.10 m grid the jamb slabs are staircases padded by half a cell, so the
+   * distance transform alone loses up to ~0.15 m of a yawed door's width (a
+   * 0.7 m door at 21° was impassable). Here each door cell's clearance is the
+   * exact distance to the jambs: the wall slabs either side of the gap, given
+   * as bands of door-local z (lz = −(p − centre)·n) with |local x| ≥ hw; or
+   * the distance to the nearest other obstacle if that is closer: furniture
+   * always, floor edges and wall cells outside the slab bands.
+   * @param {number} cx @param {number} cz door centre
+   * @param {number} c @param {number} s door tangent (unit)
+   * @param {number} hw half width @param {number} hd half depth of the carve
+   * @param {ArrayLike<number>} bands slab bands [z0, z1, …] in door-local z
+   * @param {number} [radius] scan radius (clearances beyond it are capped there)
+   */
+  refineDoorClearance(cx, cz, c, s, hw, hd, bands, radius = 0.6) {
+    const w = this.w, h = this.h, cell = this.cell, fl = this.flags;
+    const rx = Math.abs(c) * hw + Math.abs(s) * hd, rz = Math.abs(s) * hw + Math.abs(c) * hd;
+    const ix0 = Math.max(0, Math.floor((cx - rx - this.ox) * this.inv)), ix1 = Math.min(w - 1, Math.floor((cx + rx - this.ox) * this.inv));
+    const iz0 = Math.max(0, Math.floor((cz - rz - this.oz) * this.inv)), iz1 = Math.min(h - 1, Math.floor((cz + rz - this.oz) * this.inv));
+    const R = Math.ceil(radius * this.inv);
+    let bz0 = Infinity, bz1 = -Infinity;
+    for (let k = 0; k + 1 < bands.length; k += 2) { if (bands[k] < bz0) bz0 = bands[k]; if (bands[k + 1] > bz1) bz1 = bands[k + 1]; }
+    // Wall and off-floor cells this close to the slab bands are the jambs (counted exactly), not obstacles.
+    bz0 -= cell; bz1 += cell;
+    const bandX = hw + 0.45;
+    for (let iz = iz0; iz <= iz1; iz++) {
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const i = iz * w + ix;
+        if ((fl[i] & NAV_DOOR) === 0) continue;
+        const dx = this.ox + (ix + 0.5) * cell - cx, dz = this.oz + (iz + 0.5) * cell - cz;
+        const lx = dx * c + dz * s, lz = dz * c - dx * s;
+        if (lx < -hw || lx > hw || lz < -hd || lz > hd) continue;
+        let best = radius;
+        const ex = hw - (lx < 0 ? -lx : lx);
+        for (let k = 0; k + 1 < bands.length; k += 2) {
+          const ez = lz < bands[k] ? bands[k] - lz : lz > bands[k + 1] ? lz - bands[k + 1] : 0;
+          const dj = Math.sqrt(ex * ex + ez * ez);
+          if (dj < best) best = dj;
+        }
+        for (let jz = iz - R; jz <= iz + R; jz++) {
+          for (let jx = ix - R; jx <= ix + R; jx++) {
+            const ddx = (jx - ix) * cell, ddz = (jz - iz) * cell;
+            const d = Math.sqrt(ddx * ddx + ddz * ddz) - 0.5 * cell;
+            if (d >= best) continue;
+            if (jx >= 0 && jz >= 0 && jx < w && jz < h) {
+              const f = fl[jz * w + jx];
+              if ((f & NAV_OBST) === 0) {
+                if ((f & (NAV_INSIDE | NAV_DOOR)) !== 0 && (f & NAV_WALL) === 0) continue; // free
+                const qx = dx + ddx, qz = dz + ddz;
+                const qlx = qx * c + qz * s, qlz = qz * c - qx * s;
+                if (qlz >= bz0 && qlz <= bz1 && qlx >= -bandX && qlx <= bandX) continue; // a jamb cell
+              }
+            }
+            best = d;
+          }
+        }
+        this.clr[i] = best > 0 ? best : 0;
       }
     }
   }

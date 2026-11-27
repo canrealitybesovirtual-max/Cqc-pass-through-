@@ -14,6 +14,16 @@ Add one entry per phase test. Each entry records the build version (shown on the
 4. In every session, note whether the system boundary appears.
 5. Tap **Copy** and paste the JSON into the chat.
 
+## v0.2: tests to run
+
+1. **Probe session: "Hand does not cover the cube" (your report from the p1 build).**
+    - Read out the panel's **Depth** line: it says whether depth arrived, whether three's occlusion pass runs, and whether the browser hands out a new depth texture every frame (`rec.probes.liveDepth.textureChanges`). v0.2 keeps three's texture current either way.
+    - Hand about 40 cm in front of your face, over the cube: hidden or not?
+    - **Y**: the depth picture. Does a hand shape show up in it when you move your hand?
+    - **X** twice (clear off, on): black or smeared?
+2. **Play.** Two waves at least: Glock from the hip, shots, A reload, pouch reload, rack, AKM from the shoulder (selector, burst, two hands). Note what feels wrong. Exit by holding Y.
+3. Tap **Copy** and paste the JSON into the chat. Play records carry `spaceSnapshot` (your house, replayable on desktop), `play.world.report`, `warmXR`, `perfRuns` (the 60 s run from wave 1) and `systemsMs`.
+
 ## Entries
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)
