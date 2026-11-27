@@ -87,7 +87,7 @@ export class World extends WorldCore {
       const box = geo.boundingBox || (geo.boundingBox = new THREE.Box3());
       box.makeEmpty();
       const v = new THREE.Vector3();
-      for (let i = 0; i < n * OCC_VERTS_PER_BOX; i++) box.expandByPoint(v.fromArray(pos, i * 3));
+      for (let i = 0; i < n * OCC_VERTS_PER_BOX; i++) box.expandByPoint(v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]));
       const sphere = geo.boundingSphere || (geo.boundingSphere = new THREE.Sphere());
       box.getBoundingSphere(sphere);
     }

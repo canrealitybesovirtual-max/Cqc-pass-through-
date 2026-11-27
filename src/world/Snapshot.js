@@ -204,7 +204,10 @@ export class CaptureGate {
   constructor({ stableMs = 500, timeoutMs = 3000 } = {}) {
     this.stableMs = stableMs;
     this.timeoutMs = timeoutMs;
-    this.reset();
+    this.t0 = -1;
+    this.count = -1;
+    this.since = 0;
+    this.done = false;
   }
 
   reset() {

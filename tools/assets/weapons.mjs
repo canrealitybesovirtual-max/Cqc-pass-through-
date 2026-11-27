@@ -51,6 +51,7 @@ const set = (p, role, label) => { p.role = role; p.label = label; };
  * @property {{ x: number, slideTravelMargin: number, ejectDir: V3, palmBelowGuard: number, magAxisTop?: number,
  *   catchAxis: V3, catchTravel: number }} tune
  * @property {string[]} partNames
+ * @property {Record<string, number>} [errScale] simplification error factor per label (barely visible parts)
  */
 
 /** @type {WeaponDef} */
@@ -65,6 +66,7 @@ export const GLOCK = {
   triBudget: 26000,
   res: 1400,
   partNames: ['static', 'slide', 'trigger', 'slideStop', 'magCatch'],
+  errScale: { recoilSpring: 3 },
   tune: { x: 0, slideTravelMargin: 0.0015, ejectDir: [1.5, 1.9, 0.8], palmBelowGuard: 0.02, catchAxis: [1, 0, 0], catchTravel: 0.0025 },
   classify(p) {
     const [ex, ey, ez] = ext(p);
@@ -105,6 +107,7 @@ export const AKM = {
   triBudget: 28000,
   res: 2400,
   partNames: ['static', 'carrier', 'trigger', 'selector', 'magCatch'],
+  errScale: { recoilSpring: 4, bolt: 2 },
   tune: { x: 0, slideTravelMargin: 0.003, ejectDir: [0.85, 0.35, -0.4], palmBelowGuard: 0.02, magAxisTop: 0.045, catchAxis: [0, 0, -1], catchTravel: 0.004 },
   classify(p, all) {
     const [ex, , ez] = ext(p);
@@ -348,7 +351,7 @@ export async function bakeWeapon(def, env) {
   const rifleSource = pieces.map((p) => ({ ...p })); // pre-simplification, for the enemy rifle
 
   // 6. simplification to the budget (same absolute error for every piece)
-  const simplified = simplifyToBudget(pieces, def.triBudget, 5e-5, 6e-4);
+  const simplified = simplifyToBudget(pieces, def.triBudget, 5e-5, 6e-4, def.errScale);
   log(`${def.id}: simplified at ${(simplified.error * 1000).toFixed(3)} mm -> ${simplified.tris} tris`);
   pieces = simplified.pieces;
 
@@ -673,12 +676,16 @@ export function unwrapUV(p) {
 }
 
 /**
- * Simplify every piece at one absolute error; bisect the error so the total
- * fits the budget (never below errMin).
+ * Simplify every piece at one absolute error (times a per-label factor for
+ * parts that are only glimpsed, like springs seen through a port); bisect the
+ * error so the total fits the budget (never below errMin).
  * @param {(Piece & { cut?: boolean })[]} pieces @param {number} budget @param {number} errMin @param {number} errMax
+ * @param {Record<string, number>} [errScale]
+ * @param {boolean} [permissive] allow collapses across UV seams (distant LODs only)
  */
-export function simplifyToBudget(pieces, budget, errMin, errMax) {
-  const run = (/** @type {number} */ e) => pieces.map((p) => ({ ...p, ...weldAndSimplify(p, e, { lockBorder: !!p.cut }) }));
+export function simplifyToBudget(pieces, budget, errMin, errMax, errScale = {}, permissive = false) {
+  const k = (/** @type {Piece} */ p) => /** @type {Record<string, number>} */ (errScale)[(p.label || '').replace(/:back$/, '')] ?? 1;
+  const run = (/** @type {number} */ e) => pieces.map((p) => ({ ...p, ...weldAndSimplify(p, e * k(p), { lockBorder: !!p.cut, permissive }) }));
   const count = (/** @type {{ idx: Uint32Array }[]} */ ps) => ps.reduce((a, p) => a + p.idx.length / 3, 0);
   let best = run(errMin), e = errMin;
   if (count(best) > budget) {
@@ -784,7 +791,7 @@ export function rifleMesh(src, budget) {
     const b = bounds(p.pos);
     return length(sub(b.max, b.min)) > 0.014 && !/:back$/.test(p.label || '') && !/Spring|bolt$/.test(p.label || '');
   });
-  let r = simplifyToBudget(big.map((p) => ({ ...p, cut: false })), budget, 2e-4, 2e-2);
+  const r = simplifyToBudget(big.map((p) => ({ ...p, cut: false })), budget, 2e-4, 2e-2, {}, true);
   return concat(r.pieces);
 }
 

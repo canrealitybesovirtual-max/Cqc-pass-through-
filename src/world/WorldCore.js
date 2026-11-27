@@ -236,10 +236,14 @@ export class WorldCore {
   }
 
   /**
-   * The world is static; this only tracks time for the spawn memory.
-   * @param {number} dt @param {number} t ms
+   * The world is static (never rebuilt during play); this only tracks time for
+   * the spawn memory. Allocation-free.
+   * @param {number} dt seconds
+   * @param {number} t ms
+   * @param {any} [frame] XRFrame (unused)
+   * @param {any} [ctx] (unused)
    */
-  update(dt, t) {
+  update(dt, t, frame, ctx) {
     this.time = t * 0.001;
   }
 

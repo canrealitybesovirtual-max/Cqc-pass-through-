@@ -15,7 +15,8 @@ export const ready = MeshoptSimplifier.ready;
  * Simplify one mesh to an absolute geometric error.
  * @param {MeshData} m (already welded)
  * @param {number} error metres
- * @param {{ lockBorder?: boolean, targetRatio?: number }} [opt]
+ * @param {{ lockBorder?: boolean, targetRatio?: number, permissive?: boolean }} [opt]
+ *   permissive: also collapse across UV seams where the error allows (distant LODs)
  * @returns {MeshData}
  */
 export function simplifyAbs(m, error, opt = {}) {
@@ -24,6 +25,7 @@ export function simplifyAbs(m, error, opt = {}) {
   /** @type {import('meshoptimizer').SimplifierFlags[]} */
   const flags = ['ErrorAbsolute'];
   if (opt.lockBorder) flags.push('LockBorder');
+  if (opt.permissive) flags.push('Permissive', 'Prune');
   const target = Math.max(3, Math.floor(m.idx.length * (opt.targetRatio ?? 0)) - (Math.floor(m.idx.length * (opt.targetRatio ?? 0)) % 3));
   const [idx] = MeshoptSimplifier.simplify(m.idx, m.pos, 3, target, error, flags);
   return compact({ ...m, idx: Uint32Array.from(idx) });
@@ -49,7 +51,7 @@ export function compact(m) {
 
 /**
  * Weld then simplify, keeping the result only if it is smaller.
- * @param {MeshData} m @param {number} error @param {{ lockBorder?: boolean }} [opt]
+ * @param {MeshData} m @param {number} error @param {{ lockBorder?: boolean, permissive?: boolean }} [opt]
  */
 export function weldAndSimplify(m, error, opt = {}) {
   const w = weldExact(m);
