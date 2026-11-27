@@ -193,7 +193,9 @@ export const AKM = deepFreeze({
   startRounds: 30,
   startChambered: true,
   modes: ['safe', 'auto', 'semi'],
-  startMode: 'safe',
+  // Issued on semi for the first headset tests (gap audit F3: on safe the trigger does nothing and the
+  // rifle reads as broken). The stick click then goes semi → safe → auto → semi.
+  startMode: 'semi',
   selectorRad: [0, -0.17, -0.34],
   cyclicRpm: 600,
   autoDelayS: 0.010,

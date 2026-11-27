@@ -15,26 +15,34 @@
  * space, made for spawning); the whole room is virtual (no Space Setup floor);
  * or no mapped cell qualifies at all (`virtualFallback`, noted in the report).
  *
- * Query (`find`, allocation-free): ≥ minDist (and ≥ 2.5 m) from the player,
- * not near a recent spawn, then in preference order:
+ * Query (`find`, allocation-free): ≥ minDist (and never within 3.5 m) of the
+ * player, not near a recent spawn, then in preference order:
  *   3. on the far side of a door (pockets included) and hidden from the player's eyes;
  *   2. hidden behind walls or furniture in the player's room;
  *   1. visible, but outside ±100° of the view direction (behind the player:
- *      the Quest 3 sees about ±55°, and the head turns) and ≥ 3 m away.
+ *      the Quest 3 sees about ±55°, and the head turns);
+ *   4. last resort, only when `inViewAfter` finds in a row found none of the
+ *      above (nothing else exists, e.g. the player faces the only open floor;
+ *      a wave must not stall): visible within ±100°, the one furthest from the
+ *      view direction (≥ 55° when there is one: outside the Quest's view).
  * "Hidden" = every sight line from the eye (floor + 1.6 m) to the enemy's
  * shins, chest, head and both shoulders is blocked. Within a tier the choice is
  * random (seeded), mildly favouring 5–12 m of path. At most `evalCap`
  * candidates get sight tests per call, so the cost is bounded.
  *
- * Every find() is counted by the tier it returned (`finds[0..3]`, 0 = none
- * found) and the last 16 spawns are kept in a ring (x, z, tier, time) for the
- * session record (`report`).
+ * Every find() is counted by the tier it returned (`finds[0..4]`, 0 = none
+ * found), `lastTier` / `lastX` / `lastZ` hold the last find's result (the
+ * enemy manager records each spawn's tier from them) and the last 16 spawns
+ * are kept in a ring (x, z, tier, time) for the session record (`report`).
  */
 
 import { NAV_DOOR, NAV_INSIDE, NAV_POCKET, NAV_VIRTUAL, NAV_WALK } from './NavGrid.js';
 
 /** Spawn log ring size (x, z, tier, time per entry). */
 export const SPAWN_LOG = 16;
+
+/** Spawn tiers (`lastTier`, `finds[]`, the log). IN_VIEW is the last resort, not the best. */
+export const SPAWN_TIER = Object.freeze({ NONE: 0, BEHIND: 1, HIDDEN_ROOM: 2, HIDDEN_DOOR: 3, IN_VIEW: 4 });
 
 const DIRX = new Float32Array(8), DIRZ = new Float32Array(8);
 for (let k = 0; k < 8; k++) { DIRX[k] = Math.cos((k * Math.PI) / 4); DIRZ[k] = Math.sin((k * Math.PI) / 4); }
@@ -76,15 +84,24 @@ export class SpawnFinder {
     /** Fallback tier: only outside ±100° of the view direction. */
     this.fovCos = Math.cos((100 * Math.PI) / 180);
     this.nearVisible = 3.0;
-    this.hardMin = 2.5;
+    /** Never closer than this to the player, whatever minDist says (m). */
+    this.hardMin = 3.5;
+    /** The in-view last resort needs this many finds in a row with nothing else. */
+    this.inViewAfter = 4;
+    /** Finds in a row that returned nothing outside the view. */
+    this.failStreak = 0;
+    /** cos of the Quest 3's horizontal half view (≈ 55°): the last resort prefers beyond it. */
+    this.viewCos = Math.cos((55 * Math.PI) / 180);
     this.evalCap = 128;
     this.avoidR = 1.0;
     this.avoidS = 10;
-    /** Diagnostics of the last find(): tier 0 = nothing found. */
+    /** Diagnostics of the last find(): tier 0 = nothing found; the point it returned. */
     this.lastTier = 0;
+    this.lastX = NaN;
+    this.lastZ = NaN;
     this.lastEvals = 0;
-    /** find() results by tier since the last build (0 = nothing found). */
-    this.finds = new Uint32Array(4);
+    /** find() results by tier since the last build (0 = nothing found, 4 = in view). */
+    this.finds = new Uint32Array(5);
     /** Last SPAWN_LOG spawns: x, z, tier, time (s). */
     this.log = new Float32Array(SPAWN_LOG * 4);
     this.logHead = 0;
@@ -104,6 +121,8 @@ export class SpawnFinder {
     this.log.fill(0);
     this.logHead = this.logCount = 0;
     this.lastTier = 0;
+    this.lastX = this.lastZ = NaN;
+    this.failStreak = 0;
     this.virtualFallback = false;
     this.skippedVirtual = 0;
     const w = nav.w, h = nav.h, B = 5; // 0.5 m blocks
@@ -189,6 +208,7 @@ export class SpawnFinder {
    */
   find(world, fromX, fromZ, vx, vz, minDist, out, time) {
     this.lastTier = 0;
+    this.lastX = this.lastZ = NaN;
     this.lastEvals = 0;
     if (this.count === 0) return false;
     const vl = Math.sqrt(vx * vx + vz * vz);
@@ -197,6 +217,8 @@ export class SpawnFinder {
     const eyeY = world.floorY(fromX, fromZ) + this.eyeHeight;
     const minD = minDist > this.hardMin ? minDist : this.hardMin;
     let bestScore = -1, bx = 0, bz = 0, bestTier = 0, evals = 0, hiddenDoor = 0;
+    // the last resort: visible within ±100° (used only after inViewAfter empty finds)
+    let ivScore = -1, ivx = 0, ivz = 0;
     for (let pass = 0; pass < 2; pass++) {
       if (pass === 1 && bestTier === 3) break;
       const lo = pass === 0 ? 0 : this.doorCount, hi = pass === 0 ? this.doorCount : this.count;
@@ -217,7 +239,12 @@ export class SpawnFinder {
         else {
           if (d < this.nearVisible || !hasView) continue;
           cosA = (dx * vx + dz * vz) / d;
-          if (cosA > this.fovCos) continue;
+          if (cosA > this.fovCos) {
+            // in view: remember the most peripheral one (beyond the Quest's view first), then farther
+            const iv = (cosA <= this.viewCos ? 4 : 0) + (1 - cosA) * 2 + (d > 8 ? 8 : d) * 0.05 + (this.rand() / 4294967296) * 0.2;
+            if (iv > ivScore) { ivScore = iv; ivx = x; ivz = z; }
+            continue;
+          }
           tier = 1;
         }
         const p = this.path[c];
@@ -228,11 +255,18 @@ export class SpawnFinder {
       }
     }
     this.lastEvals = evals;
+    if (bestTier === 0) {
+      this.failStreak++;
+      if (ivScore < 0 || this.failStreak < this.inViewAfter) { this.finds[0]++; return false; }
+      bestTier = 4; bx = ivx; bz = ivz; // nothing else for a while: the least visible point in view
+    }
+    this.failStreak = 0; // (after an in-view spawn the next one waits again: time to turn)
     this.finds[bestTier]++;
-    if (bestTier === 0) return false;
     out.x = bx;
     out.z = bz;
     this.lastTier = bestTier;
+    this.lastX = bx;
+    this.lastZ = bz;
     const o = this.recentHead * 3;
     this.recent[o] = bx; this.recent[o + 1] = bz; this.recent[o + 2] = time;
     this.recentHead = (this.recentHead + 1) & 3;
@@ -246,7 +280,8 @@ export class SpawnFinder {
   /**
    * Session-record summary (allocates; build time or session end only):
    * candidate counts by kind; by tier as seen from (sx, sz) at build (eye at
-   * floor + 1.6 m; 'visible' ones can only be used by the ±100° fallback);
+   * floor + 1.6 m; 'visible' ones can only be used by the ±100° fallback or
+   * the in-view last resort);
    * per floor; the find() results by tier; and the last spawns, oldest first.
    * @param {{ floorY(x: number, z: number): number, segmentClear(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean,
    *   nav: import('./NavGrid.js').NavGrid }} world
@@ -280,7 +315,7 @@ export class SpawnFinder {
       virtualFallback: this.virtualFallback,
       fromStart: { tier3: hiddenDoor, tier2: hiddenRoom, visible, tooNear },
       byFloor,
-      finds: { none: this.finds[0], tier1: this.finds[1], tier2: this.finds[2], tier3: this.finds[3] },
+      finds: { none: this.finds[0], tier1: this.finds[1], tier2: this.finds[2], tier3: this.finds[3], inView: this.finds[4] },
       recent,
     };
   }

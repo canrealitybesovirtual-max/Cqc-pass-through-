@@ -93,8 +93,8 @@ export class MuzzleFlash {
     this.mesh.visible = false;
     scene.add(this.mesh);
     this.max = max;
-    /** Per slot: age (s, ≥ LIFE = free), transform. */
-    this.age = new Float32Array(max).fill(LIFE);
+    /** Per slot: age (s, ≥ LIFE = free; Float64: a Float32 fill of LIFE reads back below it, so every slot drew once). */
+    this.age = new Float64Array(max).fill(LIFE);
     this.px = new Float32Array(max); this.py = new Float32Array(max); this.pz = new Float32Array(max);
     this.qx = new Float32Array(max); this.qy = new Float32Array(max); this.qz = new Float32Array(max); this.qw = new Float32Array(max);
     this.sc = new Float32Array(max);

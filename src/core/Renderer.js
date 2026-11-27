@@ -1,6 +1,16 @@
 // @ts-check
 import * as THREE from 'three';
 
+/** Camera near plane (m): probe and depth sessions, and the desktop view. */
+export const CAMERA_NEAR = 0.05;
+/**
+ * Near plane in play sessions without depth sensing (m): the AKM's stock sits
+ * up to 0.27 m behind the grip and clipped through the face at 0.05 when
+ * aiming. With depth sensing on, three takes the near plane from the depth
+ * data instead, so depth sessions keep CAMERA_NEAR.
+ */
+export const PLAY_NEAR = 0.02;
+
 /**
  * WebGL2 renderer for XR. We create the context ourselves with
  * `xrCompatible: true`, so three.js skips `makeXRCompatible()` (a context
@@ -48,7 +58,7 @@ export function createRenderer({ dev }) {
   scene.add(hemi, sun);
 
   // Only used outside XR; inside XR three.js drives its own ArrayCamera.
-  const camera = new THREE.PerspectiveCamera(70, 1, 0.05, 50);
+  const camera = new THREE.PerspectiveCamera(70, 1, CAMERA_NEAR, 50);
 
   return { renderer, scene, camera, gl, canvas, hemi, sun, flashLights };
 }

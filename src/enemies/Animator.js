@@ -20,8 +20,9 @@
  *    and head; bladed chest and cheek weld while aiming.
  * 4. Hit reaction: additive springs on the torso, head and knees, plus a
  *    recoil spring on the rifle.
- * 5. Death: a scripted fall away from the shot (an inverted pendulum about the
- *    feet with the knees buckling), twisting to land on the back or front, the
+ * 5. Death: a scripted fall away from the shot, or the clearest way the
+ *    manager found (src/enemies/Fall.js: no falling into real walls or
+ *    sofas), as an inverted pendulum about the feet with the knees buckling, twisting to land on the back or front, the
  *    rifle dropped, the body brought to rest ON the floor plane (the lowest
  *    body point touches y = floor, nothing sinks below it), limbs settling.
  *
@@ -281,10 +282,13 @@ export class Animator {
   }
 
   /**
-   * Start the death fall. (dx, dz) = bullet travel (world, horizontal part used).
+   * Start the death fall. (dx, dz) = fall direction (world, horizontal part
+   * used): the bullet's travel, or the clearest direction the manager chose
+   * (src/enemies/Fall.js, which then passes scatter 0: it scattered already).
    * @param {number} dx @param {number} dz @param {boolean} headshot
+   * @param {number} [scatter] total random spread (rad) added here (default ±25°)
    */
-  die(dx, dz, headshot) {
+  die(dx, dz, headshot, scatter = 0.9) {
     if (this.dead) return;
     this.dead = true;
     this.deathT = 0;
@@ -295,7 +299,7 @@ export class Animator {
     if (l < 1e-3) { fx = 0; fz = -1; l = 1; }
     fx /= l; fz /= l;
     // ±25° of scatter, and a head shot mostly drops where he stands
-    const sc = (this.rng.next() - 0.5) * 0.9, cs = Math.cos(sc), sn = Math.sin(sc);
+    const sc = (this.rng.next() - 0.5) * (Number.isFinite(scatter) ? scatter : 0.9), cs = Math.cos(sc), sn = Math.sin(sc);
     this.fallX = fx * cs + fz * sn; this.fallZ = -fx * sn + fz * cs;
     // body yaw that lands him on his back (back toward the fall) or front
     const yawBack = Math.atan2(-this.fallX, -this.fallZ), yawFront = Math.atan2(this.fallX, this.fallZ);

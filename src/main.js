@@ -6,7 +6,7 @@ import { preload, preloaded, preloadSummary } from './core/Preload.js';
 import { checkSupport } from './debug/CapabilityLog.js';
 import { Diagnostics } from './debug/Diagnostics.js';
 import { HomePage } from './ui/HomePage.js';
-import { PlayKit } from './app/Play.js';
+import { PlayKit, gripFitFromParams } from './app/Play.js';
 import { loadFixture, normalizeSnapshot } from './world/World.js';
 
 const params = new URLSearchParams(location.search);
@@ -63,12 +63,13 @@ async function boot() {
     scene: gfx.scene,
     camera: gfx.camera,
     onProgress: (f, label) => page.loading(f, label),
-    // The whole game is built here, once: world + occluder, player, weapons (views, FX pools), enemy
+    // The whole game is built here, once: world (occluder + dev overlay: world.warmMeshes()), player, weapons (views, FX pools), enemy
     // pool, game session (ring, tint, messages), wrist HUD. The warm-up then compiles, uploads and draws
     // all of it before Enter MR is enabled; nothing is built or re-keyed after this.
     buildPools: async (assets, audio) => {
       const fixture = await fixtureFor(diag);
-      const kit = new PlayKit({ gfx, assets, audio, input: app.input, fixture });
+      // ?gripPitch=<deg>&gripY=<m>&gripZ=<m>: the grip fit escape hatch (both guns; logged in rec.play.grip)
+      const kit = new PlayKit({ gfx, assets, audio, input: app.input, fixture, grip: gripFitFromParams(params) });
       app.play = kit;
       kit.setWarm(true); // every pool shown (and culling off) for the warm-up draw
       return kit.warmObjects();

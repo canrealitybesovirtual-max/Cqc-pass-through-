@@ -339,19 +339,25 @@ test('glock: reset() re-issues the weapon', () => {
 
 // ------------------------------------------------------------------ AKM
 
-test('akm: issued on safe with 30 + 1; selector safe -> auto -> semi -> safe', () => {
+test('akm: issued on semi with 30 + 1 (the trigger works out of the box); selector semi -> safe -> auto -> semi', () => {
   const { w, take, ok } = rig(AKM);
-  assert.deepEqual([w.mode, w.magRounds, w.chamber, w.cocked], ['safe', 30, CHAMBER_LIVE, true]);
-  assert.equal(w.selectorRad, 0);
+  assert.equal(AKM.startMode, 'semi');
+  assert.deepEqual([w.mode, w.magRounds, w.chamber, w.cocked], ['semi', 30, CHAMBER_LIVE, true]);
+  assert.equal(w.selectorRad, AKM.selectorRad[2]);
+  assert.equal(w.selector(), true); assert.equal(w.selectorRad, AKM.selectorRad[0]);
   assert.equal(w.selector(), true); assert.equal(w.selectorRad, AKM.selectorRad[1]);
-  assert.equal(w.selector(), true); assert.equal(w.selectorRad, AKM.selectorRad[2]);
   assert.equal(w.selector(), true);
-  assert.deepEqual(take(), ['sel:auto', 'sel:semi', 'sel:safe']);
+  assert.deepEqual(take(), ['sel:safe', 'sel:auto', 'sel:semi']);
+  // reset re-issues on semi
+  w.selector();
+  w.reset();
+  assert.equal(w.mode, 'semi');
+  assert.equal(w.triggerPull(), true, 'fires on the first pull');
   ok();
 });
 
 test('akm: safe blocks the trigger and stops the charging handle at 15 %', () => {
-  const { w, take, run, ok } = rig(AKM);
+  const { w, take, run, ok } = rig(AKM, { mode: 'safe' });
   assert.equal(w.triggerPull(), false);
   w.triggerRelease();
   w.rackPull(1);

@@ -1,7 +1,8 @@
 // @ts-check
 /**
  * Everything the headset measured, kept across reloads in localStorage and
- * exported as one JSON (copy, download, or share). Writes happen only at
+ * exported as JSON: Copy takes only the last session (small enough to paste
+ * into a chat), Download and Share take everything. Writes happen only at
  * session end or when the page is hidden, never from the frame loop.
  */
 
@@ -47,16 +48,36 @@ export class Diagnostics {
     try { localStorage.removeItem(KEY); } catch { /* ignore */ }
   }
 
+  /** Everything (Download and Share): every kept session, hitch logs and snapshots. */
   json() { return JSON.stringify({ ...this.data, exportedAt: new Date().toISOString() }, null, 1); }
+
+  /**
+   * What Copy pastes into the chat: the LAST session only, plus everything
+   * that is not a session (app, version, ua, support, preload, pageErrors).
+   * Compact (no indentation) so it stays small.
+   */
+  lastJson() {
+    const { sessions, ...rest } = this.data;
+    const last = sessions.length ? [sessions[sessions.length - 1]] : [];
+    return JSON.stringify({ ...rest, sessions: last, sessionsKept: sessions.length,
+      copied: 'last session only (Download or Share has every kept session)', exportedAt: new Date().toISOString() });
+  }
+
+  /** Sizes of both exports, for the page: { copy: '42 KB', all: '310 KB', sessions: 6 }. Allocates (page only). */
+  sizes() {
+    return { copy: sizeText(this.lastJson().length), all: sizeText(this.json().length), sessions: this.data.sessions.length };
+  }
 
   fileName() { return `cqc-pt-diagnostics-${this.data.version}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`; }
 
   /** @returns {Promise<string>} what happened, for the page */
   async copy() {
-    const text = this.json();
+    const text = this.lastJson();
+    const size = sizeText(text.length);
+    const what = this.data.sessions.length ? 'the last session' : 'the page diagnostics (no session yet)';
     try {
       await navigator.clipboard.writeText(text);
-      return `Copied ${Math.round(text.length / 1024)} KB — paste it into the chat.`;
+      return `Copied ${what} (${size}) — paste it into the chat.`;
     } catch {
       const ta = document.createElement('textarea');
       ta.value = text;
@@ -64,7 +85,7 @@ export class Diagnostics {
       ta.select();
       const ok = document.execCommand('copy');
       ta.remove();
-      return ok ? `Copied ${Math.round(text.length / 1024)} KB — paste it into the chat.` : 'Copy blocked by the browser — use Download or Share.';
+      return ok ? `Copied ${what} (${size}) — paste it into the chat.` : `Copy blocked by the browser (${size}) — use Download or Share.`;
     }
   }
 
@@ -77,7 +98,7 @@ export class Diagnostics {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    return 'Download started.';
+    return `Download started (${this.allText()}).`;
   }
 
   /** @returns {Promise<string>} */
@@ -85,9 +106,20 @@ export class Diagnostics {
     const text = this.json();
     try {
       const file = new File([text], this.fileName(), { type: 'application/json' });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'CQC Pass-Through diagnostics' }); return 'Shared.'; }
-      if (navigator.share) { await navigator.share({ title: 'CQC Pass-Through diagnostics', text }); return 'Shared as text.'; }
+      if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'CQC Pass-Through diagnostics' }); return `Shared (${this.allText(text)}).`; }
+      if (navigator.share) { await navigator.share({ title: 'CQC Pass-Through diagnostics', text }); return `Shared as text (${this.allText(text)}).`; }
     } catch (e) { return `Share cancelled or failed (${e}).`; }
     return 'Sharing is not available here — use Copy or Download.';
   }
+
+  /** "310 KB, 6 sessions" for the full export. @param {string} [text] the full export, when already made */
+  allText(text) {
+    const n = this.data.sessions.length;
+    return `${sizeText((text ?? this.json()).length)}, ${n} session${n === 1 ? '' : 's'}`;
+  }
+}
+
+/** @param {number} chars JSON length (ASCII, so ≈ bytes) */
+export function sizeText(chars) {
+  return chars >= 1024 * 1024 ? `${(chars / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(chars / 1024))} KB`;
 }

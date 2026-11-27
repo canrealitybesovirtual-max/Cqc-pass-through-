@@ -262,7 +262,7 @@ export class EnemyManager {
     - Wave n has 2 + n enemies, at most 4 alive at once; spawns come from `world.findSpawn`.
     - 5 s break between waves, which heals 25.
     - Player health 100. On death, a `roundOver` card appears. **Y** = restart.
-    - **Safe zone:** centred where the player stood at the start, r = 0.8 m.
+    - **Safe zone:** centred where the player confirmed the spot (v0.2.1; v0.2: where they stood at the start), r = 0.8 m.
         - A floor ring shows near the edge.
         - The head beyond r gives a full pause ("Return to your spot"). Resume after 0.5 s back inside, then a 3-2-1 countdown.
     - Visibility blur also pauses.
@@ -283,6 +283,7 @@ export class EnemyManager {
     4. Only then is "Enter MR" enabled.
 - **App wiring:** `App.started` for mode `play` creates the Ctx and registers the systems in the order above (`PerfMonitor` system names to match).
     - It captures the Space Setup snapshot, builds the World and starts the GameSession behind a "Get ready" panel (with one draw of the pools behind it).
+    - v0.2.1: the panel carries a controls card; then `game.pickSpot` lets the player confirm an open spot with the trigger (the world is rebuilt around it, behind the panel, when it is more than 0.25 m from the build point), and `game.start(zone)` starts the round there.
     - It stores the snapshot in the session record (`rec.spaceSnapshot`), so the user's real house can be replayed on desktop later.
     - The `probe` mode stays as it is.
 - **`?emulate`:** loads `tests/fixtures/house.json`. IWER has no scene data.

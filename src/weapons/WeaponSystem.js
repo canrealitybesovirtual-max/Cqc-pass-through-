@@ -22,7 +22,8 @@ import { HANDLING, MagWell, MAG_FREE, MAG_GUIDED, TriggerGate, HapticGate, rackF
  * - Right trigger fires (bore at the moment the trigger breaks, through
  *   `ctx.raycast`). A = magazine release; A again with the magazine out =
  *   assisted reload (1.2 s, for testing). B = slide release. Right stick
- *   click = AKM selector (safe → auto → semi).
+ *   click = AKM selector (lever order, wrapping: safe → auto → semi → safe; the
+ *   AKM is issued on semi, so the first click puts it on safe).
  * - Left grip at the left-hip pouch takes a fresh magazine; bring it to the
  *   well, aligned, and push it home. Left grip on the slide's rear / the
  *   AKM's charging handle racks (the slide follows the hand along its axis).
@@ -34,7 +35,7 @@ import { HANDLING, MagWell, MAG_FREE, MAG_GUIDED, TriggerGate, HapticGate, rackF
  *   const weapons = new WeaponSystem(ctx, { fpScene });   // at load, after assets; adds its own objects
  *   warm-up: weapons.setWarm(true) … draw … weapons.setWarm(false); weapons.warmMeshes()
  *   `weapons` system: weapons.update(dt, t, frame, ctx) (after `player`)
- *   HUD: weapons.ammo() → { weapon, mag, chambered } (one reused object)
+ *   HUD: weapons.ammo() → { weapon, mag, chambered, mode } (one reused object; mode 'safe' | 'semi' | 'auto')
  * It listens to `pause` (no firing while paused; the guns still follow the
  * hands) and emits `shot` and `enemyHit` (reused payloads). Pass
  * `{ enemies }` to also call enemies.applyHit for each enemy hit.
@@ -214,7 +215,8 @@ export class WeaponSystem {
     this.hit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, kind: 'none', surface: '', enemy: -1, part: '' };
     this.shotEv = { weapon: 'glock', x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: -1 };
     this.hitEv = { enemy: -1, part: '', damage: 0, x: 0, y: 0, z: 0, dx: 0, dy: 0, dz: -1 };
-    this._ammo = { weapon: /** @type {string|null} */ ('glock'), mag: -1, chambered: 0 };
+    /** @type {{ weapon: string|null, mag: number, chambered: number, mode: import('./WeaponDefs.js').FireMode|null }} */
+    this._ammo = { weapon: 'glock', mag: -1, chambered: 0, mode: 'semi' };
     this.stats = { shots: 0, hits: 0, enemyHits: 0, draws: 0, reloads: 0 };
 
     this._mp = new THREE.Vector3();
@@ -756,18 +758,23 @@ export class WeaponSystem {
 
   // ======================================================================= public
 
-  /** Ammo of the gun in hand (or the last one held), for the HUD: one reused object. */
+  /**
+   * Ammo of the gun in hand (or the last one held), for the HUD: one reused
+   * object. `mode`: the fire mode, 'safe' | 'semi' | 'auto' (the Glock is
+   * always 'semi'; null with no gun yet).
+   */
   ammo() {
     const w = this.held || this.lastHeld, o = this._ammo;
     o.weapon = w ? w.id : null;
     o.mag = w && w.inst.magSeated ? w.inst.magRounds : -1;
     o.chambered = w && w.inst.chamber === CHAMBER_LIVE ? 1 : 0;
+    o.mode = w ? w.inst.mode : null;
     return o;
   }
 
   /**
    * New round: both guns re-issued (full magazine + one chambered; AKM on
-   * safe), effects cleared. A gun in the hand stays in the hand.
+   * semi), effects cleared. A gun in the hand stays in the hand.
    */
   reset() {
     if (this.lRole !== L_NONE) {

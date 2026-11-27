@@ -11,13 +11,22 @@
  *   chest, spread away from his mates' points. No such point: the nearest
  *   reachable one toward the player, re-chosen when he gets there.
  * - Sight: line of sight from his eye (world.segmentClear) inside a 120° cone,
- *   always within 2.2 m. On first sight a reaction time of 0.45–0.85 s runs
- *   before he may shoot (0.25 s when he only lost you for a moment).
- * - Aim error 0.07 rad on acquiring you, settling to 0.012 rad over 0.9 s;
- *   each shot of a burst adds a little; a flinch or a near miss throws it back.
+ *   always within 2.2 m. On first sight a reaction time runs before he may
+ *   shoot (0.25 s when he only lost you for a moment), and his first shot after
+ *   acquiring you never comes before `firstShot` s.
+ * - Aim error 0.07 rad on acquiring you, settling over `aimSettle` s to
+ *   `aimErr1`; each shot of a burst adds a little; a flinch or a near miss
+ *   throws it back.
+ * - Difficulty (`DIFFICULTY`, `setDifficulty`): "test" (the default for the
+ *   first headset tests: settled error 0.035 rad over 1.6 s, reaction
+ *   0.6–1.1 s, first shot ≥ 0.9 s after acquiring, half damage to the player)
+ *   or "realistic" (PLAN §9's tested CQC values: 0.012 rad over 0.9 s,
+ *   0.45–0.85 s). The owner picks it (a pure option; nothing here reads the URL).
  * - Bursts of 2–4 rounds at 600 rpm, 0.45–1.1 s apart; a 30-round magazine and
  *   a 2.6 s reload. At most two enemies hold a shooter slot at a time; a slot
  *   is given up after 4 s when another enemy is waiting, or when he loses you.
+ * - Path finding: the planner gets at most `pathQuota` A* expansions and about
+ *   `pathBudgetMs` of each frame (it checks the clock every 64 expansions).
  * - He never fires through a mate (line-of-fire check) and never walks into
  *   one (separation).
  * - Movement never leaves walkable nav cells (x-only / z-only slide, else stop)
@@ -59,7 +68,58 @@ export const AI = Object.freeze({
   spread: 2.0, // m between enemies' points
   separation: 0.8, // m between enemies
   pathQuota: 600, // A* expansions per frame (PLAN §9: measure on Quest)
+  pathBudgetMs: 0.35, // … and at most this much of the frame (PLAN cap 0.4 ms)
 });
+
+/**
+ * Enemy difficulty presets. `react`, `aimErr1`, `aimSettle` and `maxShooters`
+ * in AI above are the realistic values (PLAN §9, CQC-tested).
+ * - firstShot: s from acquiring the player (line of sight starts) before his
+ *   first shot may break, whatever the reaction time;
+ * - playerTorso / playerHead: damage of one enemy round to the player (100 hp).
+ * @typedef {{ name: string, aimErr1: number, aimSettle: number, react: readonly number[], firstShot: number,
+ *   maxShooters: number, playerTorso: number, playerHead: number }} Difficulty
+ */
+export const DIFFICULTY = Object.freeze({
+  /** First headset tests: you can see the fight and survive a mistake. */
+  test: /** @type {Readonly<Difficulty>} */ (Object.freeze({
+    name: 'test', aimErr1: 0.035, aimSettle: 1.6, react: Object.freeze([0.6, 1.1]), firstShot: 0.9, maxShooters: 2,
+    playerTorso: 12, playerHead: 25,
+  })),
+  /** PLAN §9's tested CQC values: nearly every settled round hits at 5 m. */
+  realistic: /** @type {Readonly<Difficulty>} */ (Object.freeze({
+    name: 'realistic', aimErr1: AI.aimErr1, aimSettle: AI.aimSettle, react: Object.freeze([AI.react[0], AI.react[1]]), firstShot: 0,
+    maxShooters: AI.maxShooters, playerTorso: 25, playerHead: 50,
+  })),
+});
+export const DEFAULT_DIFFICULTY = 'test';
+
+/**
+ * A difficulty preset from a name ('test' | 'realistic', any case) or a preset
+ * object; anything else gives the default ('test').
+ * @param {string|Difficulty|null|undefined} d
+ * @returns {Readonly<Difficulty>}
+ */
+export function resolveDifficulty(d) {
+  if (d && typeof d === 'object' && typeof d.aimErr1 === 'number' && typeof d.name === 'string') return d;
+  const k = typeof d === 'string' ? d.trim().toLowerCase() : '';
+  return k === 'realistic' ? DIFFICULTY.realistic : k === 'test' ? DIFFICULTY.test : DIFFICULTY[DEFAULT_DIFFICULTY];
+}
+
+/**
+ * The difficulty named by a URL query string (`?difficulty=realistic`), else
+ * the default. Pure: the caller passes `location.search`.
+ * @param {string|null|undefined} search
+ * @returns {'test'|'realistic'}
+ */
+export function difficultyFromSearch(search) {
+  if (typeof search !== 'string' || !search) return DEFAULT_DIFFICULTY;
+  const m = /(?:^|[?&])difficulty=([^&#]*)/i.exec(search);
+  if (!m) return DEFAULT_DIFFICULTY;
+  let v = m[1];
+  try { v = decodeURIComponent(v.replace(/\+/g, ' ')); } catch { /* keep it raw */ }
+  return /** @type {'test'|'realistic'} */ (resolveDifficulty(v).name);
+}
 
 export const ST = Object.freeze({ IDLE: 0, MOVE: 1, HOLD: 2, DEAD: 3 });
 
@@ -110,6 +170,8 @@ export class Agent {
     this.think = 0;
     // perception
     this.los = false; this.losT = 0; this.lostAt = -1e9; this.aware = false; this.alertT = -1e9;
+    /** Brain time when he last acquired the player (line of sight began). */
+    this.acqT = -1e9;
     /** Last line-of-sight query: where he and the player were, and the answer. */
     this.seeX = 1e9; this.seeZ = 1e9; this.seePX = 1e9; this.seePY = 1e9; this.seePZ = 1e9; this.seeOK = false;
     this.reactT = -1;
@@ -138,15 +200,17 @@ export class Agent {
  *   segmentClear: (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => boolean,
  *   floorY: (x: number, z: number) => number }} WorldLike
  * @typedef {{ request: (id: number, sx: number, sz: number, gx: number, gz: number) => void,
- *   step: (n: number) => number, result: (id: number, out: Float32Array) => number, cancel: (id: number) => void }} PlannerLike
+ *   step: (n: number, maxMs?: number) => number, result: (id: number, out: Float32Array) => number, cancel: (id: number) => void }} PlannerLike
  */
 
 export class Brain {
   /**
-   * @param {{ maxEnemies?: number, seed?: number }} [o]
+   * @param {{ maxEnemies?: number, seed?: number, difficulty?: string|Difficulty }} [o] difficulty: see DIFFICULTY (default 'test')
    */
-  constructor({ maxEnemies = 6, seed = 0x5eed } = {}) {
+  constructor({ maxEnemies = 6, seed = 0x5eed, difficulty = DEFAULT_DIFFICULTY } = {}) {
     this.n = maxEnemies;
+    /** @type {Readonly<Difficulty>} */
+    this.diff = resolveDifficulty(difficulty);
     /** @type {Agent[]} */
     this.agents = [];
     for (let i = 0; i < maxEnemies; i++) this.agents.push(new Agent(i));
@@ -177,6 +241,17 @@ export class Brain {
     this.planner = planner;
   }
 
+  /**
+   * Change the difficulty (between rounds or live: the next decision and
+   * shot use it).
+   * @param {string|Difficulty|null|undefined} d
+   * @returns {Readonly<Difficulty>} the preset now in use
+   */
+  setDifficulty(d) {
+    this.diff = resolveDifficulty(d);
+    return this.diff;
+  }
+
   reset() {
     for (const a of this.agents) this.release(a, true);
     this.shooters = 0;
@@ -199,7 +274,7 @@ export class Brain {
     a.hasGoal = false; a.pathN = 0; a.pathI = 0; a.pathWait = false; a.pathFails = 0; a.holdT = 0;
     a.progT = 0; a.progX = x; a.progZ = z; a.repaths = 0;
     a.think = (i / this.n) / AI.thinkHz; // staggered
-    a.los = false; a.losT = 0; a.lostAt = -1e9; a.aware = false; a.alertT = -1e9; a.reactT = -1;
+    a.los = false; a.losT = 0; a.lostAt = -1e9; a.aware = false; a.alertT = -1e9; a.reactT = -1; a.acqT = -1e9;
     a.seeX = 1e9; a.seeOK = false;
     a.aimErr = AI.aimErr0; a.aimT = 0; a.raise = 0; a.raiseNow = 0;
     a.aimX = x + Math.sin(yaw) * 5; a.aimY = a.y + 1.4; a.aimZ = z + Math.cos(yaw) * 5;
@@ -285,7 +360,7 @@ export class Brain {
     this.px = h.x; this.py = h.y; this.pz = h.z;
     this.cx = tb.x + (tt.x - tb.x) * 0.6; this.cy = tb.y + (tt.y - tb.y) * 0.6; this.cz = tb.z + (tt.z - tb.z) * 0.6;
     this.palive = player.alive !== false;
-    if (this.planner) this.planner.step(AI.pathQuota);
+    if (this.planner) this.planner.step(AI.pathQuota, AI.pathBudgetMs);
     // waiting shooters (for slot fairness)
     let w = 0;
     for (let i = 0; i < this.n; i++) { const a = this.agents[i]; if (a.alive && a.los && !a.slot && a.reactT <= 0) w++; }
@@ -332,11 +407,13 @@ export class Brain {
     if (see && !a.los) {
       a.los = true;
       a.losT = 0;
+      a.acqT = this.time;
       a.aimT = 0;
       a.aimErr = Math.max(a.aimErr, AI.aimErr0);
       const quick = this.time - a.lostAt < AI.reacquireWithin;
       rand(this.rng, this.R, 0);
-      a.reactT = quick ? AI.reacquire : (AI.react[0] + (AI.react[1] - AI.react[0]) * this.R[0]) * (this.time - a.alertT < 5 ? 0.85 : 1);
+      const rc = this.diff.react;
+      a.reactT = quick ? AI.reacquire : (rc[0] + (rc[1] - rc[0]) * this.R[0]) * (this.time - a.alertT < 5 ? 0.85 : 1);
       a.aware = true;
     } else if (!see && a.los) {
       a.los = false;
@@ -542,10 +619,11 @@ export class Brain {
       if (a.reloadT <= 0) { a.reloadT = 0; a.mag = AI.mag; }
     }
     if (a.los && a.reactT > 0) a.reactT -= dt;
+    const D = this.diff;
     // aim settles while he has you in sight
     if (a.los) {
       a.aimT += dt;
-      const settle = AI.aimErr0 + (AI.aimErr1 - AI.aimErr0) * Math.min(1, a.aimT / AI.aimSettle);
+      const settle = AI.aimErr0 + (D.aimErr1 - AI.aimErr0) * Math.min(1, a.aimT / D.aimSettle);
       // extra error (flinch, near miss, recoil) decays toward the settling curve
       a.aimErr = settle + Math.max(0, a.aimErr - settle) * Math.exp(-dt / 0.5);
     }
@@ -559,8 +637,9 @@ export class Brain {
       }
     }
     const facing = Math.abs(wrapAngle(Math.atan2(this.px - a.x, this.pz - a.z) - a.yaw)) < 0.35;
-    const ready = a.los && this.palive && a.reactT <= 0 && a.flinchT <= 0 && a.suppressT <= 0 && a.reloadT <= 0 && a.raiseNow >= 0.95 && facing;
-    if (ready && !a.slot && a.slotCool <= 0 && this.shooters < AI.maxShooters && this.time - this.slotFreedAt > 0.15) { a.slot = true; a.slotT = 0; this.shooters++; }
+    // the first shot after acquiring you never breaks before D.firstShot
+    const ready = a.los && this.palive && a.reactT <= 0 && this.time - a.acqT >= D.firstShot && a.flinchT <= 0 && a.suppressT <= 0 && a.reloadT <= 0 && a.raiseNow >= 0.95 && facing;
+    if (ready && !a.slot && a.slotCool <= 0 && this.shooters < D.maxShooters && this.time - this.slotFreedAt > 0.15) { a.slot = true; a.slotT = 0; this.shooters++; }
     if (!a.slot || !ready) { if (!ready) a.burstLeft = 0; return; }
     if (a.burstLeft === 0) {
       if (a.gapT > 0) return;

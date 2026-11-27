@@ -24,6 +24,16 @@ Add one entry per phase test. Each entry records the build version (shown on the
 2. **Play.** Two waves at least: Glock from the hip, shots, A reload, pouch reload, rack, AKM from the shoulder (selector, burst, two hands). Note what feels wrong. Exit by holding Y.
 3. Tap **Copy** and paste the JSON into the chat. Play records carry `spaceSnapshot` (your house, replayable on desktop), `play.world.report`, `warmXR`, `perfRuns` (the 60 s run from wave 1) and `systemsMs`.
 
+## v0.2.1: tests to run
+
+v0.2.1 adds the safe-spot step, a controls card, 72 Hz, a closer near plane, the fire mode on the wrist and a smaller Copy. Run the v0.2 probe test above first if it was not run yet.
+
+1. **Enter MR.** Read the "Get ready" card (is it legible?), pull the trigger.
+2. **Safe spot.** A ring follows you on the floor. Is its colour and the message ("Good spot", "Step … m") right for where you stand? Pull the trigger in a green spot (or hold it 1 s in an amber one).
+3. **Play two waves.** Glock from the hip, shots, A reload, pouch reload, rack, AKM from the shoulder (the wrist should say SEMI; stick click → SAFE, again → AUTO), two hands, aim down the AKM sights: does the stock still clip through your face? Do you hear the first shots? Try B + Y (pause) and a trigger pull (resume). Exit by holding Y.
+4. If the gun sits at a wrong angle or height in your hand, reload the page with e.g. `?gripPitch=5` or `?gripY=0.01` and say which value felt right.
+5. Tap **Copy** (now the last session only) and paste it into the chat. New in the record: `probes.frameRate` (72 Hz request and the measured rate), `audio` (context state at start, after 1 s, at the end), `view.near`, `play.spot`, `play.world.rebuild`, `play.grip`, `play.safety`.
+
 ## Entries
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)

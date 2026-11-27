@@ -205,3 +205,71 @@ test('cancel and re-request without stepping never grows the queue', () => {
   assert.ok(p.result(0, new Float32Array(64)) >= 3);
   assert.equal(p.result(1, new Float32Array(64)), 2);
 });
+
+test('time budget: the clock is read every 64 expansions and a step stops once over maxMs; the path is unchanged', () => {
+  const g = maze();
+  const ref = new PathPlanner(g);
+  const once = solve(ref, 0, 2, 1, 8, 1.8);
+  const total = ref.stats.lastExpansions;
+  assert.ok(total > 600, `the maze search needs ${total} expansions (more than one frame's quota)`);
+  // Each clock read advances fake time by 0.1 ms.
+  let now = 0, reads = 0;
+  const p = new PathPlanner(g, { clock: () => { reads++; now += 0.1; return now; } });
+  assert.equal(p.step(600, 0.35), 0);
+  assert.equal(reads, 0, 'an idle planner never reads the clock');
+  p.request(0, 2, 1, 8, 1.8);
+  // t0, then reads after 64, 128, 192 (0.3 ms) and 256 (0.4 ms ≥ 0.35): stop at 256 of 600
+  assert.equal(p.step(600, 0.35), 4 * 64);
+  assert.equal(p.stats.timeouts, 1);
+  assert.ok(Math.abs(p.stats.maxStepMs - 0.5) < 1e-9, `longest step ${p.stats.maxStepMs} ms (incl. the closing read)`);
+  // without a budget the same planner runs the full quota
+  const n0 = p.stats.expansions;
+  assert.equal(p.step(100), 100);
+  assert.equal(p.stats.expansions - n0, 100);
+  // a very slow CPU: every chunk takes 1 ms, so each step does exactly one chunk (progress is never 0)
+  const slow = new PathPlanner(g, { clock: () => { now += 1; return now; } });
+  slow.request(0, 2, 1, 8, 1.8);
+  const out = new Float32Array(256);
+  let steps = 0;
+  while (slow.result(0, out) === PATH_PENDING) {
+    const n = slow.step(600, 0.35);
+    assert.ok(n >= 1 && n <= 64, `${n} expansions in a 1 ms chunk`);
+    if (++steps > 1e4) throw new Error('no progress');
+  }
+  assert.ok(steps >= Math.floor(total / 64), `${steps} steps of ≤ 64`);
+  const n = slow.result(0, out);
+  assert.equal(n, once.n);
+  assert.deepEqual(Array.from(out.subarray(0, n * 2)), once.pts, 'time slicing never changes the path');
+  // a frozen clock: only the expansion cap applies
+  const frozen = new PathPlanner(g, { clock: () => 5 });
+  frozen.request(0, 2, 1, 8, 1.8);
+  assert.equal(frozen.step(300, 0.35), 300);
+  assert.equal(frozen.stats.timeouts, 0);
+});
+
+test('a timed step with the real clock stays near its budget (warm code; most steps)', () => {
+  const g = maze();
+  const p = new PathPlanner(g);
+  const goals = [[8, 1.8], [8.5, 3], [9, 5.5], [7, 2.2]];
+  const run = (n, timed, times) => {
+    for (let i = 0; i < n; i++) {
+      const q = goals[i & 3];
+      p.request(i & 15, 2 + (i % 3) * 0.5, 1 + (i % 5) * 0.4, q[0], q[1]);
+      while (p.pending()) {
+        const t0 = performance.now();
+        if (timed) p.step(1e6, 0.35); else p.step(1e6);
+        if (times) times.push(performance.now() - t0);
+      }
+    }
+  };
+  run(200, false, null); // optimised code first (a cold search is interpreted)
+  run(20, true, null);
+  const times = [];
+  run(60, true, times);
+  times.sort((a, b) => a - b);
+  const p90 = times[Math.floor(times.length * 0.9)];
+  assert.ok(times.length > 60, `${times.length} timed steps`);
+  // a step overruns by at most one 64-expansion chunk; the slack is for a loaded parallel test run
+  assert.ok(p90 < 2, `90 % of timed steps under ${p90.toFixed(3)} ms`);
+  assert.ok(p.stats.timeouts > 0, 'the budget cut some steps');
+});

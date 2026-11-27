@@ -15,6 +15,7 @@ import { DepthView } from '../debug/DepthView.js';
 import { TestCube } from '../debug/TestCube.js';
 import { CanvasPanel } from '../ui/CanvasPanel.js';
 import { assertStable } from '../core/Warmup.js';
+import { CAMERA_NEAR, PLAY_NEAR } from '../core/Renderer.js';
 
 /** Systems of the probe-style sessions (probe, bounds, vr, setup). */
 const PROBE_SYSTEMS = ['input', 'probe', 'ui', 'render'];
@@ -22,6 +23,10 @@ const PROBE_SYSTEMS = ['input', 'probe', 'ui', 'render'];
 const GAME_MODES = new Set(['play', 'reduced']);
 /** The probe panel sits this far left of straight ahead, so it never hides the test cube. */
 const PROBE_PANEL_YAW = 0.6;
+/** Play asks for this refresh rate (the Quest's AR default is 90 Hz, DEVICE_LOG p1.0). */
+const PLAY_HZ = 72;
+/** XR input events that count as user activation: the audio context may resume from them. */
+const GESTURE_EVENTS = ['selectstart', 'select', 'squeeze'];
 
 /**
  * Composition root for one page: owns the renderer objects and runs one XR
@@ -123,6 +128,13 @@ export class App {
     // session with no lifecycle, no record and the menu stuck in 'entering'.
     try {
       collectSession(rec, session, r, this.gfx.gl, att);
+      // Play without depth sensing: near plane 0.02 m (the AKM's stock clipped the face at 0.05). three
+      // passes camera.near to the session's depthNear; with depth on it uses the depth data's own values.
+      const depthOn = att.enabled.includes('depth-sensing');
+      const near = kit && !depthOn ? PLAY_NEAR : CAMERA_NEAR;
+      this.gfx.camera.near = near;
+      this.gfx.camera.updateProjectionMatrix();
+      /** @type {any} */ (rec).view = { near, depthSensing: depthOn };
       const space = r.xr.getReferenceSpace();
       this.lifecycle.attach(session, space);
       perf.setRates(frameRates(session));
@@ -192,12 +204,25 @@ export class App {
     this.draw.hideAll();
     this.panel.yawOffset = 0;
     this.panel.autoHide = false;
-    rec.probes.frameRate = { attrAtStart: /** @type {any} */ (session).frameRate ?? null, measuredHz: null, changes: [] };
+    const s = /** @type {any} */ (session);
+    const rates = frameRates(session);
+    /** @type {any} */
+    const F = rec.probes.frameRate = { attrAtStart: s.frameRate ?? null, offered: rates, target: null, request: '', attrAfter: null,
+      measuredHz: null, changes: [], hzAtEnd: null };
     perf.onRateChange = (hz) => {
-      const F = rec.probes.frameRate;
       if (F.measuredHz === null) F.measuredHz = hz;
       if (F.changes.length < 20) F.changes.push(hz);
     };
+    // 72 Hz for play (90 is the AR default): 13.9 ms a frame instead of 11.1. PerfMonitor measures what we get.
+    if (rates.includes(PLAY_HZ) && typeof s.updateTargetFrameRate === 'function') {
+      F.target = PLAY_HZ;
+      F.request = 'pending';
+      try {
+        s.updateTargetFrameRate(PLAY_HZ).then(() => { F.request = 'ok'; F.attrAfter = s.frameRate ?? null; perf.mark(`rate ${PLAY_HZ}`); },
+          (/** @type {unknown} */ e) => { F.request = `failed: ${errText(e)}`; });
+      } catch (e) { F.request = `threw: ${errText(e)}`; }
+    } else F.request = rates.length ? `${PLAY_HZ} Hz not offered (${rates.join('/')})` : 'no frame-rate API';
+    this.watchAudio(kit, session, rec);
     kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [] });
     for (const s of kit.systems()) loop.add(s);
     loop.add({
@@ -207,6 +232,8 @@ export class App {
         // App's opaque "Get ready" panel until the round starts, then GameSession's messages
         const lines = kit.panelLines();
         if (lines) {
+          // shown again (the rebuild after the spot step): placed afresh in front of the eyes
+          if (!this.panel.mesh.visible) { this.panel.mesh.visible = true; this.panel.placed = false; }
           if (lines !== this.panel.lines) this.panel.setLines(/** @type {string[]} */ (lines));
           this.panel.follow(cam, dt);
           this.panel.flush();
@@ -214,6 +241,28 @@ export class App {
         if (kit.playing) this.devCheck(t); // against the baseline of this session's XR warm draw
       },
     });
+  }
+
+  /**
+   * Audio in play: the context state at session start and 1 s later, and a
+   * resume from the XR session's input events (user activation in the WebXR
+   * spec) whenever the context is not running. Event-driven only.
+   * @param {import('./Play.js').PlayKit} kit @param {XRSession} session @param {any} rec
+   */
+  watchAudio(kit, session, rec) {
+    const audio = /** @type {any} */ (kit.audio);
+    if (!audio) { rec.audio = { atStart: 'no audio engine' }; return; }
+    /** @type {{ atStart: string, at1s: string|null, unlocked: boolean, gestureResumes: number, firstGesture: string|null, afterGesture: string|null, errors: number }} */
+    const A = { atStart: audio.state, at1s: null, unlocked: !!audio.unlocked, gestureResumes: 0, firstGesture: null, afterGesture: null, errors: audio.errors.length };
+    rec.audio = A;
+    const onGesture = (/** @type {Event} */ e) => {
+      if (this.session !== session || !audio.gestureResume()) return;
+      A.gestureResumes++;
+      if (!A.firstGesture) A.firstGesture = e.type;
+      setTimeout(() => { A.afterGesture = audio.state; }, 250);
+    };
+    for (const type of GESTURE_EVENTS) session.addEventListener(type, onGesture);
+    setTimeout(() => { if (this.rec === rec) { A.at1s = audio.state; A.unlocked = !!audio.unlocked; } }, 1000);
   }
 
   /**
@@ -283,6 +332,8 @@ export class App {
       rec.recent = this.perf.recent(72);
       rec.systemsMs = this.perf.systemAverages(this.perf.count);
       rec.probes.liveDepth = this.liveDepth.summary();
+      if (rec.probes.frameRate && 'hzAtEnd' in rec.probes.frameRate) rec.probes.frameRate.hzAtEnd = this.perf.measured ? this.perf.hz : null;
+      if (rec.audio && 'atStart' in rec.audio) rec.audio.atEnd = this.play && this.play.audio ? /** @type {any} */ (this.play.audio).state : null;
       this.perf.cancelRun('session ended');
     }
     if (wasPlay && kit) kit.end(); // writes rec.play before the record is saved

@@ -57,6 +57,39 @@ const resumeIfPaused = async (ms = 20000) => {
   return [...seen, 'still paused'];
 };
 
+/**
+ * The "Get ready" card waits for a trigger pull (after 1 s) or 8 s; then the safe-spot step waits
+ * for a trigger pull in a clear spot (a 1 s hold in a tight one). Pull the LEFT trigger (it never
+ * fires the gun in the right hand). Where the spot is blocked, the headset moves to the suggested
+ * step. Returns the spot statuses seen.
+ */
+const skipCard = async () => {
+  const at = await waitFor(() => window.__app.play.stepName === 'start', null, 15000);
+  if (!at) return false;
+  await sleep(1300);
+  await press('left', 'trigger', 150);
+  return !!(await waitFor(() => window.__app.play.stepName !== 'start', null, 10000));
+};
+const confirmSpot = async (ms = 25000) => {
+  const seen = [];
+  const t = Date.now();
+  while (Date.now() - t < ms) {
+    const s = await page.evaluate(() => { const k = window.__app.play, S = k.game.spot; return { step: k.stepName, status: k.game.spotStatus, hasStep: S.hasStep, x: S.stepX, z: S.stepZ }; });
+    if (s.step !== 'spot') return seen;
+    if (!seen.includes(s.status)) seen.push(s.status);
+    if (s.status === 'clear' || s.status === 'unmapped') await press('left', 'trigger', 150);
+    else if (s.status === 'tight') {
+      // hold until it is accepted (1 s of frames), and no longer: the round's 3 s "Get ready" starts then
+      await button('left', 'trigger', 1);
+      await waitFor(() => window.__app.play.stepName !== 'spot', null, 8000, 100);
+      await button('left', 'trigger', 0);
+    }
+    else if (s.hasStep) { await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [s.x, s.z]); seen.push('moved'); await sleep(800); }
+    await sleep(300);
+  }
+  return seen.concat('timeout');
+};
+
 /** Page helpers: move a controller so its GRIP lands on a world point; aim its ray; read the pixel under the cube. */
 const installHelpers = () => page.evaluate(async () => {
   const THREE = await import('three');
@@ -106,10 +139,11 @@ try {
       sounds: p.audio ? Object.keys(p.audio.buffers).length : 0, models: m ? Object.keys(m) : [],
       detached: !!m && ['glock', 'akm', 'soldier'].every((x) => m[x].scene.parent === null),
       kit: !!k && k.stepName === 'idle',
-      poolsWarmed: !!k && warmed.has(k.world.occluder) && k.enemies.pool.rigs.every((r) => warmed.has(r.root)) && warmed.has(k.weapons.glock.view.root)
+      poolsWarmed: !!k && warmed.has(k.world.occluder) && warmed.has(k.world.overlay) && k.enemies.pool.rigs.every((r) => warmed.has(r.root)) && warmed.has(k.weapons.glock.view.root)
         && warmed.has(k.weapons.akm.view.root) && warmed.has(k.game.tint) && warmed.has(k.hud.panel.mesh),
       poolsRestored: !!k && k.enemies.pool.rigs.every((r) => !r.root.visible) && !k.weapons.glock.view.root.visible && !k.game.tint.visible,
-      diag: JSON.parse(a.diag.json()).preload, trace: window.__loadTrace };
+      diag: JSON.parse(a.diag.json()).preload, trace: window.__loadTrace,
+      grip: k && { ...k.gripReport }, gripPatched: !!k && k.weapons.glock.view.holdPose !== Object.getPrototypeOf(k.weapons.glock.view).holdPose };
   });
   ok('preload: ready', pre.state === 'ready', pre.error || `${pre.times.totalMs} ms (assets ${pre.times.assetsMs}, audio ${pre.times.audioMs}, pools ${pre.times.poolsMs}, warm-up ${pre.times.warmMs})`);
   const pcts = pre.history.map((h) => h.pct);
@@ -125,6 +159,8 @@ try {
   ok('preload: programs count recorded', pre.warm && pre.warm.programs > 0 && pre.warm.textures > 0 && pre.warm.geometries > 0 && pre.diag && pre.diag.warm.programs === pre.warm.programs,
     pre.warm && `${pre.warm.programs} programs, ${pre.warm.textures} textures, ${pre.warm.geometries} geometries; ${pre.warm.drawables} drawables, ${pre.warm.calls} calls, ${pre.warm.textureCount} uploads`);
   ok('preload: asset scenes detached again', pre.detached);
+  ok('preload: no grip fit in the URL: default fit, holdPose untouched', pre.grip && pre.grip.source === 'default' && pre.grip.pitchDeg === 0 && !pre.gripPatched && pre.grip.applied.length === 0,
+    pre.grip && JSON.stringify(pre.grip.palm));
   report.preload = { ...pre.times, programs: pre.warm.programs, textures: pre.warm.textures, geometries: pre.warm.geometries, drawables: pre.warm.drawables };
 
   // Fake GPU depth (IWER has none): XRWebGLBinding.getDepthInformation returns, while on, one of two
@@ -288,12 +324,27 @@ try {
       sys.update = (dt, t, f, c) => orig(dt, clock(t), f, c);
     }
   });
+  // The "Get ready" card (world built behind it) with the controls, then the safe-spot step
+  const card = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'start' && { lines: a.panel.lines.slice(), visible: a.panel.mesh.visible }; }, null, 15000);
+  ok('play: the "Get ready" card shows the controls after the build', card && card.visible && card.lines[0] === 'Get ready' && card.lines.includes('[How to play]')
+    && card.lines.some((l) => /Exit: hold Y/.test(l)) && card.lines.some((l) => /B: slide release/.test(l)), card && card.lines.join(' | '));
+  const skipped = await skipCard();
+  const sp = await waitFor(() => {
+    const a = window.__app, k = a.play, g = k.game;
+    return k.stepName === 'spot' && g.panel.mesh.visible && { status: g.spotStatus, spotting: g.spotting, appPanel: a.panel.mesh.visible, lines: k.panelLines(), ring: g.ring.visible,
+      msg: g.panel.lines.slice(), skipped: a.rec.play.cardSkipped, cardMs: a.rec.play.cardMs };
+  }, null, 10000);
+  ok('play: a trigger pull moves on to the safe spot: App panel hidden, ring and spot message shown', skipped && sp && sp.spotting && !sp.appPanel && sp.lines === null && sp.ring && sp.skipped,
+    sp && `${sp.status}; "${sp.msg.join(' / ')}"; card up ${sp.cardMs} ms`);
+  const spotSeen = await confirmSpot();
+  report.spot = spotSeen;
   const ready = await waitFor(() => window.__app.play.stepName === 'play', null, 15000);
   const g0 = await page.evaluate(() => {
     const a = window.__app, k = a.play, rec = a.rec;
     return { space: rec.granted.referenceSpace, req: rec.requested, systems: a.perf.systems, loop: a.loop.systems.map((s) => s.name), play: rec.play, warmXR: rec.warmXR,
       snap: rec.spaceSnapshot && { planes: rec.spaceSnapshot.planes.length, meshes: rec.spaceSnapshot.meshes.length }, world: k.world.describe(), virtual: k.world.virtual,
-      phase: k.game.phaseName, msg: k.game.panel.mesh.visible ? k.game.panel.lines : null, programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone } };
+      phase: k.game.phaseName, msg: k.game.panel.mesh.visible ? k.game.panel.lines : null, programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone },
+      head: { x: k.player.head.x, z: k.player.head.z }, view: rec.view, xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible };
   });
   ok('play: local-floor and no unbounded request', g0.space === 'local-floor' && !g0.req.includes('unbounded'), `${g0.space}; ${g0.req.join(',')}`);
   ok('play: systems in the contract order', g0.loop.join(',') === 'input,world,player,weapons,enemies,game,audio,ui' && g0.systems.join(',') === 'input,world,player,weapons,enemies,game,audio,ui,render', g0.systems.join(' → '));
@@ -302,8 +353,21 @@ try {
   ok('play: world built from it behind the Get ready panel', !g0.virtual && /2 floors/.test(g0.world) && g0.play.world.buildMs >= 0, `${g0.world}; build ${g0.play.world.buildMs} ms`);
   ok('play: one XR warm draw of every pool, nothing new compiled', g0.warmXR && !g0.warmXR.skipped && g0.warmXR.programs === before.programs && g0.programs === before.programs,
     g0.warmXR && `${g0.warmXR.drawables} drawables, ${g0.warmXR.calls} calls, ${g0.warmXR.ms} ms; ${g0.programs} programs (before play ${before.programs}, warm-up ${pre.warm.programs})`);
-  ok('play: the round starts with "Get ready" and the zone at the head', g0.phase === 'ready' && g0.msg && g0.msg[0] === 'Get ready' && Math.abs(g0.zone.x) < 0.3 && Math.abs(g0.zone.z) < 0.3,
-    `${g0.phase}; ${g0.msg && g0.msg.join(' / ')}; zone ${JSON.stringify(g0.zone)}`);
+  ok('play: the trigger in a good spot starts the round there ("Get ready", zone at the head)', !!ready && g0.phase === 'ready' && g0.msg && g0.msg[0] === 'Get ready' && !g0.appPanel
+    && Math.hypot(g0.zone.x - g0.head.x, g0.zone.z - g0.head.z) < 0.3 && g0.play.spot && g0.play.spot.rebuilt === g0.play.spot.movedM > 0.25,
+    `${g0.phase}; ${g0.msg && g0.msg.join(' / ')}; spot ${spotSeen.join('→')}; zone ${JSON.stringify(g0.zone)}; ${JSON.stringify(g0.play.spot)}`);
+  ok('play: near plane 0.02 m without depth sensing', g0.view && g0.view.near === 0.02 && !g0.view.depthSensing && Math.abs(g0.xrNear - 0.02) < 1e-9, JSON.stringify(g0.view));
+  const fr = await waitFor(() => { const F = window.__app.rec.probes.frameRate; return F && F.request !== 'pending' && { ...F }; }, null, 5000);
+  ok('play: 72 Hz requested (updateTargetFrameRate), logged with the measured rate', fr && fr.target === 72 && fr.request === 'ok' && fr.offered.includes(72),
+    fr && `${fr.request}; offered ${fr.offered.join('/')}; attr after ${fr.attrAfter}; measured ${fr.measuredHz}`);
+  // Audio: context state at start and 1 s later; an XR 'select' resumes a suspended context
+  const au0 = await waitFor(() => { const A = window.__app.rec.audio; return A && A.at1s !== null && { ...A }; }, null, 5000);
+  ok('play: audio context state logged at session start and 1 s later', au0 && typeof au0.atStart === 'string' && typeof au0.at1s === 'string', au0 && `${au0.atStart} → ${au0.at1s}`);
+  await page.evaluate(async () => { const au = window.__app.play.audio; au._resumeAt = Infinity; await au.ctx.suspend(); });
+  await press('right', 'trigger', 150); // empty right hand: only the XR select events
+  const au1 = await waitFor(() => { const au = window.__app.play.audio, A = window.__app.rec.audio; return A.gestureResumes > 0 && au.state === 'running' && { ...A, state: au.state }; }, null, 4000);
+  await page.evaluate(() => { window.__app.play.audio._resumeAt = 0; });
+  ok('play: an XR select resumes a suspended audio context', !!au1, au1 && `first ${au1.firstGesture}, ${au1.gestureResumes} resumes, now ${au1.state}`);
   await installHelpers();
 
   // Wave 1: enemies spawn out of view and walk in
@@ -331,6 +395,7 @@ try {
   let hits = 0, tries = 0;
   /** @type {string[]} */ const evs = [];
   await page.evaluate(() => { const E = window.__app.play.events; window.__ev = []; for (const t of ['shot', 'enemyHit', 'enemyKilled', 'playerHit']) E.on(t, () => window.__ev.push(t)); });
+  await page.evaluate(() => { window.__pdmg = []; window.__app.play.events.on('playerHit', (p) => window.__pdmg.push(p.damage)); });
   while (hits === 0 && tries < 6) {
     const tgt = await waitFor(() => {
       const k = window.__app.play, e = k.player.eye;
@@ -349,11 +414,30 @@ try {
     await sleep(250);
     hits = await page.evaluate((h0) => window.__app.play.weapons.stats.enemyHits - h0, shots0.enemyHits);
   }
+  // the enemies need a moment to see the player, settle their aim and fire (more so when the first shot hit at once)
+  for (let i = 0; i < 8 && !(await page.evaluate(() => window.__app.play.enemies.stats.shots > 0)); i++) {
+    const c = await resumeIfPaused();
+    if (c.length) report.pausesResumed = (report.pausesResumed || []).concat(c);
+    await sleep(800);
+  }
   const w1 = await page.evaluate(() => { const k = window.__app.play; return { stats: { ...k.weapons.stats }, en: { ...k.enemies.stats }, mag: k.weapons.glock.inst.magRounds, ev: window.__ev.slice(), phase: k.game.phaseName, health: k.game.health }; });
   ok('play: the trigger fires the Glock (rounds leave the magazine)', w1.stats.shots > shots0.shots && w1.mag < 17, `${w1.stats.shots} shots, ${w1.mag} left in the magazine`);
   ok('play: a shot hits an enemy (enemyHit → EnemyManager)', hits > 0 && w1.ev.includes('enemyHit'), `${hits} enemy hits in ${tries} aimed shots; events ${[...new Set(w1.ev)].join(', ')}; killed ${w1.en.killed}`);
   ok('play: enemies shoot back (playerHit → health)', w1.en.shots > 0, `${w1.en.shots} enemy shots, ${w1.en.hitsOnPlayer} hit; health ${w1.health}, phase ${w1.phase}`);
   report.combat = { playerShots: w1.stats.shots, enemyHits: w1.stats.enemyHits, kills: w1.en.killed, enemyShots: w1.en.shots, hitsOnPlayer: w1.en.hitsOnPlayer, health: w1.health };
+  // Enemy follow-ups: the "test" difficulty, spawn tiers, hit puffs (gap audit F1, F4, F6)
+  const efx = await page.evaluate(() => {
+    const k = window.__app.play, W = k.world, z = W.zone, S = W.spawner, rec = [];
+    for (let j = 0; j < S.logCount; j++) { const g = ((S.logHead - S.logCount + j + 16) % 16) * 4; rec.push({ d: Math.hypot(S.log[g] - z.x, S.log[g + 1] - z.z), tier: S.log[g + 2] }); }
+    return { rec, dmg: window.__pdmg.slice(), diff: k.enemies.brain.diff.name, puffWarm: new Set(window.__app.preload.warmed).has(k.enemies.puff.mesh), puffs: k.enemies.puff.spawned };
+  });
+  const efe = w1.en, tiered = efe.spawnBehind + efe.spawnHiddenRoom + efe.spawnHiddenDoor + efe.spawnInView;
+  ok('play: enemies on the "test" difficulty by default (half damage: torso 12, head 25)', efe.difficulty === 'test' && efx.diff === 'test' && efx.dmg.every((d) => d === 12 || d === 25),
+    `${efe.difficulty}; rounds on the player ${efx.dmg.join(', ') || 'none yet'}`);
+  ok('play: every spawn came from the world spawner with its tier, ≥ 3.5 m from the spot', efe.spawned > 0 && tiered === efe.spawned && efe.spawnDirect === 0 && efe.lastSpawnTier >= 1
+    && efx.rec.length >= efe.spawned && efx.rec.every((r) => r.d >= 3.5 - 0.35), `${efe.spawned} spawns: behind ${efe.spawnBehind}, room ${efe.spawnHiddenRoom}, door ${efe.spawnHiddenDoor}, in view ${efe.spawnInView}; ${efx.rec.map((r) => r.d.toFixed(1)).join(' ')} m`);
+  ok('play: a hit on an enemy shows a pooled puff (warmed at load)', efx.puffWarm && efe.puffs >= hits && efx.puffs === efe.puffs, `${efe.puffs} puffs for ${hits} hits`);
+  report.enemies = { difficulty: efe.difficulty, spawnTiers: { behind: efe.spawnBehind, room: efe.spawnHiddenRoom, door: efe.spawnHiddenDoor, inView: efe.spawnInView }, puffs: efe.puffs, pathMaxStepMs: efe.pathMaxStepMs, pathTimeouts: efe.pathTimeouts };
 
   // Magazine release (A): the magazine drops; A again = assisted reload (1.2 s)
   await page.evaluate(() => window.__h.level('right'));
@@ -379,9 +463,19 @@ try {
   ok('play: right grip over the right shoulder takes the AKM', !!akm, `back slot at (${back.map((v) => v.toFixed(2)).join(', ')})`);
   await page.evaluate(() => window.__h.gripTo('right', [0.16, 1.4, -0.35]));
   await sleep(700);
-  await press('right', 'thumbstick');
+  // the AKM is issued on semi (WeaponDefs); the stick click goes semi → safe → auto (held across a
+  // few slow emulator frames, so each click is seen)
+  const akmModes = [await page.evaluate(() => window.__app.play.weapons.akm.inst.mode)];
+  const hudSemi = await waitFor(() => window.__app.play.hud._s[10] === 2, null, 4000);
+  await press('right', 'thumbstick', 400);
+  akmModes.push(await page.evaluate(() => window.__app.play.weapons.akm.inst.mode));
+  const hudSafe = await waitFor(() => window.__app.play.hud._s[10] === 1, null, 4000);
+  await press('right', 'thumbstick', 400);
   const mode = await page.evaluate(() => window.__app.play.weapons.akm.inst.mode);
-  ok('play: right stick click moves the AKM selector off safe', mode === 'auto', `mode ${mode}`);
+  akmModes.push(mode);
+  ok('play: right stick click cycles the AKM selector (semi → safe → auto)', akmModes.join() === 'semi,safe,auto', akmModes.join(' → '));
+  const hudAuto = await waitFor(() => window.__app.play.hud._s[10] === 3, null, 4000);
+  ok('play: the wrist HUD shows the fire mode (SEMI, SAFE, AUTO)', !!hudSemi && !!hudSafe && !!hudAuto);
   await page.evaluate(() => window.__h.aimAt('right', [0.16, 1.3, -5]));
   await waitFor(() => { const w = window.__app.play.weapons; return w.akm.carry.state === window.__CARRY_HAND && w.akm.gate.open; }, null, 8000);
   const causes2 = await resumeIfPaused();
@@ -412,6 +506,25 @@ try {
   ok('play: draw calls ≤ 60 with 4 enemies (both eyes)', dc.alive >= 4 && dc.max <= 60, `max ${dc.max}, avg ${dc.avg.toFixed(1)} per frame (${(dc.max / 2).toFixed(0)} per eye); ${dc.alive} alive, ${dc.shown} rigs shown`);
   report.drawCalls = { maxBothEyes: dc.max, avgBothEyes: +dc.avg.toFixed(1), perEyeMax: dc.max / 2, enemies: dc.alive };
 
+  // A kill with the round flying into the north wall (z = −3): he falls toward open floor, a puff shows (gap audit F4, F5)
+  const fall = await page.evaluate(() => {
+    const k = window.__app.play, E = k.enemies;
+    let bi = -1, bd = Infinity;
+    for (const a of E.brain.agents) if (a.active && a.alive && Math.abs(a.x - 0.4) < bd) { bd = Math.abs(a.x - 0.4); bi = a.i; }
+    if (bi < 0) return null;
+    const a = E.brain.agents[bi], p0 = E.stats.puffs;
+    E.applyHit(bi, 'head', 400, 0, -0.05, -1);
+    const F = Array.from(E._fall);
+    return { i: bi, x: a.x, z: a.z, dead: !a.alive, fx: F[0], fz: F[1], score: F[2], puffs: E.stats.puffs - p0, puffShown: E.puff.live > 0 };
+  });
+  const causes3 = await resumeIfPaused(); // (a paused round freezes the enemies, falls included)
+  if (causes3.length) report.pausesResumed = (report.pausesResumed || []).concat(causes3);
+  const landed = fall && await waitFor((i) => window.__app.play.enemies.anims[i].landed, fall.i, 10000);
+  const fell = fall && await page.evaluate((i) => { const k = window.__app.play, an = k.enemies.anims[i]; return { landed: an.landed, deathT: +an.deathT.toFixed(2), paused: k.game.paused }; }, fall.i);
+  ok('play: a body falls toward open floor, not into the wall behind it', !!fall && fall.dead && fall.fz > -0.5 && fall.score >= 8 && !!landed,
+    fall && `at (${fall.x.toFixed(2)}, ${fall.z.toFixed(2)}), falls along (${fall.fx.toFixed(2)}, ${fall.fz.toFixed(2)}), score ${fall.score}; ${JSON.stringify(fell)}`);
+  ok('play: the killing hit showed a puff', !!fall && fall.puffs === 1 && fall.puffShown);
+
   // No program, texture or geometry created after the warm-up
   const st2 = await page.evaluate(async () => { const m = await import('/src/core/Warmup.js'); const r = window.__app.gfx.renderer; return { ...m.assertStable(r, () => {}), programs: r.info.programs.length, tex: r.info.memory.textures, geo: r.info.memory.geometries, growth: window.__app.rec.warmGrowth || null }; });
   ok('play: renderer.info.programs flat through the whole round', st2.checked && st2.ok && st2.programs === before.programs && st2.tex === before.textures && st2.geo === before.geometries && !st2.growth,
@@ -434,6 +547,24 @@ try {
   ok('play: session saved with the snapshot and the round summary', pl && pl.mode === 'play' && pl.spaceSnapshot && pl.spaceSnapshot.planes.length === 19 && pl.play && pl.play.weapons && pl.play.enemies && pl.systemsMs,
     pl && pl.play && `wave ${pl.play.wave}, ${pl.play.kills} kills, phase ${pl.play.phase}; ${JSON.stringify(pl.play.weapons)}`);
   ok('play: no XR-frame errors at exit', !consoleErrors.some((e) => /outside the callback/i.test(e)));
+  ok('play: record has the safety report (spot chosen), the grip fit, audio states, rate and near plane',
+    pl && pl.play.safety && pl.play.safety.spot && pl.play.safety.spot.chosen === true && pl.play.grip && pl.play.grip.source === 'default'
+      && pl.audio && pl.audio.at1s && pl.probes.frameRate.request === 'ok' && 'hzAtEnd' in pl.probes.frameRate && pl.view.near === 0.02 && pl.play.world.report && pl.play.world.report.spawn,
+    pl && pl.play.safety && `spot ${JSON.stringify(pl.play.safety.spot)}; pauses ${JSON.stringify(pl.play.safety.pauses)}; audio ${pl.audio.atStart}→${pl.audio.at1s}→${pl.audio.atEnd}; ${pl.probes.frameRate.hzAtEnd} Hz at end`);
+
+  // Diagnostics: Copy takes only the last session (Download / Share keep everything), sizes shown
+  const cp = await page.evaluate(() => {
+    const d = window.__app.diag, c = JSON.parse(d.lastJson());
+    return { sessions: c.sessions.length, kept: c.sessionsKept, keys: Object.keys(c), last: c.sessions[0] && c.sessions[0].mode, copyLen: d.lastJson().length, allLen: d.json().length,
+      allSessions: JSON.parse(d.json()).sessions.length, size: document.getElementById('diagSize').textContent };
+  });
+  ok('diagnostics: Copy exports only the last session (+ app, version, ua, support, preload, pageErrors)', cp.sessions === 1 && cp.last === 'play' && cp.kept === cp.allSessions && cp.kept >= 2
+    && ['app', 'version', 'ua', 'support', 'preload', 'pageErrors'].every((k) => cp.keys.includes(k)) && cp.copyLen < cp.allLen,
+    `copy ${(cp.copyLen / 1024).toFixed(0)} KB, all ${(cp.allLen / 1024).toFixed(0)} KB (${cp.allSessions} sessions)`);
+  ok('diagnostics: export sizes shown on the page', /^Copy: the last session \(\d+ KB\)\. Download \/ Share: all \d+ kept sessions \(\d+ KB\)\.$/.test(cp.size), cp.size);
+  await page.click('#bCopy');
+  const copyMsg = await waitFor(() => { const t = document.getElementById('msg').textContent; return /\d+ KB/.test(t) && t; }, null, 4000);
+  ok('diagnostics: Copy says what it copied and its size', !!copyMsg && /last session/.test(copyMsg), copyMsg);
 
   // ---- VR test scene
   await page.click('#bVR');
@@ -456,12 +587,75 @@ try {
   ok('reduced: entered xr', await waitState('xr'));
   const red = await page.evaluate(() => window.__app.rec.requested);
   ok('reduced: only local-floor requested', JSON.stringify(red) === '["local-floor"]', JSON.stringify(red));
-  ok('reduced: the game runs', !!(await waitFor(() => window.__app.play.stepName === 'play', null, 8000)));
+  // The spot step with a move: confirming 0.5+ m from where the world was built rebuilds it there
+  const redBefore = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
+  const redCard = await skipCard();
+  const redSpot = await waitFor(() => window.__app.play.stepName === 'spot', null, 10000);
+  const tgt = await page.evaluate(async () => {
+    const { SafeSpot } = await import('/src/safety/SafeSpot.js');
+    const k = window.__app.play, h = k.player.head, S = new SafeSpot();
+    let tight = null;
+    for (const d of [0.5, 0.7, 0.9, 1.2, 1.6, 2.0]) {
+      for (let i = 0; i < 16; i++) {
+        const a = (i / 16) * Math.PI * 2, x = h.x + Math.cos(a) * d, z = h.z + Math.sin(a) * d;
+        const st = S.evaluate(k.world, x, z, k.game.spot.r);
+        if (st === 1 || st === 5) return { x, z, st, d, from: [h.x, h.z] };
+        if (st === 2 && !tight) tight = { x, z, st, d, from: [h.x, h.z] };
+      }
+    }
+    return tight; // a "tight" spot is confirmed by holding the trigger
+  });
+  if (tgt) {
+    await page.evaluate(() => {
+      const a = window.__app, k = a.play, orig = k.rebuildForSpot.bind(k);
+      k.rebuildForSpot = (t) => { window.__rb = { panel: a.panel.mesh.visible, first: a.panel.lines[0] }; orig(t); };
+    });
+    await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [tgt.x, tgt.z]);
+    await sleep(1000);
+  }
+  const redSeen = await confirmSpot();
+  const redPlay = await waitFor(() => window.__app.play.stepName === 'play', null, 10000);
+  const rb = await page.evaluate(() => {
+    const a = window.__app, k = a.play, r = a.gfx.renderer, W = a.rec.play.world;
+    return { rebuild: W.rebuild || null, spot: a.rec.play.spot, zone: { ...k.world.zone }, gameZone: { ...k.game.zone }, hook: window.__rb || null,
+      programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries, errors: a.rec.errors.slice(0, 3), appPanel: a.panel.mesh.visible };
+  });
+  ok('reduced: the game runs (card, then the spot)', redCard && !!redSpot && !!redPlay, redSeen.join('→'));
+  ok('reduced: a spot 0.5 m away rebuilds the world there, behind the Get ready panel', !!tgt && rb.rebuild && rb.rebuild.movedM > 0.25 && rb.spot.rebuilt
+    && Math.hypot(rb.zone.x - tgt.x, rb.zone.z - tgt.z) < 0.15 && Math.hypot(rb.gameZone.x - rb.zone.x, rb.gameZone.z - rb.zone.z) < 1e-6 && rb.hook && rb.hook.panel && rb.hook.first === 'Get ready' && !rb.appPanel,
+    tgt ? `moved ${rb.rebuild && rb.rebuild.movedM} m (status ${tgt.st}); rebuild ${rb.rebuild && rb.rebuild.buildMs} ms; zone (${rb.zone.x.toFixed(2)}, ${rb.zone.z.toFixed(2)})` : 'no clear spot found');
+  ok('reduced: nothing compiled or created by the rebuild', rb.programs === redBefore.programs && rb.textures === redBefore.textures && rb.geometries === redBefore.geometries && rb.errors.length === 0,
+    `${rb.programs}/${rb.textures}/${rb.geometries} (before ${redBefore.programs}/${redBefore.textures}/${redBefore.geometries}) ${rb.errors.join(' | ')}`);
   await page.evaluate(() => window.__app.session.end());
   await waitState('menu');
+  await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
 
   const errs = consoleErrors.filter((e) => !/test rejection/.test(e));
   ok('no console errors', errs.length === 0, errs.slice(0, 5).join(' || '));
+
+  // ---- Grip fit escape hatch (fresh page): ?gripPitch=10&gripY=0.01&gripZ=-0.02 on both guns
+  const gp = await browser.newPage();
+  await gp.goto(`http://localhost:${port}/?emulate&gripPitch=10&gripY=0.01&gripZ=-0.02`);
+  await gp.waitForFunction(() => ['ready', 'failed'].includes(window.__app?.preload?.state), null, { timeout: 120000 });
+  const gf = await gp.evaluate(async () => {
+    const THREE = await import('three');
+    const k = window.__app.play, out = {};
+    for (const id of ['glock', 'akm']) {
+      const v = k.weapons[id].view;
+      const g = new THREE.Vector3(0.2, 1.2, -0.3), op = new THREE.Vector3(), oq = new THREE.Quaternion();
+      v.holdPose(g, new THREE.Quaternion(), op, oq);
+      const f = new THREE.Vector3(0, 0, -1).applyQuaternion(oq);
+      out[id] = { pitchDeg: (Math.atan2(f.y, -f.z) * 180) / Math.PI, palmOff: v.palm.clone().applyQuaternion(oq).add(op).sub(g).length() };
+    }
+    return { rep: k.gripReport, out };
+  });
+  const dPalm = (id, i) => gf.rep.palm[id][i] - pre.grip.palm[id][i];
+  ok('grip fit: URL values applied to both guns and reported', gf.rep.source === 'url' && gf.rep.pitchDeg === 10 && gf.rep.y === 0.01 && gf.rep.z === -0.02 && gf.rep.applied.join() === 'glock,akm'
+    && ['glock', 'akm'].every((id) => Math.abs(dPalm(id, 1) + 0.01) < 0.0015 && Math.abs(dPalm(id, 2) - 0.02) < 0.0015 && Math.abs(dPalm(id, 0)) < 0.0015),
+    JSON.stringify(gf.rep.palm));
+  ok('grip fit: the held gun is pitched 10° about its palm point', ['glock', 'akm'].every((id) => Math.abs(gf.out[id].pitchDeg - 10) < 0.05 && gf.out[id].palmOff < 1e-6),
+    ['glock', 'akm'].map((id) => `${id} ${gf.out[id].pitchDeg.toFixed(2)}°`).join(', '));
+  await gp.close();
 
   // ---- A failed load says why and keeps the probe sessions usable (fresh page, one model missing)
   const bad = await browser.newPage();

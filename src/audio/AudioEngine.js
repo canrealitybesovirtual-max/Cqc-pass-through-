@@ -145,6 +145,22 @@ export class AudioEngine {
   /** Decoded and the graph exists. */
   get ready() { return !!this.ctx && this.decoded; }
 
+  /** The context's state ('running', 'suspended', 'closed', 'interrupted'), or 'none' without a context. */
+  get state() { return this.ctx ? String(this.ctx.state) : 'none'; }
+
+  /**
+   * From an XR input event ('selectstart', 'select', 'squeeze': user
+   * activation in the WebXR spec): unlock again when the context is not
+   * running (the Enter click's unlock may not have taken). Event-driven, never
+   * per frame. Returns true when it tried.
+   */
+  gestureResume() {
+    const ac = this.ctx;
+    if (!ac || ac.state === 'running' || ac.state === 'closed') return false;
+    this.unlock();
+    return true;
+  }
+
   /** Create the context (suspended until unlock) and the whole node graph, once. */
   ensureContext() {
     if (this.ctx || !this.AC) return this.ctx;

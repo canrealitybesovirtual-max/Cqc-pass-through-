@@ -288,7 +288,9 @@ test('pockets: a door into unmapped space gets a small virtual floor behind it; 
   // From here the bedroom is in view through its door, so the hidden pocket delivers most enemies.
   assert.ok(inPocket >= 20, `pocket ${inPocket}, bedroom ${inBedroom}`);
   const fromStart = w.report().spawn;
-  assert.ok(fromStart.pocket >= 1 && fromStart.fromStart.tier3 >= fromStart.pocket, JSON.stringify(fromStart.fromStart));
+  // (the bedroom's candidates are within 3.5 m of this spot: never used; one pocket cell shows through the door)
+  const fs0 = fromStart.fromStart;
+  assert.ok(fromStart.pocket >= 1 && fs0.tier3 >= 1 && fs0.tier3 + fs0.tier2 + fs0.visible + fs0.tooNear === fromStart.candidates, JSON.stringify(fs0));
   // From the pocket to the living room: through the hallway door.
   const p = path(w, -1.15, -4.3, 1.0, -2.6);
   assert.ok(p, 'path from the pocket');
@@ -592,4 +594,65 @@ test('findSpawn with its tier log, raycast and floorY allocate nothing in world 
   assert.ok(bytes < 2048, `world code allocated ~${bytes} bytes in 10,000 rounds at ${sites.join(', ')}`);
   assert.equal(w.spawner.finds.reduce((a, b) => a + b, 0), 30000);
   assert.ok((NAV_INSIDE | NAV_WALK) > 0);
+});
+
+// ---------------------------------------------------------------- spawns: 3.5 m floor, in-view last resort, tier per find
+
+test('spawns are never within 3.5 m of the player, whatever minDist asks', () => {
+  const w = new WorldCore();
+  w.build(house(), { x: 0, z: 0 });
+  const out = { x: 0, z: 0 };
+  let found = 0;
+  for (let k = 0; k < 40; k++) {
+    w.update(0, k * 11000);
+    const a = k * 0.9;
+    if (!w.findSpawn(0, 0, Math.cos(a), Math.sin(a), 1.0, out)) continue;
+    found++;
+    assert.ok(Math.hypot(out.x, out.z) >= 3.5 - 1e-6, `spawn ${k} ${Math.hypot(out.x, out.z).toFixed(2)} m away`);
+    assert.equal(w.spawner.lastX, out.x);
+    assert.equal(w.spawner.lastZ, out.z);
+    assert.ok(w.spawner.lastTier >= 1 && w.spawner.lastTier <= 4);
+  }
+  assert.ok(found >= 30, `${found} of 40`);
+  assert.equal(w.findSpawn(0, 0, 1, 0, 30, out), false);
+  assert.ok(Number.isNaN(w.spawner.lastX) && w.spawner.lastTier === 0, 'a failed find clears the last point');
+});
+
+test('in view (±100°) only as a last resort: after 4 empty finds in a row, the most peripheral point, then the wait starts again', () => {
+  // one bare 7 × 6 m room, the player in a corner facing into it: every candidate is in view
+  const r = [[0, 0], [7, 0], [7, 6], [0, 6]];
+  const b = new SnapshotBuilder();
+  b.floor(r, 0).ceiling(r, 2.5);
+  for (let i = 0; i < 4; i++) b.wall(r[i][0], r[i][1], r[(i + 1) % 4][0], r[(i + 1) % 4][1], 0, 2.5, { extend: 0.05 });
+  const w = new WorldCore();
+  w.build(b.build(), { x: 0.7, z: 0.7 });
+  assert.ok(w.spawner.count > 10 && w.report().spawn.fromStart.visible === w.spawner.count, 'nothing hides');
+  const out = { x: 0, z: 0 };
+  const vx = Math.SQRT1_2, vz = Math.SQRT1_2;
+  const angle = () => (Math.acos(((out.x - 0.7) * vx + (out.z - 0.7) * vz) / Math.hypot(out.x - 0.7, out.z - 0.7)) * 180) / Math.PI;
+  /** @type {boolean[]} */ const got = [];
+  for (let k = 0; k < 10; k++) {
+    w.update(0, k * 11000);
+    got.push(w.findSpawn(0.7, 0.7, vx, vz, 3.5, out));
+    if (got[k]) {
+      assert.equal(w.spawner.lastTier, 4, 'the in-view tier');
+      assert.ok(Math.hypot(out.x - 0.7, out.z - 0.7) >= 3.5);
+      assert.ok(angle() > 40, `as far from the view direction as the room allows: ${angle().toFixed(0)}°`);
+    }
+  }
+  assert.deepEqual(got, [false, false, false, true, false, false, false, true, false, false], 'every 4th try');
+  const s = w.report().spawn;
+  assert.equal(s.finds.inView, 2);
+  assert.equal(s.finds.none, 8);
+  assert.ok(s.recent.every((e) => e.tier === 4));
+  // turned round: a visible point behind (tier 1) at once, and the streak is cleared
+  assert.ok(w.findSpawn(0.7, 0.7, -1, 0, 3.5, out) || w.findSpawn(0.7, 0.7, -vx, -vz, 3.5, out));
+  assert.equal(w.spawner.failStreak, 0);
+  // a hidden point always wins over the last resort
+  const h = new WorldCore();
+  h.build(house(), { x: 0, z: 0 });
+  for (let k = 0; k < 8; k++) {
+    h.update(0, k * 11000);
+    if (h.findSpawn(0, 0, 3, -2.175, 3.5, out)) assert.notEqual(h.spawner.lastTier, 4);
+  }
 });

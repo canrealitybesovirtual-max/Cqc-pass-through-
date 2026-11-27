@@ -27,36 +27,24 @@
 
     <section>
       <h2>How to play (Enter MR)</h2>
-      <p>Wait until the bar under Start says <b>Ready</b>. Stand where you want to fight, with room to turn, then tap <b>Enter MR</b>. A “Get ready” panel shows while the game reads your Space Setup room; then waves of soldiers come in through your real doors.</p>
+      <p>Wait for <b>Ready</b> under Start, then tap <b>Enter MR</b>. A “Get ready” card shows these controls while the game reads your Space Setup room; pull the trigger to go on.</p>
       <ul>
-        <li><b>Safe zone.</b> Your spot is a 0.8 m circle on the floor; a ring appears near its edge. Step out and the game pauses (“Return to your spot”). Step back in: 3-2-1, then it goes on.</li>
-        <li><b>Pistol (Glock):</b> put your <b>right</b> hand on your <b>right hip</b> and squeeze the <b>grip</b>. Keep squeezing to hold it.</li>
-        <li><b>Rifle (AKM):</b> reach <b>over your right shoulder</b> and squeeze the right grip. Hold the handguard with the <b>left grip</b> to aim with two hands. It starts on <b>safe</b>.</li>
-        <li><b>Fire:</b> right <b>trigger</b>. <b>Right stick click</b> moves the AKM selector: safe → auto → semi → safe.</li>
-        <li><b>Reload:</b> <b>A</b> drops the magazine. Squeeze the <b>left grip at your left hip</b> to take a fresh one, bring it under the gun, line it up and push it up into the well. For testing: <b>A again</b> with the magazine out reloads by itself (1.2 s).</li>
-        <li><b>Rack:</b> left grip on the back of the slide (or the AKM's charging handle, right side), pull it all the way back, let go. <b>B</b> drops a locked-open Glock slide.</li>
-        <li><b>Switch:</b> let go of the gun at its spot (hip or shoulder) to put it away, then take the other. A gun let go anywhere else goes back to its spot by itself.</li>
-        <li><b>Left wrist:</b> wave, health, kills and ammo. Looking at it: tap <b>X</b> to hide or show the ammo line.</li>
-        <li><b>Exit:</b> hold <b>Y</b> for 2 s, or look at your left wrist and hold <b>X</b> for 1 s. (Both grips do not exit in play: the rifle needs both hands.)</li>
-        <li><b>Hit:</b> a short red tint, a thud and a buzz. You heal 25 between waves. When you are down: tap <b>Y</b> to restart.</li>
+        <li><b>Safe spot:</b> a ring follows you on the floor. Stand where it is green, with room to turn, and <b>pull the trigger</b>. Amber: something is within arm’s reach (hold the trigger 1 s to play there anyway). Red: move where the arrow points. Step out of the ring during the round and the game pauses.</li>
+        <li><b>Glock:</b> right hand on your <b>right hip</b>, squeeze the <b>right grip</b>.</li>
+        <li><b>AKM:</b> right hand <b>over your right shoulder</b>, squeeze the <b>right grip</b>. Left grip on the handguard to aim with two hands.</li>
+        <li><b>Fire:</b> trigger. <b>AKM selector:</b> right stick click (semi → safe → auto → semi). It starts on semi; your left wrist shows the mode.</li>
+        <li><b>Reload:</b> <b>A</b> drops the magazine. Take a new one from your <b>left hip with the left grip</b>, then push it up into the gun. (A again with the magazine out reloads by itself, for testing.)</li>
+        <li><b>Rack:</b> left grip on the slide (AKM: the charging handle), pull back, let go. <b>B:</b> slide release.</li>
+        <li><b>Pause:</b> <b>B + Y</b> together; pull the trigger to resume. <b>Exit:</b> hold <b>Y</b> for 2 s.</li>
+        <li><b>Left wrist:</b> wave, health, kills, ammo and fire mode.</li>
+        <li>Afterwards tap <b>Copy</b> below and paste it into the chat.</li>
       </ul>
+      <p class="quiet">Gun sits wrong in your hand? Add to the page address, then reload: <code>?gripPitch=5</code> (degrees, + = muzzle up), <code>&amp;gripY=0.01</code> (metres, + = gun higher in the hand), <code>&amp;gripZ=0.01</code> (metres, + = gun back toward you). The values used are saved with each session.</p>
     </section>
 
     <section>
-      <h2>Headset tests for v0.2</h2>
-      <ol>
-        <li><b>Probe session: does your hand hide the cube?</b> You should see your room, an orange cube ahead and the panel to its left.
-          <ul>
-            <li>Read the panel's <b>Depth</b> line out loud in your reply (for example “new texture each frame” or “same texture each frame”, or “off (…)”).</li>
-            <li>Hold your open hand about 40 cm in front of your face, between your eyes and the cube. Does the hand hide the cube?</li>
-            <li>Press <b>Y</b>: a picture of what the depth sensor sees appears to the right of the cube (red = near, yellow 1 m, green 2 m, blue far). Move your hand in front of you: do you see a hand shape in the picture? Press <b>Y</b> again to hide it.</li>
-            <li>Press <b>X</b> (clear off), then <b>X</b> again (clear on). Does the room ever turn black or smeared?</li>
-            <li>Exit by holding <b>both grips for 1 second</b>.</li>
-          </ul>
-        </li>
-        <li><b>Enter MR (play).</b> Play at least two waves: draw the Glock, shoot, reload with A, take the AKM over your shoulder, try the pouch reload and the rack. Tell me what felt wrong (holster height, gun angle in the hand, magazine push, recoil, sounds, enemies). Exit by holding Y.</li>
-        <li>Tap <b>Copy</b> below and paste it into the chat.</li>
-      </ol>
+      <h2>Probe tools</h2>
+      <p class="quiet"><b>Probe session:</b> an orange test cube with an info panel to its left. <b>Y</b> shows the depth picture, <b>X</b> toggles the explicit clear, <b>A</b> starts a 60 s timing run, <b>B</b> changes the refresh rate. Hold <b>both grips for 1 s</b> to exit. <b>Boundary probe</b> and <b>VR test scene</b>: look around, then exit the same way.</p>
     </section>
 
     <section>
@@ -68,6 +56,7 @@
         <button id="bShare">Share</button>
         <button id="bClear" class="quiet">Clear</button>
       </div>
+      <p id="diagSize" class="quiet"></p>
     </section>
   </main>
   <script type="module" src="./src/main.js"></script>

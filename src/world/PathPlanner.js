@@ -1,10 +1,14 @@
 // @ts-check
 /**
  * Time-sliced A* on a NavGrid (pure; typed arrays; no allocation after
- * construction). One search runs at a time; others queue. `step(n)` expands at
- * most n nodes and resumes the same search next call, so the main thread can
- * give path finding a fixed per-frame quota (PLAN §9: start ≈ 1,000 expansions,
- * then set the quota to ≤ 0.4 ms from measured expansions/ms on the Quest).
+ * construction). One search runs at a time; others queue. `step(n, maxMs)`
+ * expands at most n nodes and resumes the same search next call, so the main
+ * thread can give path finding a fixed per-frame quota (PLAN §9: ≤ 0.4 ms).
+ * With `maxMs` it also stops once that much time has passed, reading the clock
+ * (performance.now, or the `clock` option for tests) after every 64
+ * expansions: the expansion cap alone cannot bound the time on a slower CPU.
+ * `stats.timeouts` counts the steps the clock cut short and `stats.maxStepMs`
+ * holds the longest timed step (for the session record).
  *
  * - 8-connected, no corner cutting (a diagonal needs both side cells walkable).
  * - Octile heuristic (admissible: every step costs at least its length).
@@ -24,6 +28,9 @@ export const PATH_PENDING = -1;
 export const PATH_FAILED = -2;
 
 const IDLE = 0, QUEUED = 1, ACTIVE = 2, DONE = 3, FAILED = 4;
+/** Expansions between clock reads in a timed step. */
+export const TIME_CHECK = 64;
+const defaultClock = typeof performance !== 'undefined' && typeof performance.now === 'function' ? () => performance.now() : () => Date.now();
 const SQRT2 = Math.SQRT2;
 const NDX = new Int8Array([1, -1, 0, 0, 1, 1, -1, -1]);
 const NDZ = new Int8Array([0, 0, 1, -1, 1, -1, 1, -1]);
@@ -32,10 +39,13 @@ export class PathPlanner {
   /**
    * @param {import('./NavGrid.js').NavGrid} nav buffers are sized to nav.capacity, so build the
    *   planner at load (before World.build) and keep it for the whole page
-   * @param {{ maxRequests?: number, maxPoints?: number, wallCost?: number, wallBand?: number, snapRadius?: number }} [o]
+   * @param {{ maxRequests?: number, maxPoints?: number, wallCost?: number, wallBand?: number, snapRadius?: number,
+   *   clock?: () => number }} [o] clock: milliseconds (default performance.now; inject a fake in tests)
    */
-  constructor(nav, { maxRequests = 16, maxPoints = 64, wallCost = 1.5, wallBand = 0.3, snapRadius = 1.0 } = {}) {
+  constructor(nav, { maxRequests = 16, maxPoints = 64, wallCost = 1.5, wallBand = 0.3, snapRadius = 1.0, clock = defaultClock } = {}) {
     this.nav = nav;
+    /** @type {() => number} */
+    this.clock = clock;
     const cap = nav.capacity;
     this.g = new Float32Array(cap);
     this.parent = new Int32Array(cap);
@@ -70,7 +80,7 @@ export class PathPlanner {
     this.bx = 0;
     this.bz = 0;
     this.navVersion = nav.version;
-    this.stats = { searches: 0, direct: 0, failures: 0, expansions: 0, lastExpansions: 0, truncated: 0 };
+    this.stats = { searches: 0, direct: 0, failures: 0, expansions: 0, lastExpansions: 0, truncated: 0, timeouts: 0, maxStepMs: 0 };
   }
 
   /**
@@ -102,19 +112,39 @@ export class PathPlanner {
   }
 
   /**
-   * Run up to `maxExpansions` node expansions, across queued requests.
+   * Run up to `maxExpansions` node expansions, across queued requests, and
+   * (with `maxMs`) for about `maxMs` milliseconds at most: the clock is read
+   * when there is work, then after every TIME_CHECK expansions, so at least
+   * one chunk always runs and a step overruns by at most one chunk. An idle
+   * planner never reads the clock.
    * @param {number} maxExpansions
+   * @param {number} [maxMs] time budget (default: none)
    * @returns {number} expansions done
    */
-  step(maxExpansions) {
+  step(maxExpansions, maxMs = Infinity) {
     this.sync();
     let done = 0;
+    const timed = maxMs < Infinity && (this.active >= 0 || this.qLen > 0);
+    const t0 = timed ? this.clock() : 0;
     while (done < maxExpansions) {
       if (this.active < 0) {
         if (!this.startNext()) break;
         continue;
       }
-      done += this.expand(maxExpansions - done);
+      if (!timed) {
+        done += this.expand(maxExpansions - done);
+        continue;
+      }
+      const left = maxExpansions - done;
+      done += this.expand(left < TIME_CHECK ? left : TIME_CHECK);
+      if (this.clock() - t0 >= maxMs) {
+        if (done < maxExpansions && (this.active >= 0 || this.qLen > 0)) this.stats.timeouts++;
+        break;
+      }
+    }
+    if (timed) {
+      const ms = this.clock() - t0;
+      if (ms > this.stats.maxStepMs) this.stats.maxStepMs = ms;
     }
     this.stats.expansions += done;
     return done;

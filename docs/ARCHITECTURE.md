@@ -47,10 +47,12 @@ index.html ── import map: three → vendor/three/three.module.js, three/addo
 | | Probe-style (`probe`, `bounds`, `vr`) | Play (`play`, and `reduced`, its fallback request) |
 |---|---|---|
 | Systems (PerfMonitor names) | `input`, `probe`, `ui`, `render` | `input`, `world`, `player`, `weapons`, `enemies`, `game`, `audio`, `ui`, `render` (CONTRACTS order) |
-| Content | test cube, controller rays, hit-test reticle, info panel (34° left of ahead), depth picture (Y) | the game; App's opaque "Get ready" panel until the round starts |
-| Buttons | A timing run, B rate, X clear, Y depth picture, both grips exit | weapon buttons (A, B, stick, trigger, grips); hold Y 2 s or wrist X 1 s exits |
+| Content | test cube, controller rays, hit-test reticle, info panel (34° left of ahead), depth picture (Y) | the game; App's opaque "Get ready" panel with the controls card until the spot step |
+| Buttons | A timing run, B rate, X clear, Y depth picture, both grips exit | weapon buttons (A, B, stick, trigger, grips); B + Y pauses; hold Y 2 s or wrist X 1 s exits |
 | Timing run | A (60 s) | starts with wave 1 (60 s) |
-| Record extras | `probes.*`, `probes.liveDepth` | `spaceSnapshot`, `play` (capture, world build + report, round summary), `warmXR`, `systemsMs` |
+| Near plane | 0.05 m | 0.02 m without depth sensing (the AKM stock), 0.05 with it |
+| Refresh rate | as the browser starts it (B cycles) | asks for 72 Hz at start (`probes.frameRate`) |
+| Record extras | `probes.*`, `probes.liveDepth` | `spaceSnapshot`, `play` (capture, world build + report, spot, grip fit, safety report, round summary), `warmXR`, `systemsMs`, `audio` (context state at start, 1 s, end; gesture resumes), `view` |
 
 ### Frame order
 
@@ -60,15 +62,22 @@ In play, the `player` step also runs `game.preUpdate` (GameSession's pause and f
 
 ### Play session start
 
-1. The click handler calls `requestXR` synchronously (the user gesture); `audio.unlock()` runs in the same click.
+1. The click handler calls `requestXR` synchronously (the user gesture); `audio.unlock()` runs in the same click. During the session the XR `selectstart` / `select` / `squeeze` events (user activation) unlock the audio again whenever its context is not running.
 2. When the promise resolves: the `Loop` starts **before** `setSession`, `attachSession` sets space, scale and foveation and calls `setSession`; everything after it is in one try: a start error ends the session and returns to the menu with a record.
-3. `PlayKit.begin`: Ctx gets the session and space; the player resets; the capture gate resets.
+3. `PlayKit.begin`: Ctx gets the session and space; the player resets; the capture gate resets. App asks for 72 Hz (`updateTargetFrameRate`, when offered) and sets the near plane.
 4. `world` system, frame by frame:
     1. **capture:** once the Space Setup plane count has been stable for 0.5 s (or after 3 s), `captureSnapshot(frame, space)` copies planes and meshes (`?emulate`: the house fixture). The snapshot goes into `rec.spaceSnapshot`.
-    2. **build:** `world.build(snapshot, head)` once, synchronously, behind App's opaque "Get ready" panel.
+    2. **build:** `world.build(snapshot, head)` once, synchronously, behind App's opaque "Get ready" panel (which carries the controls card).
     3. **warm:** next frame, every pool is drawn once into the XR framebuffer (`warmXR`, before that frame's render, which clears and draws over it) and the baseline moves to include XR's own resources.
-    4. **start:** the frame after, `game.start(world.zone)`: the safe zone is where you stand; GameSession shows "Get ready", then the waves.
-5. Session end: the round summary goes into `rec.play`, the record is saved, every pool is reset and hidden.
+    4. **start:** the card stays up until a trigger pull (after 1 s) or 8 s.
+    5. **spot:** `game.pickSpot(cb)`: App's panel hides; GameSession's ring follows the head (green clear, amber tight, red blocked) with a floor arrow and a message until the trigger confirms a spot (a 1 s hold for a tight one). The callback runs inside `game.preUpdate`, so PlayKit starts the round in the next frame's `world` step.
+    6. **rebuild** (only when the spot is more than 0.25 m from where the world was built): App's panel shows again, the next frame runs `world.build(world.snapshot, zone, { doors })` and draws with the panel up (uploading the occluder's rewritten buffers).
+    7. **go:** `game.start(zone)`; GameSession shows "Get ready", then the waves.
+5. Session end: `game.safetyReport()` (before `game.stop()`), the world report with the spawn tiers used and the round summary go into `rec.play`, the record is saved, every pool is reset and hidden.
+
+The grip fit escape hatch (`?gripPitch=<deg>&gripY=<m>&gripZ=<m>`) is applied once at load by PlayKit (WeaponView's `FIT` is frozen and has no hook): each view's palm point moves by −(0, y, z), and for a pitch the view's `holdPose` turns the aim-ray orientation about the gun's X axis first. The effective values are in `rec.play.grip`.
+
+Diagnostics: **Copy** takes only the last session (plus app, version, ua, support, preload, pageErrors), compact, so it can be pasted into a chat; **Download** and **Share** take every kept session. The page shows both sizes.
 
 ### Shared runtime context (Ctx)
 
@@ -102,7 +111,7 @@ three r187 draws its occlusion pass (a full-screen quad writing `gl_FragDepth`) 
 - **Production:** a Render static site from `main` (`render.yaml`). It sends `Cache-Control: no-cache` and `Permissions-Policy: xr-spatial-tracking=(self)`. The origin must never change, because rooms and anchors belong to it.
 - **Desktop:**
     - `npm test` runs the Node unit tests.
-    - `NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs` runs Playwright with IWER: preload, probe (with fake per-frame depth), a play round (draw, fire, hit, reload, AKM), VR, the reduced retry and a failed load. It prints the play session's CPU per frame and draw calls.
+    - `NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs` runs Playwright with IWER: preload, probe (with fake per-frame depth), a play round (card, safe spot, draw, fire, hit, reload, AKM, wrist fire mode), diagnostics Copy, VR, the reduced retry (with a moved spot and the rebuild), a grip-fit page and a failed load. It prints the play session's CPU per frame and draw calls.
     - `NODE_PATH=$(npm root -g) node tests/e2e/depth-occlusion.mjs` checks the soft-occlusion shaders on the GPU path.
     - `node tools/serve.mjs` then `http://localhost:8080/?emulate` runs the page in the emulator (the house fixture). `?emulate&snapshot=<url>` plays in a saved snapshot or a diagnostics export (your real house); `?emulate&replay` uses the newest snapshot in this browser's diagnostics.
 - **Headset:** open the Render URL in the Quest Browser and follow the on-page tests. Then copy the diagnostics JSON into the chat.

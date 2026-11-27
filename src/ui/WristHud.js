@@ -8,8 +8,9 @@ import { PHASE } from '../game/Rules.js';
  * A small watch-like panel on the back of the left wrist (CONTRACTS.md
  * "WristHud"), placed from `ctx.input.left.grip` every frame.
  *
- * Shows wave, health, kills and an ammo line (toggle, on by default for the
- * test). Look at the wrist to use it: X taps toggle the ammo line, holding X
+ * Shows wave, health, kills and an ammo line with the fire mode (SAFE /
+ * SEMI / AUTO; SAFE in amber, so a dead AKM trigger is explained) (toggle,
+ * on by default for the test). Look at the wrist to use it: X taps toggle the ammo line, holding X
  * for 1 s exits (the wrist menu exit). Redraws only when a value changes, at
  * most twice a second, and only through the shared one-upload-per-frame gate.
  * Drawing uses cached strings only (no per-frame allocation).
@@ -44,6 +45,12 @@ const NUM = /** @type {string[]} */ ([]);
 for (let i = 0; i < 1000; i++) NUM.push(String(i));
 /** @param {number} n */
 const num = (n) => NUM[n < 0 ? 0 : n > 999 ? 999 : n | 0];
+/** Fire mode labels by code (0 = unknown). */
+const MODE_LABEL = ['', 'SAFE', 'SEMI', 'AUTO'];
+/** @param {unknown} m a WeaponInstance mode ('safe', 'semi', 'auto') */
+const modeCode = (m) => (m === 'safe' ? 1 : m === 'semi' ? 2 : m === 'auto' ? 3 : 0);
+/** Values sampled and drawn (wave, health, kills, state, ammo on, weapon, mag, chamber, looking, exit hold, mode). */
+const N_VALUES = 11;
 
 const FONT_BIG = '600 44px system-ui, sans-serif';
 const FONT_MID = '500 32px system-ui, sans-serif';
@@ -60,7 +67,9 @@ export class WristHud {
   /**
    * @param {{ scene: THREE.Scene }} ctx
    * @param {{ game?: { wave: number, health: number, kills: number, paused: boolean, phase: number, requestExit?: (r: string) => void } | null,
-   *   weapons?: { ammo?: () => { weapon: string|null, mag: number|null, chambered: boolean|number } } | null, showAmmo?: boolean }} [o]
+   *   weapons?: { ammo?: () => { weapon: string|null, mag: number|null, chambered: boolean|number, mode?: string|null },
+   *     held?: any, lastHeld?: any } | null, showAmmo?: boolean }} [o]
+   *   the fire mode comes from `ammo().mode` when present, else from the held (or last held) weapon's `inst.mode`
    */
   constructor(ctx, { game = null, weapons = null, showAmmo = true } = {}) {
     this.game = game;
@@ -82,8 +91,8 @@ export class WristHud {
     this.lastDraw = -1e9;
     this.draws = 0;
     // last drawn state, and the state now
-    this._s = new Int32Array(10).fill(-9);
-    this._n = new Int32Array(10);
+    this._s = new Int32Array(N_VALUES).fill(-9);
+    this._n = new Int32Array(N_VALUES);
     this.dirty = true;
     this.draw(); // initial content, so the warm-up uploads a real texture
   }
@@ -169,7 +178,7 @@ export class WristHud {
     n[1] = g ? Math.ceil(g.health) | 0 : 100;
     n[2] = g ? g.kills | 0 : 0;
     n[3] = g ? (g.phase === PHASE.OVER ? 2 : g.paused ? 1 : g.phase === PHASE.BREAK ? 3 : 0) : 0;
-    let wc = 0, mag = -1, ch = 0;
+    let wc = 0, mag = -1, ch = 0, md = 0;
     const W = this.weapons;
     if (this.showAmmo && W && typeof W.ammo === 'function') {
       const a = W.ammo();
@@ -177,6 +186,11 @@ export class WristHud {
         wc = a.weapon === 'glock' ? 1 : a.weapon === 'akm' ? 2 : 0;
         mag = typeof a.mag === 'number' && a.mag >= 0 ? a.mag | 0 : -1;
         ch = a.chambered ? 1 : 0;
+        if (a.mode !== undefined) md = modeCode(a.mode);
+        else {
+          const w = W.held || W.lastHeld;
+          md = w && w.inst ? modeCode(w.inst.mode) : 0;
+        }
       }
     }
     n[4] = this.showAmmo ? 1 : 0;
@@ -185,14 +199,15 @@ export class WristHud {
     n[7] = ch;
     n[8] = this.looking ? 1 : 0;
     n[9] = this._xT >= WRIST.tapS ? 1 : 0;
+    n[10] = wc !== 0 ? md : 0;
     const s = this._s;
-    for (let i = 0; i < 10; i++) if (s[i] !== n[i]) { this.dirty = true; break; }
+    for (let i = 0; i < N_VALUES; i++) if (s[i] !== n[i]) { this.dirty = true; break; }
   }
 
   /** Draw the current values and queue one upload. */
   draw() {
     const n = this._n, s = this._s;
-    for (let i = 0; i < 10; i++) s[i] = n[i];
+    for (let i = 0; i < N_VALUES; i++) s[i] = n[i];
     const P = this.panel, c = P.ctx, W = P.canvas.width, H = P.canvas.height;
     c.fillStyle = C_BG;
     c.fillRect(0, 0, W, H);
@@ -235,6 +250,13 @@ export class WristHud {
       c.textAlign = 'left';
       c.fillStyle = C_DIM;
       c.fillText(n[5] === 1 ? 'G17' : n[5] === 2 ? 'AKM' : '—', 18, 156);
+      if (n[10] !== 0) {
+        // fire mode, between the name and the count: SAFE in amber (the trigger is blocked)
+        c.font = FONT_SMALL;
+        c.fillStyle = n[10] === 1 ? C_WARN : C_TEXT;
+        c.fillText(MODE_LABEL[n[10]], 98, 154);
+        c.font = FONT_MID;
+      }
       if (n[5] !== 0) {
         c.textAlign = 'right';
         c.fillStyle = n[6] < 0 ? C_WARN : C_TEXT;

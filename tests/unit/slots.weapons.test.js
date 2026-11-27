@@ -175,7 +175,7 @@ test('guns start in their slots: Glock on the right hip, AKM on the back', () =>
   const ak = W.akm.view.toWorld(W.akm.view.palm, v3());
   assert.ok(ak.distanceTo(backPoint(W)) < 1e-6 && ak.z > 0.1, 'AKM grip behind the shoulder');
   assert.ok(W.glock.view.root.visible && W.akm.view.root.visible);
-  assert.deepEqual(W.ammo(), { weapon: 'glock', mag: 17, chambered: 1 });
+  assert.deepEqual(W.ammo(), { weapon: 'glock', mag: 17, chambered: 1, mode: 'semi' });
   assert.equal(W.ammo(), W.ammo(), 'one reused object');
 });
 
@@ -302,7 +302,7 @@ test('A drops the magazine (pooled, falls to the floor, one landing sound); A ag
   const P = W.fx.mags.glock.pos;
   assert.ok(P[1] < 0.03 && P[1] > 0, `dropped magazine lies on the floor: y ${P[1]}`);
   assert.equal(S.sounds.filter((s) => s.key === 'magDrop').length, 1, 'landing sound once');
-  assert.deepEqual(W.ammo(), { weapon: 'glock', mag: -1, chambered: 1 });
+  assert.deepEqual(W.ammo(), { weapon: 'glock', mag: -1, chambered: 1, mode: 'semi' });
   R.set(4, 1); S.step(1); R.set(4, 0);
   S.step(Math.floor(1.0 / DT));
   assert.equal(W.glock.inst.magSeated, false, 'not yet');
@@ -451,7 +451,7 @@ test('lost controller tracking for 0.25 s auto-holsters', () => {
   assert.equal(W.glock.carry.state, CARRY_HOLSTER);
 });
 
-test('AKM: over the right shoulder, selector safe → auto, two-handed aim from the right grip to the left hand, 600 rpm', () => {
+test('AKM: over the right shoulder, issued on semi (fires), selector semi → safe → auto, two-handed aim from the right grip to the left hand, 600 rpm', () => {
   const S = setup();
   const { W, L, R } = S;
   let shots = 0;
@@ -463,11 +463,20 @@ test('AKM: over the right shoulder, selector safe → auto, two-handed aim from 
   assert.ok(S.sounds.some((s) => s.key === 'cloth'));
   R.pose(AIM_POS, new THREE.Quaternion());
   S.step(30);
+  // issued on semi (gap audit F3: on safe the trigger did nothing and the rifle read as broken)
+  assert.equal(W.akm.inst.mode, 'semi');
+  assert.deepEqual(W.ammo(), { weapon: 'akm', mag: 30, chambered: 1, mode: 'semi' });
+  R.set(0, 1); S.step(12); R.set(0, 0); S.step(12);
+  assert.equal(shots, 1, 'semi: one round per pull');
+  // stick click: semi → safe (the trigger does nothing), again → auto
+  R.set(3, 1); S.step(1); R.set(3, 0); S.step(1);
   assert.equal(W.akm.inst.mode, 'safe');
+  assert.equal(W.ammo().mode, 'safe', 'the HUD can show SAFE');
   R.set(0, 1); S.step(3); R.set(0, 0); S.step(2);
-  assert.equal(shots, 0, 'on safe');
+  assert.equal(shots, 1, 'on safe');
   R.set(3, 1); S.step(1); R.set(3, 0); S.step(1);
   assert.equal(W.akm.inst.mode, 'auto');
+  assert.equal(W.ammo().mode, 'auto');
   assert.ok(R.pulses.some(([a]) => a === HAPTIC.selector[0]));
   // left hand on the handguard support, then swing it 10° to the left: the rifle follows
   const v = W.akm.view;
@@ -705,8 +714,8 @@ test('a full handling cycle allocates only the boxed numbers handed to the audio
     else if (c < 600) {
       R.pose(AIM_POS, q);
       const w = W.akm, v = w.view;
-      if (c === 30 && w.inst.mode !== 'auto') R.set(3, 1);
-      if (c === 31) R.set(3, 0);
+      if ((c === 30 || c === 34) && w.inst.mode !== 'auto') R.set(3, 1); // issued on semi: semi → safe → auto
+      if (c === 31 || c === 35) R.set(3, 0);
       if (c >= 40 && c < 300) { v.toWorld(v.support, tmp2); L.pose(tmp2, Q0); L.set(1, 1); R.set(0, (c % 90) < 60 ? 1 : 0); }
       if (c === 300) { R.set(0, 0); L.set(1, 0); R.set(4, 1); }
       if (c === 301) R.set(4, 0);
