@@ -160,7 +160,7 @@ Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g)
 ### Not in this build
 
 - The user's chosen extras **8 (home defense), 7 (room clearing)**: not built (v0.4 built 10, the automatic upload). The data side for 7 and 8 exists (rooms, door graph, exterior doors); windows are not parsed yet.
-- Walkthrough pre-scan, the silent learner, IndexedDB persistence: not built. (Real-surface physics came in v0.4.)
+- Walkthrough pre-scan, the silent learner, IndexedDB persistence: not built. (Real-surface physics came in v0.4; the scan and the learner in v0.5.)
 - A watch toggle for the gloves; a watch-fit page; the pre-scan "rooms found" on the watch.
 
 ### Ask in the headset (keep it short)
@@ -263,6 +263,41 @@ The user's v0.4 test in their house: "it's looking fake how they spawn, see thro
 ### Ask in the headset (keep it short)
 
 See DEVICE_LOG "v0.4.1: tests to run".
+
+## v0.5: zero-hitch pass, the walkthrough scan, the house learner (desktop only)
+
+Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs`, 164 checks) plus `npm test` (658 tests). **Nothing in this section has run on the Quest yet.** IWER has no hit-test environment and no real depth: the e2e feeds the depth tap a fake constant-depth texture (the pipeline runs end to end; the geometry is tested in Node), and hit-test sources fail there ("Synthetic Environment Module required").
+
+### Hitch fixes from the v0.4 device record
+
+| Item | Status | Notes |
+|---|---|---|
+| Hitch entries carry the previous frame (CPU, interval, per-system split), the callback lateness, the next interval, the marker with its age (markers name hitches for 0.5 s); skipped intervals are logged gaps; `rec.perf`: the whole-session interval / CPU histograms, percentiles, per-system averages and peaks, lateness | desktop-tested | PerfMonitor Node tests (incl. allocation-free with a hitch every 50 frames); e2e: `rec.perf` and the hitch log in the saved session |
+| Programs / textures / geometries checked once a second in every build; a growth → hitch marker + `rec.growth` | desktop-tested | e2e: flat through the round (32 / 38 / 52) |
+| Zero texture uploads in play: the watch dial and menu, GameSession's messages and the play card draw from one glyph atlas uploaded at load (GlyphBoard: instanced quads, one shared program) | desktop-tested | e2e: **0** texture uploads from the round start to the exit (the old build: canvas `texSubImage2D` for the watch and messages); the only texture data left is three's bone matrices of visible soldiers (997 small float updates in the run: skinning). Watch Node tests: no allocation per frame with the boards. Legibility of the glyph text on the device pending |
+| Space Setup capture spread over frames (planes, then ≤ 16k mesh vertices a frame); `rec.play.capture.ms`, `maxMs`, `frames` | desktop-tested | Node test: identical snapshot to the one-frame capture; the fixture plays from its file in the e2e, so the live path is Node-only |
+| After a build: the card, the look's rebuild, its light snap and the card's layout each in their own frame, then the XR warm draw (step POST) | desktop-tested | Node test of the staging; e2e: the card and warm draw as before |
+| JS heap once a second outside the frame loop (GC drops with times, `rec.heap`, marker `gc`); long animation frames ≥ 50 ms with their top 3 scripts | desktop-tested (heap, LoAF parser) / implemented (in the record) | `performance.memory` and LoAF are Chromium APIs; whether the Quest Browser exposes them is a device question |
+
+### The walkthrough scan and the house learner
+
+| Item | Status | Notes |
+|---|---|---|
+| **Scan house** button; the first play in a house with nothing learned starts with the scan (`?scan=0` never on its own, `?learn=0` off) | desktop-tested | e2e: the first play goes card → scan → (walk) → hold the trigger → built from the scan → the card; later sessions in the same house skip it (the house was loaded) |
+| While scanning: nothing in the view but a faint floor tint; the watch shows the rooms found (9 o'clock, blue) and SCAN n% | desktop-tested | e2e: card hidden, tint shown, no message panel, the watch reads "SCAN 2%" |
+| Play asks for depth-sensing for the learner only; three never sees it (near plane 0.02 m, its own clear, no occlusion pass) | desktop-tested | e2e: `depthSensing` true, `depthToThree` false, `hasDepthSensing()` false, near 0.02. Whether the Quest prompts again for depth is a device question |
+| GPU depth readback (DepthTap): GPU downsample to 40 × 40 blocks per eye with the nearest texel's position, `readPixels` into a freshly specified PIXEL_PACK_BUFFER the frame after, fence, poll, `getBufferSubData`; one GL step a frame on frames under 8 ms; 4 Hz scanning, 1 Hz in play; compiled and drawn at load | desktop-tested | e2e (SwiftShader): 145 readbacks in play, 0 dropped, issue 0.16 ms avg (max 1 ms), `getBufferSubData` 0.35 ms avg (max 1.8 ms), always signalled the next frame. Node: the packing (the shader's CPU mirror) decodes to the surfaces with p50 < 2 mm, p95 < 6 mm (320², asymmetric frusta). Adreno costs, the depth geometry, the no-data value and the row direction are device questions |
+| Row-direction calibration against Space Setup (first 8 readbacks; median < 8 cm or depth learning is off for the session) | desktop-tested (Node) | e2e's fake constant depth correctly turns depth learning off ("no points"); real depth is the device's |
+| Hit-test rays (controllers, two viewer rays; `['point', 'plane']` in a try, then the default), one source a frame | implemented | IWER cannot emulate hit-test; `rec.play.learn.hitTest` says what the Quest gives |
+| Learner worker: sparse 4 × 4 m chunks of 10 cm cells from a fixed pool, fusion (floor heights, tops, wall-height hits, wall-height free space by DDA, walked cells), analysis (openings, floors, walls, furniture tops, rooms) | desktop-tested | Node tests; e2e: the worker loop runs, loads and saves in IndexedDB |
+| The learned house in the world build (door planes in conflicting walls, floor planes beyond / at other heights, learned walls and volumes, walked rooms never "unscanned") | desktop-tested | **Replay of your v0.4 house** (`tests/unit/learn.replay.test.js`): without the scan the hall is closed (bedroom, hall and living room are three nav regions); a synthetic depth walk along your path (bedroom → hall → living room) through the walls Space Setup put where you walked finds 2 walked openings, and the world built from it is ONE region; Space Setup's other walls stay; the space behind the living room's doors stays hidden unless walked |
+| Persistence: IndexedDB (worker only), compact versioned chunks with CRC (corrupt → quarantined), per-house caps (160 chunks, 4 houses), decay per session, compaction, quota check; saves after the scan, at each wave break and at session end | desktop-tested | Node: **100 simulated sessions**: stored size 89.1 KB at session 20, 89.9 KB at 50, 89.4 KB at 100 (plateau); load + analysis flat (60 → 61 ms); the doorway beyond Space Setup found every session. e2e: saved in IndexedDB (4 chunks, 1.4 KB for the short fixture walk) |
+| Silent learner in play: 1 Hz; a changed result built in only in a wave break / after the round with no enemy alive (lights ease, no snap) | desktop-tested (Node) | The e2e's fixture never changes its result in play, so the live window is Node-tested only |
+| House frame and id from Space Setup (largest floor plane, yaw only; a hash of floor areas, wall lengths, doors) | desktop-tested (Node) | Whether the Quest's floor plane pose is stable across sessions is the device's (the learned map is then reused) |
+
+### Ask in the headset (keep it short)
+
+See DEVICE_LOG "v0.5: tests to run": Scan house and walk bedroom → hall → living room; is the floor glow the only thing you see; does the watch count rooms; do soldiers now come through the hall; reload: no scan, hall still open; any new permission prompt; any stutter.
 
 ## Later phases
 

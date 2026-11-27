@@ -454,20 +454,71 @@ try {
       sys.update = (dt, t, f, c) => orig(dt, clock(t), f, c);
     }
   });
+  // ---- v0.5: the walkthrough scan. The first play in a house with nothing learned starts with it: a short card,
+  // then nothing in the view but a faint floor tint, the rooms found on the watch; the depth readback (the fake
+  // GPU depth: XRWebGLBinding is patched above), the hit-test sources and the head path go to the learner worker;
+  // holding the trigger finishes it, the worker saves the house (IndexedDB) and the world is built again from it.
+  await page.evaluate(() => { window.__fakeDepth.on = true; window.__fakeDepth.mode = 'far'; });
+  const sc0 = await waitFor(() => { const a = window.__app, k = a.play; return (k.stepName === 'scan' || k.stepName === 'start') && { step: k.stepName, lines: a.card.lines.slice(), card: a.card.mesh.visible,
+    learn: a.rec.play.learn || null, capture: a.rec.play.capture || null, three: a.gfx.renderer.xr.hasDepthSensing() }; }, null, 25000);
+  ok('scan (v0.5): the first play in a house with nothing learned starts with the walkthrough scan (its card up)', sc0 && sc0.step === 'scan' && sc0.card && sc0.lines[0] === 'Scan your house'
+    && sc0.learn && sc0.learn.scanWanted && sc0.learn.open && sc0.learn.open.loaded === false && !sc0.three, JSON.stringify(sc0 && { ...sc0, lines: sc0.lines.slice(0, 2) }));
+  await sleep(1300);
+  await press('left', 'trigger', 150);
+  // walk the fixture house for a few seconds (the headset moves; the controllers come along)
+  const p0 = await page.evaluate(() => { const p = window.__iwer.position; return [p.x, p.z]; });
+  for (const [dx, dz] of [[0.4, 0], [0.8, -0.3], [1.0, -0.8], [0.6, -1.2], [0, -1.0], [-0.4, -0.4], [0, 0]]) {
+    await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [p0[0] + dx, p0[1] + dz]);
+    await sleep(900);
+  }
+  const sc1 = await page.evaluate(() => { const a = window.__app, k = a.play, L = k.learner; return { step: k.stepName, card: a.card.mesh.visible, tint: k.scanTint.mesh.visible,
+    watch: { scanning: k.watch.status.scanning, rooms: k.watch.status.rooms, info: k.watch.readTexts }, rep: L.report(), msg: k.game.panel.mesh.visible }; });
+  const sd = sc1.rep.depth || {};
+  ok('scan: nothing in the view but the floor tint; the watch counts rooms; the head path and the depth readbacks reach the learner worker',
+    sc1.step === 'scan' && !sc1.card && sc1.tint && !sc1.msg && sc1.watch.scanning && sc1.rep.state === 'open' && sc1.rep.headSamples > 5 && sc1.rep.flushes > 0
+      && sd.enabled && sd.issued > 0 && sd.packets > 0 && sc1.rep.worker === 'worker',
+    JSON.stringify({ watch: sc1.watch, head: sc1.rep.headSamples, flushes: sc1.rep.flushes, depth: { issued: sd.issued, packets: sd.packets, drops: sd.drops, issueMs: sd.issueMs, getMs: sd.getMs, why: sd.why, signal: sd.framesToSignal },
+      hit: sc1.rep.hitTest && { created: sc1.rep.hitTest.created, entityTypes: sc1.rep.hitTest.entityTypes, errors: sc1.rep.hitTest.errors }, worker: sc1.rep.core && { depth: sc1.rep.core.depth, packets: sc1.rep.core.packets } }));
+  report.scan = { headSamples: sc1.rep.headSamples, flushes: sc1.rep.flushes, depth: sd, results: sc1.rep.results };
+  await button('left', 'trigger', 1);
+  const fin = await waitFor(() => window.__app.play.scanS.finishing || window.__app.play.stepName !== 'scan', null, 12000);
+  await button('left', 'trigger', 0);
+  const sc2 = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'start' && { lines: a.card.lines.slice(0, 2), rec: a.rec.play.learn, scanResult: a.rec.play.scanResult, world: a.rec.play.world,
+    saved: k.learner.lastSave, tint: k.scanTint.mesh.visible, scanning: k.watch.status.scanning, programs: a.gfx.renderer.info.programs.length }; }, null, 25000);
+  ok('scan: holding the trigger finishes it: the final analysis, a save in the worker (IndexedDB), the world built again from Space Setup + the scan, then the card',
+    !!fin && sc2 && sc2.lines[0] === 'Get ready' && sc2.scanResult && !sc2.tint && !sc2.scanning && sc2.world && sc2.world.beforeScan && sc2.world.async && sc2.world.async.kind === 'scan',
+    JSON.stringify(sc2 && { result: sc2.scanResult, async: sc2.world && sc2.world.async && sc2.world.async.kind }));
+  const saved = await waitFor(() => { const s = window.__app.play.learner.lastSave; return s && s; }, null, 8000);
+  ok('scan: the learned house is saved by the worker (IndexedDB, compact chunks)', saved && saved.saved && saved.chunks > 0 && saved.bytes > 0, JSON.stringify(saved));
   // The "Get ready" card (world built behind it) with the controls; in Roam a trigger pull starts the round where you stand
-  const card = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'start' && { lines: a.panel.lines.slice(), visible: a.panel.mesh.visible }; }, null, 15000);
+  const card = await waitFor(() => { const a = window.__app, k = a.play; return k.stepName === 'start' && { lines: a.card.lines.slice(), visible: a.card.mesh.visible }; }, null, 15000);
   ok('play: the "Get ready" card shows the CQC controls after the build', card && card.visible && card.lines[0] === 'Get ready' && card.lines.includes('[How to play]')
     && card.lines.some((l) => /Exit: hold Y/.test(l)) && card.lines.some((l) => /A \(or X on the gun\): drop the magazine/.test(l)) && card.lines.some((l) => /B \(or Y on the gun\)/.test(l))
     && card.lines.some((l) => /watch/.test(l)) && card.lines.at(-1) === 'Pull the trigger to start', card && card.lines.join(' | '));
   const skipped = await skipCard();
   const ready = await waitFor(() => window.__app.play.stepName === 'play', null, 15000);
+  // v0.5: count every texture upload from the round start to the exit (the watch, the messages and the card draw
+  // from the glyph atlas uploaded at load: there must be none), and the depth tap's GL calls
+  await page.evaluate(() => {
+    const gl = window.__app.gfx.gl, C = window.__glCount = { tex: 0, texNames: {}, bones: 0, readPixels: 0, getBufferSubData: 0, fence: 0 };
+    for (const n of ['texImage2D', 'texSubImage2D', 'texImage3D', 'texSubImage3D', 'compressedTexImage2D', 'compressedTexSubImage2D', 'texStorage2D', 'texStorage3D', 'copyTexSubImage2D']) {
+      const o = gl[n].bind(gl);
+      gl[n] = (...a) => {
+        // three's skinning writes each visible soldier's bone matrices into a small float DataTexture every frame
+        // (16 × 16 RGBA32F, 4 KB): data, not a canvas or image; counted apart
+        if (n === 'texSubImage2D' && a.length === 9 && a[7] === gl.FLOAT && a[4] <= 32 && a[5] <= 32) { C.bones++; return o(...a); }
+        C.tex++; C.texNames[n] = (C.texNames[n] || 0) + 1; return o(...a);
+      };
+    }
+    for (const n of ['readPixels', 'getBufferSubData', 'fenceSync']) { const o = gl[n].bind(gl); gl[n] = (...a) => { C[n === 'fenceSync' ? 'fence' : n]++; return o(...a); }; }
+  });
   const g0 = await page.evaluate(() => {
     const a = window.__app, k = a.play, rec = a.rec, g = k.game;
     return { space: rec.granted.referenceSpace, req: rec.requested, systems: a.perf.systems, loop: a.loop.systems.map((s) => s.name), play: rec.play, warmXR: rec.warmXR,
       snap: rec.spaceSnapshot && { planes: rec.spaceSnapshot.planes.length, meshes: rec.spaceSnapshot.meshes.length }, world: k.world.describe(), virtual: k.world.virtual,
       phase: g.phaseName, roam: g.roam, worldRoam: k.world.roamOn, rooms: k.world.stats.rooms, spotting: g.spotting, ring: g.ring.visible, msg: g.panel.mesh.visible ? g.panel.lines : null,
       programs: a.gfx.renderer.info.programs.length, zone: { ...k.player.zone }, head: { x: k.player.head.x, z: k.player.head.z }, view: rec.view,
-      xrNear: a.gfx.renderer.xr.getCamera().near, appPanel: a.panel.mesh.visible, watchOn: k.watch.enabled, sink: g.warnSink === k.watch,
+      xrNear: a.gfx.renderer.xr.getCamera().near, hasDepth: a.gfx.renderer.xr.hasDepthSensing(), appPanel: a.card.mesh.visible, watchOn: k.watch.enabled, sink: g.warnSink === k.watch,
       phys: k.weapons.phys ? k.weapons.physicsReport().build : null, physOn: k.weapons.physOn, physicsLoad: rec.physicsLoad,
       gm: rec.spaceSnapshot && rec.spaceSnapshot.globalMesh ? { encoding: rec.spaceSnapshot.globalMesh.encoding, data: typeof rec.spaceSnapshot.globalMesh.data === 'string' ? rec.spaceSnapshot.globalMesh.data.length : 0,
         tris: rec.spaceSnapshot.globalMesh.triangleCount } : null };
@@ -496,7 +547,7 @@ try {
   ok('play (Roam): the card\'s trigger pull starts the round where you stand: no spot step, no ring, no zone, no text in the view', skipped && !!ready && ['ready', 'wave'].includes(g0.phase)
     && !g0.spotting && !g0.ring && g0.msg === null && !g0.appPanel && g0.zone.r === 0 && g0.play.spot && g0.play.spot.mode === 'roam' && g0.play.spot.rebuilt === false && g0.watchOn && g0.sink,
     `${g0.phase}; msg ${JSON.stringify(g0.msg)}; ${JSON.stringify(g0.play.spot)}; card up ${g0.play.cardMs} ms`);
-  ok('play: near plane 0.02 m without depth sensing', g0.view && g0.view.near === 0.02 && !g0.view.depthSensing && Math.abs(g0.xrNear - 0.02) < 1e-9, JSON.stringify(g0.view));
+  ok('play: near plane 0.02 m: the depth (asked for the house learner) is never handed to three (v0.5)', g0.view && g0.view.near === 0.02 && !g0.view.depthToThree && Math.abs(g0.xrNear - 0.02) < 1e-9 && !g0.hasDepth, JSON.stringify(g0.view));
   const fr = await waitFor(() => { const F = window.__app.rec.probes.frameRate; return F && F.request !== 'pending' && { ...F }; }, null, 5000);
   ok('play: 72 Hz requested (updateTargetFrameRate), logged with the measured rate', fr && fr.target === 72 && fr.request === 'ok' && fr.offered.includes(72),
     fr && `${fr.request}; offered ${fr.offered.join('/')}; attr after ${fr.attrAfter}; measured ${fr.measuredHz}`);
@@ -929,6 +980,11 @@ try {
   ok('play: renderer.info.programs flat through the whole round', st2.checked && st2.ok && st2.programs === before.programs && st2.tex === before.textures && st2.geo === before.geometries && !st2.growth,
     `${st2.programs} programs, ${st2.tex} textures, ${st2.geo} geometries (before play ${before.programs}/${before.textures}/${before.geometries})`);
 
+  const glc = await page.evaluate(() => ({ ...window.__glCount, learn: window.__app.play.learner.report() }));
+  ok('play (v0.5): zero texture uploads from the round start to here (watch, menu, messages, card: the glyph atlas; only three\'s per-soldier bone data); the depth tap read back asynchronously meanwhile',
+    glc.tex === 0 && glc.readPixels > 0 && glc.fence > 0 && glc.getBufferSubData > 0 && glc.learn.depth && glc.learn.depth.packets > 0,
+    `${glc.tex} texture uploads ${JSON.stringify(glc.texNames)} (+ ${glc.bones} bone-matrix updates); readPixels ${glc.readPixels}, fences ${glc.fence}, getBufferSubData ${glc.getBufferSubData}; tap ${JSON.stringify(glc.learn.depth && { packets: glc.learn.depth.packets, drops: glc.learn.depth.drops, issueMs: glc.learn.depth.issueMs, getMs: glc.learn.depth.getMs })}`);
+  report.glDuringPlay = { tex: glc.tex, readPixels: glc.readPixels, fences: glc.fence };
   // CPU time per frame (PerfMonitor: the frame callback, per system) and the wrist HUD
   const perf = await page.evaluate(() => { const a = window.__app; return { recent: a.perf.recent(120), sys: a.perf.systemAverages(120), shown: a.play.watch.shown, hudDraws: a.play.watch.draws, menuDraws: a.play.watch.menuDraws, loopErrors: a.loop.errors, errors: a.rec.errors.slice(0, 5) }; });
   ok('play: no errors in the frame loop', perf.loopErrors === 0 && perf.errors.length === 0, perf.errors.join(' | '));
@@ -1057,7 +1113,7 @@ try {
   const spCard = await skipCard();
   const spSpot = await waitFor(() => {
     const a = window.__app, k = a.play, g = k.game;
-    return k.stepName === 'spot' && g.panel.mesh.visible && { status: g.spotStatus, spotting: g.spotting, appPanel: a.panel.mesh.visible, lines: k.panelLines(), ring: g.ring.visible,
+    return k.stepName === 'spot' && g.panel.mesh.visible && { status: g.spotStatus, spotting: g.spotting, appPanel: a.card.mesh.visible, lines: k.panelLines(), ring: g.ring.visible,
       msg: g.panel.lines.slice(), skipped: a.rec.play.cardSkipped, worldRoam: k.world.roamOn };
   }, null, 10000);
   ok('spot: a trigger pull moves on to the safe spot: App panel hidden, ring and spot message shown (world built in spot mode)', spCard && spSpot && spSpot.spotting && !spSpot.appPanel
@@ -1079,7 +1135,7 @@ try {
   if (tgt) {
     await page.evaluate(() => {
       const a = window.__app, k = a.play, orig = k.rebuildForSpot.bind(k);
-      k.rebuildForSpot = (t) => { window.__rb = { panel: a.panel.mesh.visible, first: a.panel.lines[0] }; orig(t); };
+      k.rebuildForSpot = (t) => { window.__rb = { panel: a.card.mesh.visible, first: a.card.lines[0] }; orig(t); };
     });
     await page.evaluate(([x, z]) => window.__iwer.position.set(x, 1.6, z), [tgt.x, tgt.z]);
     await sleep(1000);
@@ -1090,7 +1146,7 @@ try {
   const rb = await page.evaluate(() => {
     const a = window.__app, k = a.play, r = a.gfx.renderer, W = a.rec.play.world, g = k.game;
     return { rebuild: W.rebuild || null, spot: a.rec.play.spot, zone: { ...k.world.zone }, gameZone: { ...g.zone }, hook: window.__rb || null, phase: g.phaseName, msg: g.panel.mesh.visible ? g.panel.lines.slice() : null,
-      programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries, errors: a.rec.errors.slice(0, 3), appPanel: a.panel.mesh.visible };
+      programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries, errors: a.rec.errors.slice(0, 3), appPanel: a.card.mesh.visible };
   });
   ok('spot: the trigger in a good spot starts the round there ("Get ready", zone at the spot)', !!spPlay && rb.phase === 'ready' && rb.msg && rb.msg[0] === 'Get ready' && !rb.appPanel
     && rb.spot && rb.spot.mode === 'spot' && rb.gameZone.r > 0, `${rb.phase}; ${rb.msg && rb.msg.join(' / ')}; spot ${spSeen.join('→')}; ${JSON.stringify(rb.spot)}`);

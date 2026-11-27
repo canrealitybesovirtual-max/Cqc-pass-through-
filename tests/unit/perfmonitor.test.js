@@ -173,3 +173,70 @@ test('systemAverages: per-system mean and max, and draw calls, over the last fra
   assert.equal(s.drawCallsMax, 10);
   assert.deepEqual(new PerfMonitor({ systems: ['x'] }).systemAverages(10), { x: 0, xMax: 0, drawCalls: 0, drawCallsMax: 0 });
 });
+
+test('v0.5 hitch entries: previous frame (CPU, interval, split), callback lateness, next interval, marker age', () => {
+  const { pm, clock } = make();
+  drive(pm, clock, [13.9, 13.9], 3, [0.7, 2.1]);
+  pm.mark('build');
+  // a frame whose callback started 4 ms after its XR time, then a long interval, then a short one
+  let t = clock.t + 200; // 200 ms later: the marker is still within its 0.5 s
+  clock.now = t + 4;
+  pm.beginFrame(t);
+  pm.begin(0); clock.now += 0.5; pm.end(0);
+  pm.begin(1); clock.now += 1.5; pm.end(1);
+  pm.endFrame(10);
+  clock.t = t;
+  drive(pm, clock, [9]);
+  const e = pm.exportHitches().entries[0];
+  assert.equal(e.interval, 200);
+  assert.equal(e.late, 4);
+  assert.equal(e.prevCpu, 3);
+  assert.equal(e.prevInterval, 13.9);
+  assert.deepEqual(e.prev, { a: 0.7, render: 2.1 });
+  assert.equal(e.next, 9);
+  assert.equal(e.marker, 'build');
+  assert.ok(e.markerAgeMs >= 195 && e.markerAgeMs <= 205, String(e.markerAgeMs));
+  // a marker older than 0.5 s names nothing
+  drive(pm, clock, new Array(40).fill(13.9));
+  drive(pm, clock, [40]);
+  const e2 = pm.exportHitches().entries[1];
+  assert.equal(e2.marker, '-');
+  assert.equal(e2.markerAgeMs, null);
+});
+
+test('v0.5: the interval skipped after a resume is logged as a gap; the whole-session histogram and per-system peaks', () => {
+  const { pm, clock } = make();
+  drive(pm, clock, [13.9, 13.9, 13.9]);
+  pm.mark('resume');
+  pm.resetTiming();
+  drive(pm, clock, [13.9]); // lastT reset: no interval
+  pm.resetTiming();
+  pm.lastT = clock.t; // a resume where the timestamps continue: the skipped interval is known
+  drive(pm, clock, [850]);
+  const h = pm.exportHitches();
+  assert.equal(h.total, 0, 'a gap is not a hitch');
+  assert.ok(h.gaps.total >= 1 && h.gaps.entries.some((g) => g.ms === 850 && g.marker === 'resume'), JSON.stringify(h.gaps));
+  drive(pm, clock, [13.9, 13.9, 30], 2, [0.5, 1.5]);
+  const r = pm.sessionReport();
+  assert.equal(r.frames, 2 + 3);
+  assert.equal(r.missed, 1);
+  assert.deepEqual(r.systems.a, { avg: 0.5, peak: 0.5 });
+  assert.ok(r.interval.hist.some(([ms, n]) => ms === 30.5 && n === 1), JSON.stringify(r.interval.hist));
+  assert.ok(r.interval.p50 === 14, String(r.interval.p50));
+});
+
+test('v0.5: the session counters and the hitch details allocate nothing per frame', () => {
+  const { pm, clock } = make();
+  const frames = new Array(20000).fill(13.9);
+  for (let i = 0; i < frames.length; i += 50) frames[i] = 40; // a hitch every 50 frames (the log fills, then counts)
+  drive(pm, clock, frames.slice(0, 2000));
+  let grew = Infinity;
+  for (let k = 0; k < 3 && grew >= 2_000_000; k++) {
+    globalThis.gc?.();
+    const before = process.memoryUsage().heapUsed;
+    pm.mark('x');
+    drive(pm, clock, frames);
+    grew = Math.min(grew, process.memoryUsage().heapUsed - before);
+  }
+  assert.ok(grew < 2_000_000, `heap grew ${grew} bytes`);
+});

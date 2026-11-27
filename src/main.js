@@ -61,6 +61,7 @@ async function boot() {
   const gfx = createRenderer({ dev });
   if (!gfx) { page.unsupported('WebGL2 is not available on this browser.'); return; }
   const app = new App({ gfx, diag, page, dev, upload });
+  app.autoScan = params.get('scan') !== '0';
   // Loaded assets, decoded audio and the warm-up baseline: `preloaded` (src/core/Preload.js) for App,
   // `window.__app.preload` for chrome://inspect and the e2e.
   /** @type {any} */ (app).preload = preloaded;
@@ -88,13 +89,14 @@ async function boot() {
       const atlas = await loadDecalAtlas();
       // ?gripPitch=<deg>&gripY=<m>&gripZ=<m>: the grip fit escape hatch (both guns, over the saved fit, never saved; rec.play.grip);
       // ?gloves=0: no gloved hands; ?watchBack/Out/Tilt/Scale, ?bracelet=0: the watch on the wrist; ?worker=0: the world
-      // builds on this thread (A/B only)
+      // builds on this thread (A/B only); ?scan=0: never start with the walkthrough scan on its own
       const kit = new PlayKit({ gfx, assets, audio, input: app.input, fixture, grip: gripFitFromParams(params),
         gloves: params.get('gloves') !== '0', watchFit: watchFitFromParams(params), bracelet: params.get('bracelet') !== '0',
-        difficultyFromUrl: params.has('difficulty'), storage, atlas, worldWorker: params.get('worker') !== '0' });
+        difficultyFromUrl: params.has('difficulty'), storage, atlas, worldWorker: params.get('worker') !== '0',
+        learn: params.get('learn') !== '0' }); // v0.5: ?learn=0 = Space Setup only (no scan, no learner)
       app.play = kit;
       kit.setWarm(true); // every pool shown (and culling off) for the warm-up draw
-      return kit.warmObjects();
+      return [...kit.warmObjects(), app.card.mesh]; // v0.5: the play card's glyph board too (its buffers exist before Enter)
     },
     // v0.4: Rapier import + init, the item kinds and the contact warm-up, before the GPU warm-up (?physics=off: the v0.3 rules)
     physics: () => (app.play ? app.play.initPhysics({ off: params.get('physics') === 'off' }) : null),

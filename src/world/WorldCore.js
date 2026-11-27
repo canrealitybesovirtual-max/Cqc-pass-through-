@@ -358,8 +358,12 @@ export class WorldCore {
         const ix = i % w, iz = (i - ix) / w;
         if ((ix > 0 && open(i - 1)) || (ix < w - 1 && open(i + 1)) || (iz > 0 && open(i - w)) || (iz < h - 1 && open(i + w))) edge[r] = 1;
       }
+      // v0.5: a room the walkthrough scan walked through (3 or more walked points in it) is scanned space
+      const walkedIn = new Int32Array(rooms + 1);
+      const W = /** @type {any} */ (L).scanWalked;
+      if (Array.isArray(W)) for (const q of W) { const i = nav.index(q[0], q[1]); if (i >= 0 && room[i]) walkedIn[room[i]]++; }
       const hid = new Uint8Array(rooms + 1);
-      for (let r = 1; r <= rooms; r++) if (vote[r] < 0 && edge[r]) { hid[r] = 1; this.hiddenRooms++; }
+      for (let r = 1; r <= rooms; r++) if (vote[r] < 0 && edge[r] && walkedIn[r] < 3) { hid[r] = 1; this.hiddenRooms++; }
       if (this.hiddenRooms) for (let i = 0; i < n; i++) if (hid[room[i]]) fl[i] |= NAV_HIDDEN;
     }
     // where a probe point stands: 2 scanned floor, 1 hidden floor, 0 no floor

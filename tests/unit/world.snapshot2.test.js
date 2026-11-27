@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { captureSnapshot, globalRawMesh, hydrateSnapshot, loadFixture, normalizeSnapshot, rawOf, snapshotForCopy } from '../../src/world/Snapshot.js';
+import { CaptureJob, CAPTURE_VERTS_PER_FRAME, captureSnapshot, globalRawMesh, hydrateSnapshot, loadFixture, normalizeSnapshot, rawOf, snapshotForCopy } from '../../src/world/Snapshot.js';
 import { transformSnapshot } from '../../src/world/Realign.js';
 import { scanFromSnapshot } from '../../src/world/ScanSynth.js';
 import { WorldCore } from '../../src/world/WorldCore.js';
@@ -184,4 +184,24 @@ test('with the mesh: a shot under the real table passes between its legs; labels
   assert.equal(w.surfaceBelow(0.5, 1.4, 0.4, 0.5, out), false, 'nothing within 0.5 m');
   // the walls stay boxes: a ray into a wall hits the slab, not the (cropped) scan
   assert.ok(w.raycast(0.5, 1.4, -1, 0, 0, -1, 5, h) && h.surface === 'wall');
+});
+
+test('v0.5: the capture spread over frames gives the same snapshot as the one-frame capture; the big mesh takes several frames', () => {
+  const { frame, refSpace, xrGlobal } = frameWithMesh();
+  const one = captureSnapshot(frame, refSpace, {});
+  const job = new CaptureJob();
+  const stats = { planes: 0, meshes: 0, skippedPlanes: 0, skippedMeshes: 0, meshTris: 0, meshBytes: 0 };
+  job.begin(frame, refSpace, { stats });
+  assert.equal(job.done, false);
+  assert.equal(job.snap.planes.length, one.planes.length, 'the planes in the first frame');
+  let frames = 0;
+  while (!job.step(frame, refSpace, 4096) && frames < 1000) frames++;
+  const verts = xrGlobal.vertices.length / 3;
+  assert.ok(frames + 1 >= Math.floor(verts / 4096), `${frames + 1} frames for ${verts} vertices at 4096 a frame`);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.snap)), JSON.parse(JSON.stringify(one)));
+  assert.equal(rawOf(job.snap).meshes.length, rawOf(one).meshes.length);
+  assert.equal(stats.meshes, one.meshes.length);
+  const rep = job.report();
+  assert.ok(rep.frames === frames + 2 && rep.ms >= 0 && rep.maxMs <= rep.ms + 1e-9, JSON.stringify(rep));
+  assert.ok(CAPTURE_VERTS_PER_FRAME >= 4096);
 });

@@ -158,6 +158,10 @@ export function transformSnapshot(snap, m, space) {
     out.globalMesh = { label: g.label, mesh: g.mesh, vertexCount: g.vertexCount, triangleCount: g.triangleCount, lastChangedTime: g.lastChangedTime,
       ...(g.hash ? { movedFrom: g.hash } : {}) };
   } else if (snap.version >= 2) out.globalMesh = null;
+  // v0.5: the learned overlay's bookkeeping moves with the house
+  const S = /** @type {any} */ (snap);
+  if (S.scanBase) out.scanBase = { planes: S.scanBase.planes, meshes: S.scanBase.meshes };
+  if (Array.isArray(S.scanWalked)) out.scanWalked = S.scanWalked.map((/** @type {number[]} */ q) => [Math.round((m[0] * q[0] + m[8] * q[1] + m[12]) * 1e4) / 1e4, Math.round((m[2] * q[0] + m[10] * q[1] + m[14]) * 1e4) / 1e4]);
   const raw = /** @type {any} */ (snap).raw;
   if (raw && Array.isArray(raw.meshes)) {
     const moved = {

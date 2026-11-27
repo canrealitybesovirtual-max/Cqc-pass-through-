@@ -455,7 +455,8 @@ export function rowRect(i, out) {
   const M = MENU_PX;
   const y0 = M.rowY0 + i * M.rowPitch, y1 = y0 + M.rowH;
   const dy = Math.max(Math.abs(y0 - M.c), Math.abs(y1 - M.c));
-  const half = Math.sqrt(Math.max(0, M.inner * M.inner - dy * dy)) - M.pad;
+  // whole pixels (v0.5: the glyph-board layout passes integers only)
+  const half = Math.round(Math.sqrt(Math.max(0, M.inner * M.inner - dy * dy)) - M.pad);
   out.x0 = M.c - half; out.x1 = M.c + half; out.y0 = y0; out.y1 = y1;
   return out;
 }

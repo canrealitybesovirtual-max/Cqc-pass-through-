@@ -32,6 +32,10 @@ test('depth and body tracking are opt-in for play/spot/setup only', () => {
   assert.ok(featuresFor('spot', { depth: true }).includes('depth-sensing'));
   assert.ok(!featuresFor('play').includes('depth-sensing'));
   assert.ok(featuresFor('play', { depth: true }).includes('depth-sensing'));
+  // v0.5: the house learner asks for depth in the game modes (App's cfg.learn), never twice
+  assert.ok(featuresFor('play', { learn: true }).includes('depth-sensing') && featuresFor('spot', { learn: true }).includes('depth-sensing'));
+  assert.equal(featuresFor('play', { learn: true, depth: true }).filter((x) => x === 'depth-sensing').length, 1);
+  assert.ok(!featuresFor('vr', { learn: true }).includes('depth-sensing'));
   assert.ok(featuresFor('setup', { bodyTracking: true }).includes('body-tracking'));
   assert.ok(!featuresFor('bounds', { depth: true }).includes('depth-sensing'));
   assert.equal(featuresFor('probe', { depth: true }).filter((x) => x === 'depth-sensing').length, 1);

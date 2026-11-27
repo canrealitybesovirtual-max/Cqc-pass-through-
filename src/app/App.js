@@ -8,12 +8,14 @@ import { Input } from '../xr/Input.js';
 import { Lifecycle } from '../xr/Lifecycle.js';
 import { LiveDepth } from '../xr/LiveDepth.js';
 import { PerfMonitor } from '../debug/PerfMonitor.js';
+import { HeapWatch, loafEntry } from '../debug/HeapWatch.js';
 import { collectSession, newRecord } from '../debug/CapabilityLog.js';
 import { Probes } from '../debug/Probes.js';
 import { DebugDraw } from '../debug/DebugDraw.js';
 import { DepthView } from '../debug/DepthView.js';
 import { TestCube } from '../debug/TestCube.js';
 import { CanvasPanel } from '../ui/CanvasPanel.js';
+import { GlyphPanel } from '../ui/GlyphPanel.js';
 import { assertStable } from '../core/Warmup.js';
 import { CAMERA_NEAR, PLAY_NEAR } from '../core/Renderer.js';
 
@@ -59,15 +61,24 @@ export class App {
     this.cube = new TestCube(gfx.scene);
     this.depthView = new DepthView(gfx.scene);
     this.liveDepth = new LiveDepth();
+    /** The probe sessions' text panel (a canvas: its lines carry live numbers). */
     this.panel = new CanvasPanel();
     this.panel.mesh.visible = false;
     gfx.scene.add(this.panel.mesh);
+    /** v0.5: play's opaque "Get ready" card, laid out from the glyph atlas (no texture upload after a build). */
+    this.card = new GlyphPanel({ name: 'play-card' });
+    this.card.mesh.visible = false;
+    gfx.scene.add(this.card.mesh);
     /** @type {import('./Play.js').PlayKit|null} built at load by main.js (null until then, or when the preload failed) */
     this.play = null;
     /** @type {any} the preload record (src/core/Preload.js) */
     this.preload = null;
     /** @type {import('../xr/XRSession.js').XRConfig} */
-    this.cfg = { depth: false, bodyTracking: false, space: 'auto', scale: 1.0, foveation: 0.5 };
+    this.cfg = { depth: false, bodyTracking: false, space: 'auto', scale: 1.0, foveation: 0.5, learn: true };
+    /** v0.5: the next play session starts with the walkthrough scan (the page's Scan house button). */
+    this.scanNext = false;
+    /** v0.5: the first play in a house with nothing learned starts with the scan (`?scan=0`: never on its own). */
+    this.autoScan = true;
     /** @type {XRSession|null} */ this.session = null;
     /** @type {string} */ this.mode = '';
     /** @type {any} */ this.rec = null;
@@ -78,6 +89,10 @@ export class App {
     this.panelAt = -1e9;
     this.stableAt = -1e9;
     this.warmGrowth = 0;
+    /** v0.5: the JS heap once a second outside the frame loop (GC drops with their times, `rec.heap`). */
+    this.heap = new HeapWatch({ onDrop: () => this.perf?.mark('gc') });
+    /** @type {any} */ this._heapTimer = null;
+    this.sessionT0 = 0;
     this.lifecycle = new Lifecycle({
       onEnd: () => this.ended(),
       onVisibility: (st) => this.visibility(st),
@@ -138,13 +153,17 @@ export class App {
     // session with no lifecycle, no record and the menu stuck in 'entering'.
     try {
       collectSession(rec, session, r, this.gfx.gl, att);
-      // Play without depth sensing: near plane 0.02 m (the AKM's stock clipped the face at 0.05). three
-      // passes camera.near to the session's depthNear; with depth on it uses the depth data's own values.
+      // Play: near plane 0.02 m (the AKM's stock clipped the face at 0.05). three passes camera.near to the
+      // session's depthNear; with the depth handed to it, it would use the depth data's own values. v0.5: play
+      // asks for depth-sensing for the house learner, which reads it itself (DepthTap): three never sees it
+      // unless dynamic occlusion is on (cfg.depth), so the near plane, the clear and the frame stay as without.
       const depthOn = att.enabled.includes('depth-sensing');
-      const near = kit && !depthOn ? PLAY_NEAR : CAMERA_NEAR;
+      const share = !kit || !!this.cfg.depth;
+      this.liveDepth.shareWithThree = share;
+      const near = kit && !(depthOn && share) ? PLAY_NEAR : CAMERA_NEAR;
       this.gfx.camera.near = near;
       this.gfx.camera.updateProjectionMatrix();
-      /** @type {any} */ (rec).view = { near, depthSensing: depthOn };
+      /** @type {any} */ (rec).view = { near, depthSensing: depthOn, depthToThree: depthOn && share };
       const space = r.xr.getReferenceSpace();
       this.lifecycle.attach(session, space);
       perf.setRates(frameRates(session));
@@ -162,6 +181,8 @@ export class App {
       this.panelAt = -1e9;
       this.stableAt = -1e9;
       this.warmGrowth = 0;
+      this.sessionT0 = performance.now();
+      this.startHeapWatch();
       loop.add({ name: 'input', update: (dt, t, f) => this.input.update(session, f, space, dt) });
       if (kit) this.startPlay(kit, session, space, rec, perf, loop, cam, { roam: playStyle(mode) === 'roam', spaceName: att.space, spaceNote: note });
       else this.startProbe(session, space, mode, rec, perf, loop, cam);
@@ -199,7 +220,7 @@ export class App {
         }
         this.panel.follow(cam, dt);
         this.panel.flush();
-        this.devCheck(t);
+        this.stableCheck(t);
       },
     });
   }
@@ -213,8 +234,10 @@ export class App {
   startPlay(kit, session, space, rec, perf, loop, cam, how) {
     this.cube.reset(false);
     this.draw.hideAll();
-    this.panel.yawOffset = 0;
-    this.panel.autoHide = false;
+    this.panel.mesh.visible = false; // the probe panel: not in play (the card is the glyph panel)
+    this.card.restart();
+    this.card.yawOffset = 0;
+    this.card.autoHide = false;
     const s = /** @type {any} */ (session);
     const rates = frameRates(session);
     /** @type {any} */
@@ -234,22 +257,24 @@ export class App {
       } catch (e) { F.request = `threw: ${errText(e)}`; }
     } else F.request = rates.length ? `${PLAY_HZ} Hz not offered (${rates.join('/')})` : 'no frame-rate API';
     this.watchAudio(kit, session, rec);
-    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [], ...how });
+    const scan = this.scanNext ? 'explicit' : this.autoScan ? 'auto' : 'off';
+    this.scanNext = false;
+    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [], ...how, scan, liveDepth: this.liveDepth });
     for (const s of kit.systems()) loop.add(s);
     loop.add({
       name: 'ui',
       update: (dt, t, f, c) => {
         kit.uiUpdate(dt, t, f, c); // the watch
-        // App's opaque "Get ready" panel until the round starts, then GameSession's messages
-        const lines = kit.panelLines();
+        // App's opaque "Get ready" card until the round starts, then GameSession's messages
+        const lines = kit.panelLines(), card = this.card;
         if (lines) {
           // shown again (the rebuild after the spot step): placed afresh in front of the eyes
-          if (!this.panel.mesh.visible) { this.panel.mesh.visible = true; this.panel.placed = false; }
-          if (lines !== this.panel.lines) this.panel.setLines(/** @type {string[]} */ (lines));
-          this.panel.follow(cam, dt);
-          this.panel.flush();
-        } else if (this.panel.mesh.visible) this.panel.mesh.visible = false;
-        if (kit.playing) this.devCheck(t); // against the baseline of this session's XR warm draw
+          if (!card.mesh.visible) { card.mesh.visible = true; card.placed = false; }
+          if (lines !== card.lines) card.setLines(/** @type {string[]} */ (lines));
+          card.follow(cam, dt);
+          card.flush();
+        } else if (card.mesh.visible) card.mesh.visible = false;
+        if (kit.playing) this.stableCheck(t); // against the baseline of this session's XR warm draw
       },
     });
   }
@@ -277,17 +302,36 @@ export class App {
   }
 
   /**
-   * Dev builds: once a second, have programs, textures or geometries grown since the warm-up baseline?
+   * Every build (v0.5; dev only before): once a second, have programs, textures or geometries grown since the
+   * warm-up baseline? Allocation-free while flat (assertStable reuses its result); a growth is an event: a
+   * hitch-log marker and an entry in `rec.growth` (at most 20), and `rec.warmGrowth` keeps the latest counts.
    * @param {number} t
    */
-  devCheck(t) {
-    if (!this.dev || t - this.stableAt < 1000) return;
+  stableCheck(t) {
+    if (t - this.stableAt < 1000) return;
     this.stableAt = t;
-    const st = assertStable(this.gfx.renderer);
-    if (!st.ok && this.rec) {
-      this.warmGrowth++;
-      this.rec.warmGrowth = { programs: st.programs, textures: st.textures, geometries: st.geometries, checks: this.warmGrowth };
-    }
+    const st = assertStable(this.gfx.renderer, this.dev ? undefined : () => {});
+    if (st.ok || !this.rec) return;
+    const w = this.rec.warmGrowth;
+    if (w && w.programs === st.programs && w.textures === st.textures && w.geometries === st.geometries) { w.checks++; return; }
+    this.warmGrowth++;
+    this.rec.warmGrowth = { programs: st.programs, textures: st.textures, geometries: st.geometries, checks: this.warmGrowth };
+    this.perf?.mark(`grew p${st.programs} t${st.textures} g${st.geometries}`);
+    const g = this.rec.growth || (this.rec.growth = []);
+    if (g.length < 20) g.push({ t: Math.round(performance.now() - this.sessionT0), programs: st.programs, textures: st.textures, geometries: st.geometries,
+      step: this.play && this.play.rec === this.rec ? this.play.stepName : this.mode });
+  }
+
+  /** The heap sample timer (1 s, outside the frame loop) for this session. */
+  startHeapWatch() {
+    this.stopHeapWatch();
+    this.heap.reset();
+    this.heap.sample();
+    this._heapTimer = setInterval(() => this.heap.sample(), 1000);
+  }
+
+  stopHeapWatch() {
+    if (this._heapTimer !== null) { clearInterval(this._heapTimer); this._heapTimer = null; }
   }
 
   /**
@@ -295,6 +339,7 @@ export class App {
    * @param {XRSession} session @param {any} rec @param {string} why @param {unknown} e
    */
   abort(session, rec, why, e) {
+    this.stopHeapWatch();
     this.loop?.stop();
     this.lifecycle.detach();
     this.liveDepth.detach();
@@ -308,6 +353,7 @@ export class App {
     this.loop = null;
     this.probes = null;
     this.panel.mesh.visible = false;
+    this.card.mesh.visible = false;
     console.error(why, e);
     session.end().catch(() => { /* already ended */ });
     this.game.send('failed');
@@ -331,6 +377,7 @@ export class App {
 
   ended() {
     const rec = this.rec;
+    this.stopHeapWatch();
     this.loop?.stop();
     this.lifecycle.detach();
     this.probes?.stop();
@@ -341,9 +388,13 @@ export class App {
       rec.hitches = this.perf.exportHitches();
       rec.frames = this.loop.frames;
       rec.loopErrors = this.loop.errors;
-      rec.panelUploads = this.panel.uploads;
+      rec.panelUploads = this.panel.uploads + this.card.uploads; // v0.5: the play card uploads nothing (glyph atlas)
+      rec.cardLayouts = this.card.layouts;
       rec.recent = this.perf.recent(72);
       rec.systemsMs = this.perf.systemAverages(this.perf.count);
+      rec.perf = this.perf.sessionReport(); // v0.5: whole-session interval / CPU histograms, per-system averages and peaks, lateness
+      this.heap.sample();
+      rec.heap = this.heap.report();
       rec.probes.liveDepth = this.liveDepth.summary();
       if (rec.probes.frameRate && 'hzAtEnd' in rec.probes.frameRate) rec.probes.frameRate.hzAtEnd = this.perf.measured ? this.perf.hz : null;
       if (rec.audio && 'atStart' in rec.audio) rec.audio.atEnd = this.play && this.play.audio ? /** @type {any} */ (this.play.audio).state : null;
@@ -354,6 +405,7 @@ export class App {
     this.liveDepth.detach();
     this.draw.hideAll();
     this.panel.mesh.visible = false;
+    this.card.mesh.visible = false;
     this.cube.mesh.visible = false;
     this.cube.grid.visible = false;
     this.depthView.toggle(false, this.gfx.camera);
@@ -404,6 +456,7 @@ export class App {
       // the world moved under us: place the cube and the panel again from the new pose
       this.cube.placed = false;
       this.panel.placed = false;
+      this.card.placed = false;
     }
     if (this.play && this.play.rec === this.rec) this.play.onReferenceReset(e);
   }
@@ -428,6 +481,11 @@ export class App {
           const o = rec.probes[k] || (rec.probes[k] = { count: 0, maxMs: 0 });
           o.count++;
           if (e.duration > o.maxMs) o.maxMs = Math.round(e.duration);
+          // v0.5: which scripts made a long animation frame (≥ 50 ms), at most 30 per session
+          if (type === 'long-animation-frame' && e.duration >= 50) {
+            const L = o.entries || (o.entries = []);
+            if (L.length < 30) L.push(loafEntry(e, this.sessionT0));
+          }
         }
       }).observe({ type, buffered: false });
     }

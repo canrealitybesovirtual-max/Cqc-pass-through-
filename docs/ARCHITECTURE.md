@@ -11,10 +11,10 @@ Quest 3 mixed-reality tactical FPS. three.js r187 (`WebGLRenderer`, WebGL2) and 
   - Nothing compiles, uploads or decodes mid-play.
   - Storage is written only at session end or pause.
   - Work over 2 ms goes to a worker.
-- **Pure logic stays testable.** Modules in `app/Game.js`, `xr/XRSession.js`, `xr/LiveDepth.js`, `debug/PerfMonitor.js`, `debug/Upload.js`, `util/`, `physics/` and the pure parts of `world/`, `weapons/`, `player/`, `enemies/`, `game/`, `fx/` import neither three.js nor the DOM, so `node --test` covers them.
+- **Pure logic stays testable.** Modules in `app/Game.js`, `xr/XRSession.js`, `xr/LiveDepth.js`, `debug/PerfMonitor.js`, `debug/HeapWatch.js`, `debug/Upload.js`, `util/`, `learn/` (v0.5), `physics/` and the pure parts of `world/`, `weapons/`, `player/`, `enemies/`, `game/`, `fx/` import neither three.js nor the DOM, so `node --test` covers them.
 - **The one measured exception (v0.4):** Rapier's wasm glue allocates about 0.15 KB a step and 0.03 KB per awake-body read while an item moves; with every item asleep the step returns before any Rapier call (DECISIONS).
 
-## Runtime (v0.4)
+## Runtime (v0.5)
 
 ```
 index.html ── import map: three → vendor/three/three.module.js, three/addons/ → vendor/three/addons/
@@ -36,7 +36,9 @@ index.html ── import map: three → vendor/three/three.module.js, three/addo
         ├ xr/XRSession.js  modes (play = Roam, spot, setup, probe, bounds, reduced, vr), feature lists, attach, spaceNote
         ├ xr/Input.js      controller buttons, grip + ray poses → per-hand state + press edges (allocation-free)
         ├ xr/Lifecycle.js  end, visibilitychange, reference-space reset, input changes
-        ├ xr/LiveDepth.js  keeps three's depth texture on this frame's texture; depth diagnostics
+        ├ xr/LiveDepth.js  keeps three's depth texture on this frame's texture; depth diagnostics; v0.5: hides the depth
+        │                  from three in play (`shareWithThree`) so the learner can read it without changing the frame
+        ├ xr/DepthTap.js   v0.5: async GPU depth readback for the learner (downsample → PBO → fence → getBufferSubData)
         ├ xr/DepthOcclusion.js  soft-edge live-depth occlusion (opt-in, not wired)
         ├ world/           Space Setup snapshot v2 (+ the global mesh, MeshCodec), layout, shapes, nav grid, A*, spawns,
         │                  occluders (boxes + the mesh occluder + v0.4.1 door curtains), unscanned space (NAV_HIDDEN),
@@ -51,8 +53,12 @@ index.html ── import map: three → vendor/three/three.module.js, three/addo
         │                  holster shell, gloves, mechanism, recoil, body estimate (seated)
         ├ enemies/         EnemyManager (pool, brain, procedural animation, hit capsules, muzzle flash)
         ├ audio/           AudioEngine (voice pool, HRTF, reverb, occlusion)
-        ├ ui/              CanvasPanel, Watch (+ watchLogic / watchArt / watchGeometry), HomePage (WristHud: legacy)
-        └ debug/           CapabilityLog, Probes, PerfMonitor, Diagnostics, Upload (Supabase), DebugDraw, TestCube, DepthView
+        ├ learn/           v0.5: the house learner: Learner (main thread: rates, gates, batches), HitRays, LearnClient →
+        │                  learn.worker.js (learnJob → LearnCore: HouseGrid, fuse, analyze, depthMath, HouseStore + IndexedDB),
+        │                  houseFrame (frame + id), overlay (the learned house as snapshot planes)
+        ├ ui/              CanvasPanel (probe) + TagAlong, Glyphs (atlas + boards, v0.5) / uiAtlas / GlyphPanel (play card and
+        │                  messages), Watch (+ watchLogic / watchArt / watchGeometry), ScanTint, HomePage (WristHud: legacy)
+        └ debug/           CapabilityLog, Probes, PerfMonitor, HeapWatch (v0.5), Diagnostics, Upload (Supabase), DebugDraw, TestCube, DepthView
 ```
 
 ### Two kinds of session
@@ -154,3 +160,32 @@ three r187 draws its occlusion pass (a full-screen quad writing `gl_FragDepth`) 
     - `NODE_PATH=$(npm root -g) node tests/e2e/depth-occlusion.mjs` checks the soft-occlusion shaders on the GPU path.
     - `node tools/serve.mjs` then `http://localhost:8080/?emulate` runs the page in the emulator (the house fixture). `?emulate&snapshot=<url>` plays in a saved snapshot or a diagnostics export (your real house); `?emulate&replay` uses the newest snapshot in this browser's diagnostics.
 - **Headset:** open the Render URL in the Quest Browser and follow the on-page tests. Then copy the diagnostics JSON into the chat.
+
+## v0.5: the house learner and the zero-upload UI
+
+**Data flow (one session).**
+```
+capture (CaptureJob, ≤ 16k mesh vertices a frame) → Learner.open(snapshot)
+   → worker: houseFrameOf → loadHouse(IndexedDB) → decay → analyze → 'opened' (+ result)
+→ world.buildAsync(applyScan(Space Setup, overlay(result)))      every build: Space Setup + what was learned
+→ POST (card / look / snap / layout, a frame each) → warmXR → [SCAN] → card → round
+per frame (world step): Learner.update: DepthTap.step (one GL step) | HitRays.step (one source) | head sample (10 Hz)
+   → 'depth' {pix, pose} / 'rays' {buf} transferred to the worker (buffers come back) → fuse into HouseGrid
+every 2 s (scan) / 10 s (play): 'analyze' → result (openings, floors, walls, tops, rooms) → the watch / the next window
+wave break, round over, after the scan, session end: 'save' → worker: compact, quota check, IndexedDB
+wave break with nobody alive and a changed result: a 'learn' worker build (atomic commit), lights ease
+```
+
+**Threads.** The main thread only issues the downsample draw, the readPixels into a fresh pack buffer, the fence
+poll and the getBufferSubData of a 12.8 KB buffer (at most one a frame, never on a frame whose predecessor took
+over 8 ms), and posts small transferred buffers. Fusion, analysis, decoding, the calibration and IndexedDB are
+the worker's. The world build that applies a result is the world worker's (v0.4).
+
+**Coordinates.** The worker keeps everything in the house frame (Space Setup's largest floor plane, yaw only);
+the main thread sends the session → house transform at open and after a realign, and the overlay comes back into
+session coordinates through its inverse.
+
+**Glyph UI.** One atlas (2048 × 1024, drawn once at load): the watch's fonts (only the characters each prints) and
+pieces (paper windows, icons, pill caps), the panels' fonts. A GlyphBoard is an InstancedBufferGeometry of quads
+(atlas rectangle, place, tint) over the shared board material; a layout rewrites its instanced arrays
+(`needsUpdate`, the whole preallocated buffer, a few KB). Layout code passes integers only.

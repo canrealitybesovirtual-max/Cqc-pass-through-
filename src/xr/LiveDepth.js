@@ -38,6 +38,12 @@ export class LiveDepth {
   constructor() {
     /** Set sourceTexture to the current frame's texture (false = three's stock behaviour, for A/B tests). */
     this.refresh = true;
+    /**
+     * v0.5: hand the depth to three (its occlusion pass, its 0.1 m near plane, no clear) or not. Off in play unless
+     * dynamic occlusion is on: the house learner reads the depth itself (DepthTap) and three renders as without
+     * depth (near 0.02 m, its own clear). The probe shares it.
+     */
+    this.shareWithThree = true;
     this._reset();
   }
 
@@ -96,7 +102,7 @@ export class LiveDepth {
     binding.getDepthInformation = function (view) {
       const d = orig.call(this, view);
       self._last = d;
-      return d;
+      return self.shareWithThree ? d : null;
     };
     this._binding = binding;
     this._orig = orig;
@@ -147,9 +153,10 @@ export class LiveDepth {
     if (this._binding !== null && this._orig !== null) {
       try { delete this._binding.getDepthInformation; } catch { /* sealed: leave it */ }
     }
-    const refresh = this.refresh;
+    const refresh = this.refresh, share = this.shareWithThree;
     this._reset();
     this.refresh = refresh;
+    this.shareWithThree = share;
   }
 
   /** One line for the probe panel. */
@@ -169,7 +176,7 @@ export class LiveDepth {
       width: this.width, height: this.height,
       depthNear: Number.isFinite(this.near) ? this.near : this.near === Infinity ? 'Infinity' : null,
       depthFar: Number.isFinite(this.far) ? this.far : this.far === Infinity ? 'Infinity' : null,
-      nearFarChanges: this.nearFarChanges, threePass: this.threePass, quadColorWriteOff: this.colorWriteOff,
+      nearFarChanges: this.nearFarChanges, threePass: this.threePass, quadColorWriteOff: this.colorWriteOff, sharedWithThree: this.shareWithThree,
     };
   }
 }

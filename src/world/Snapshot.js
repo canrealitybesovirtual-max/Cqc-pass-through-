@@ -84,67 +84,200 @@ const r6 = (v) => Math.round(v * 1e6) / 1e6 + 0;
  * @returns {import('./Layout.js').SpaceSnapshot}
  */
 export function captureSnapshot(frame, space, opts = {}) {
-  /** @type {import('./Layout.js').SpaceSnapshot} */
-  const snap = { version: SNAPSHOT_VERSION, space: opts.spaceName || 'local-floor', planes: [], meshes: [], globalMesh: null };
-  /** @type {RawSet} */ const raw = { token: ++rawToken, global: -1, meshes: [] };
-  /** @type {number[]} */ const rawOfMesh = [];
-  let meshTris = 0, meshBytes = 0;
-  let skippedPlanes = 0, skippedMeshes = 0;
-  const keep = Array.isArray(opts.keep) ? opts.keep : null;
-  if (keep) keep.length = 0;
-  const planes = frame && frame.detectedPlanes;
-  if (planes) {
-    for (const p of planes) {
-      const pose = p && p.planeSpace ? frame.getPose(p.planeSpace, space) : null;
-      const poly = p && p.polygon;
-      if (!pose || !poly || poly.length < 3) { skippedPlanes++; continue; }
-      const m = pose.transform.matrix;
-      /** @type {number[][]} */ const pts = [];
-      for (let i = 0; i < poly.length; i++) pts.push([r4(poly[i].x), r4(poly[i].z)]);
-      const orientation = p.orientation === 'vertical' || p.orientation === 'horizontal'
-        ? p.orientation
-        : (Math.abs(m[5]) > 0.7 ? 'horizontal' : 'vertical');
-      snap.planes.push({ label: labelOf(p.semanticLabel), orientation, pose: poseArray(m), polygon: pts });
-      if (keep) keep.push(p);
-    }
+  const job = new CaptureJob();
+  job.begin(frame, space, opts);
+  while (!job.done) job.step(frame, space, Infinity);
+  return /** @type {import('./Layout.js').SpaceSnapshot} */ (job.snap);
+}
+
+/** Vertices a capture step handles per frame (copy + bounds): the 36k-triangle global mesh takes 2–4 frames. */
+export const CAPTURE_VERTS_PER_FRAME = 16384;
+
+/**
+ * The capture spread over frames (v0.5, behind the panel): `begin` copies the planes (and takes the mesh
+ * list); each `step` copies meshes and computes their boxes up to `CAPTURE_VERTS_PER_FRAME` vertices (a mesh's
+ * vertices and indices are copied in one memcpy when first touched, with its pose in that frame; a large mesh's
+ * bounds then go on over the next frames on the copy); `done` once every mesh is in. `ms`, `frames` and `maxMs`
+ * say what the main thread paid (rec.play.capture). `captureSnapshot` is begin + steps without a budget.
+ * Every step runs inside its own XR frame callback with that frame.
+ */
+export class CaptureJob {
+  constructor() {
+    /** @type {any} */ this.snap = null;
+    this.done = false;
+    this.active = false;
+    this.ms = 0;
+    this.maxMs = 0;
+    this.frames = 0;
+    /** @type {any[]} */ this._list = [];
+    this._i = 0;
+    /** @type {any} */ this._cur = null;
+    /** @type {any} */ this._opts = null;
   }
-  const meshes = frame && frame.detectedMeshes;
-  if (meshes) {
-    for (const mesh of meshes) {
+
+  /**
+   * @param {any} frame @param {any} space
+   * @param {{ spaceName?: string, stats?: any, keep?: any[], raw?: boolean }} [opts] as captureSnapshot
+   */
+  begin(frame, space, opts = {}) {
+    const t0 = clockMs();
+    this._opts = opts;
+    /** @type {any} */
+    const snap = { version: SNAPSHOT_VERSION, space: opts.spaceName || 'local-floor', planes: [], meshes: [], globalMesh: null };
+    this.snap = snap;
+    this._raw = /** @type {RawSet} */ ({ token: ++rawToken, global: -1, meshes: [] });
+    /** @type {number[]} */ this._rawOfMesh = [];
+    this._meshTris = 0;
+    this._meshBytes = 0;
+    this._skippedPlanes = 0;
+    this._skippedMeshes = 0;
+    this.done = false;
+    this.active = true;
+    this.ms = 0;
+    this.maxMs = 0;
+    this.frames = 0;
+    this._cur = null;
+    this._i = 0;
+    const keep = Array.isArray(opts.keep) ? opts.keep : null;
+    if (keep) keep.length = 0;
+    const planes = frame && frame.detectedPlanes;
+    if (planes) {
+      for (const p of planes) {
+        const pose = p && p.planeSpace ? frame.getPose(p.planeSpace, space) : null;
+        const poly = p && p.polygon;
+        if (!pose || !poly || poly.length < 3) { this._skippedPlanes++; continue; }
+        const m = pose.transform.matrix;
+        /** @type {number[][]} */ const pts = [];
+        for (let i = 0; i < poly.length; i++) pts.push([r4(poly[i].x), r4(poly[i].z)]);
+        const orientation = p.orientation === 'vertical' || p.orientation === 'horizontal'
+          ? p.orientation
+          : (Math.abs(m[5]) > 0.7 ? 'horizontal' : 'vertical');
+        snap.planes.push({ label: labelOf(p.semanticLabel), orientation, pose: poseArray(m), polygon: pts });
+        if (keep) keep.push(p);
+      }
+    }
+    const meshes = frame && frame.detectedMeshes;
+    this._list = meshes ? Array.from(meshes) : [];
+    this._tick(t0);
+  }
+
+  /**
+   * One frame's share. Returns true once the snapshot is complete.
+   * @param {any} frame this frame @param {any} space @param {number} [budget] vertices this frame
+   */
+  step(frame, space, budget = CAPTURE_VERTS_PER_FRAME) {
+    if (this.done || !this.active) return this.done;
+    const t0 = clockMs();
+    let spent = 0;
+    const L = this._list, raw = this._raw, snap = this.snap, opts = this._opts;
+    while (this._i < L.length && spent < budget) {
+      const cur = this._cur;
+      if (cur) {
+        // a large mesh's bounds, on its copy
+        const v = cur.v, n = Math.floor(v.length / 3), m = cur.m;
+        const end = Math.min(n, cur.k + Math.max(1, budget - spent));
+        for (let i = cur.k; i < end; i++) {
+          const a = v[3 * i], b = v[3 * i + 1], c = v[3 * i + 2];
+          const x = m[0] * a + m[4] * b + m[8] * c + m[12], y = m[1] * a + m[5] * b + m[9] * c + m[13], z = m[2] * a + m[6] * b + m[10] * c + m[14];
+          if (x < cur.x0) cur.x0 = x; if (x > cur.x1) cur.x1 = x;
+          if (y < cur.y0) cur.y0 = y; if (y > cur.y1) cur.y1 = y;
+          if (z < cur.z0) cur.z0 = z; if (z > cur.z1) cur.z1 = z;
+        }
+        spent += end - cur.k;
+        cur.k = end;
+        if (end >= n) {
+          snap.meshes.push(boundsBox(cur.label, cur));
+          this._cur = null;
+          this._i++;
+        }
+        continue;
+      }
+      const mesh = L[this._i];
       const pose = mesh && mesh.meshSpace ? frame.getPose(mesh.meshSpace, space) : null;
       const v = mesh && mesh.vertices;
-      if (!pose || !v || v.length < 3) { skippedMeshes++; continue; }
+      if (!pose || !v || v.length < 3) { this._skippedMeshes++; this._i++; continue; }
       const label = labelOf(mesh.semanticLabel);
-      snap.meshes.push(meshBox(label, pose.transform.matrix, v));
+      const mat = pose.transform.matrix;
       const ix = mesh.indices;
+      /** @type {Float32Array|null} */ let copy = null;
       if (opts.raw !== false && ix && ix.length >= 3) {
         const data = { vertices: new Float32Array(v), indices: new Uint32Array(ix) };
-        meshTris += Math.floor(ix.length / 3);
-        meshBytes += data.vertices.byteLength + data.indices.byteLength;
-        rawOfMesh.push(raw.meshes.length);
-        raw.meshes.push({ label, pose: Float64Array.from(pose.transform.matrix), lastChangedTime: Number(mesh.lastChangedTime) || 0, data });
-      } else rawOfMesh.push(-1);
+        copy = data.vertices;
+        this._meshTris += Math.floor(ix.length / 3);
+        this._meshBytes += data.vertices.byteLength + data.indices.byteLength;
+        this._rawOfMesh.push(raw.meshes.length);
+        raw.meshes.push({ label, pose: Float64Array.from(mat), lastChangedTime: Number(mesh.lastChangedTime) || 0, data });
+      } else this._rawOfMesh.push(-1);
+      const n = Math.floor(v.length / 3);
+      if (n <= HULL_MAX_VERTICES) {
+        snap.meshes.push(meshBox(label, mat, v));
+        spent += n;
+        this._i++;
+        continue;
+      }
+      // a large mesh (the global mesh): its bounds over this and the next frames, on the copy
+      this._cur = { label, n, m: Float64Array.from(mat), v: copy || new Float32Array(v), k: 0,
+        x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity, z0: Infinity, z1: -Infinity };
+      spent += Math.min(n, 4096); // the copies
     }
+    if (this._i >= L.length && !this._cur) this._finish();
+    this._tick(t0);
+    return this.done;
   }
-  if (raw.meshes.length) {
-    const g = pickGlobal(raw.meshes);
-    raw.global = g;
-    if (g >= 0) {
-      const r = raw.meshes[g];
-      snap.globalMesh = { label: r.label, mesh: rawOfMesh.indexOf(g), vertexCount: Math.floor(r.data.vertices.length / 3),
-        triangleCount: Math.floor(r.data.indices.length / 3), lastChangedTime: r.lastChangedTime };
+
+  _finish() {
+    const raw = this._raw, snap = this.snap, opts = this._opts;
+    if (raw.meshes.length) {
+      const g = pickGlobal(raw.meshes);
+      raw.global = g;
+      if (g >= 0) {
+        const r = raw.meshes[g];
+        snap.globalMesh = { label: r.label, mesh: this._rawOfMesh.indexOf(g), vertexCount: Math.floor(r.data.vertices.length / 3),
+          triangleCount: Math.floor(r.data.indices.length / 3), lastChangedTime: r.lastChangedTime };
+      }
+      attachRaw(snap, raw);
     }
-    attachRaw(snap, raw);
+    if (opts.stats) {
+      opts.stats.planes = snap.planes.length;
+      opts.stats.meshes = snap.meshes.length;
+      opts.stats.skippedPlanes = this._skippedPlanes;
+      opts.stats.skippedMeshes = this._skippedMeshes;
+      opts.stats.meshTris = this._meshTris;
+      opts.stats.meshBytes = this._meshBytes;
+    }
+    this._list = [];
+    this.done = true;
+    this.active = false;
   }
-  if (opts.stats) {
-    opts.stats.planes = snap.planes.length;
-    opts.stats.meshes = snap.meshes.length;
-    opts.stats.skippedPlanes = skippedPlanes;
-    opts.stats.skippedMeshes = skippedMeshes;
-    opts.stats.meshTris = meshTris;
-    opts.stats.meshBytes = meshBytes;
+
+  /** @param {number} t0 */
+  _tick(t0) {
+    const ms = clockMs() - t0;
+    this.ms += ms;
+    if (ms > this.maxMs) this.maxMs = ms;
+    this.frames++;
   }
-  return snap;
+
+  /** For the record. */
+  report() { return { ms: Math.round(this.ms * 100) / 100, maxMs: Math.round(this.maxMs * 100) / 100, frames: this.frames }; }
+}
+
+/** @returns {number} ms */
+function clockMs() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
+
+/**
+ * The box of a large mesh from its world-axis bounds (meshBox's rule over HULL_MAX_VERTICES).
+ * @param {string|null} label @param {{ x0: number, x1: number, y0: number, y1: number, z0: number, z1: number }} b
+ */
+function boundsBox(label, b) {
+  const hy = (b.y1 - b.y0) / 2, cy = (b.y0 + b.y1) / 2;
+  return {
+    label,
+    pose: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, r4((b.x0 + b.x1) / 2), r4(cy), r4((b.z0 + b.z1) / 2), 1],
+    min: [r4(-(b.x1 - b.x0) / 2), r4(-hy), r4(-(b.z1 - b.z0) / 2)],
+    max: [r4((b.x1 - b.x0) / 2), r4(hy), r4((b.z1 - b.z0) / 2)],
+    vertexCount: /** @type {any} */ (b).n || 0,
+  };
 }
 
 /**
@@ -356,6 +489,15 @@ export function normalizeSnapshot(obj) {
       gm.data = g.data;
     }
     out.globalMesh = gm;
+  }
+  // v0.5: the learned overlay's bookkeeping (src/learn/overlay.js): how many planes / volumes are Space Setup's,
+  // and the points the user walked (a walked room is never taken for unscanned space)
+  const sb = obj.scanBase;
+  if (sb && Number.isInteger(sb.planes) && Number.isInteger(sb.meshes)) {
+    /** @type {any} */ (out).scanBase = { planes: Math.min(sb.planes, out.planes.length), meshes: Math.min(sb.meshes, out.meshes.length) };
+  }
+  if (Array.isArray(obj.scanWalked)) {
+    /** @type {any} */ (out).scanWalked = obj.scanWalked.filter((/** @type {unknown} */ q) => finiteArray(q, 2)).slice(0, 2000).map((/** @type {number[]} */ q) => [q[0], q[1]]);
   }
   const raw = rawOf(obj);
   if (raw) attachRaw(out, raw); // a live capture keeps its triangles through normalisation

@@ -61,6 +61,19 @@ v0.4.1 fixes what you saw in your house in v0.4 (enemies seen through walls, fak
 3. **Height:** do they look like real people now (1.70–1.85 m)? Are their feet on your floor in the bedroom, the hall and the living room (not floating, not sunk)?
 4. Exit. The upload goes by itself.
 
+## v0.5: tests to run
+
+v0.5 adds the walkthrough scan (the house is learned and kept on the headset), a fix pass for the hitches in your v0.4 record, and much more detail in the hitch log. The page has a new **Scan house** button; the first **Enter MR** in a house with nothing learned starts with the scan too.
+
+1. **Scan.** Tap **Scan house**. Read the card, pull the trigger. Walk bedroom → hall → living room (the path from v0.4), slowly, looking at walls, doorways and furniture. Glance at your watch: does the 9 o'clock window count rooms (blue) and the bottom line say SCAN n%? Is the faint blue floor glow under you the only thing you see? Hold the trigger 2 s to finish.
+2. **The hall.** Play a few waves. Do soldiers now come through the hall into the bedroom (v0.4: they could not reach it)? Any wall that is not there, or a doorway that is now blocked?
+3. **Kept.** Exit, reload the page, Enter MR: it should go straight to the card (no scan), and the hall should still be open.
+4. **Permission.** Did the headset ask for a new permission when you entered (the game now asks for depth, for the scan only)?
+5. **Hitches.** Did anything stutter while scanning, when the card came up after the scan, or between waves?
+6. Exit. The upload goes by itself.
+
+Records to read: `sessions[0].play.learn` (house id, loaded / saved chunks and bytes, the depth tap: `issued`, `packets`, `drops`, `issueMs`, `getMs`, `framesToSignal`, `depth.width/height/textureType/nIdentity/ownGeometry`; `core.depth` = which way the depth rows run, `calibResidualCm`; `hitTest`: `created`, `entityTypes`, `hitRate`; `result`: openings, walked openings, floors, rooms, coverage), `sessions[0].play.scanResult`, `sessions[0].view` (`depthSensing`, `depthToThree` must be false, `near` 0.02), `sessions[0].perf` (whole-session interval histogram, per-system peaks, callback lateness), `sessions[0].hitches.entries[]` (now with `late`, `prev`, `prevCpu`, `next`, `markerAgeMs`) and `.gaps`, `sessions[0].heap` (GC drops with times), `sessions[0].probes.longAnimationFrames.entries` (which script made a long frame), `sessions[0].growth` (programs / textures / geometries growing in play), `play.capture.ms` / `.frames`.
+
 ## Entries
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)

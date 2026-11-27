@@ -130,6 +130,13 @@ export class HomePage {
         if (this.onEnter) this.onEnter(mode);
       });
     }
+    // v0.5: the walkthrough scan, then play (the house is learned and kept on this device)
+    const scan = document.getElementById('bScan');
+    if (scan) scan.addEventListener('click', () => {
+      app.scanNext = true;
+      app.enter('play');
+      if (this.onEnter) this.onEnter('play');
+    });
     this.setButtons(true);
     $('bCopy').addEventListener('click', async () => {
       if (this.onCopy) this.onCopy(); // the upload starts first (the clipboard may wait for a permission)
@@ -152,7 +159,8 @@ export class HomePage {
    */
   inXR(mode, game = false, spaceNote = null, style = 'roam') {
     const menu = 'Menu and pause: look at your watch and touch it with the right controller (or point and pull the trigger). Exit: watch → EXIT, or hold Y for 2 s.';
-    const start = style === 'spot' ? 'Stand in an open spot and pull the trigger to start.' : 'Pull the trigger to start, then walk anywhere you scanned in Space Setup (walk, don’t run).';
+    const start = style === 'spot' ? 'Stand in an open spot and pull the trigger to start.'
+      : 'Pull the trigger to start, then walk anywhere in the house (walk, don’t run). If the game starts with a scan (the first time in a house, or Scan house): walk every room, then hold the trigger 2 s.';
     this.note(game ? `In ${mode}. ${start} ${menu}${spaceNote ? ` ${spaceNote}.` : ''}` : `In ${mode}. Hold both grips for 1 s to exit.`);
   }
 
@@ -181,7 +189,7 @@ export class HomePage {
     const sup = this.sup || {};
     const ready = this.load === 'ready', idle = this.load !== 'loading';
     /** @type {[string, boolean][]} */
-    const gate = [['bPlay', !!sup.ar && ready], ['bSpot', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
+    const gate = [['bPlay', !!sup.ar && ready], ['bScan', !!sup.ar && ready], ['bSpot', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
     for (const [id, ok] of gate) { const b = /** @type {HTMLButtonElement|null} */ (document.getElementById(id)); if (b) b.disabled = !on || !ok; }
   }
 

@@ -1,13 +1,15 @@
 // @ts-check
 import * as THREE from 'three';
 import { claimUpload } from '../game/UploadGate.js';
+import { GlyphBoard } from './Glyphs.js';
+import { uiAtlas } from './uiAtlas.js';
 import {
   WATCH, GRIP_IN_RAY, watchOffset, WakeGate, TapGate, PressGate, PRESS, Confirm, handAngles, BezelTurn,
   WarnPlan, WARN, PAGE, ROW, ROW_NAMES, PAGE_ROWS, isValueRow, needsConfirm, MENU_PX, rowRect, hitMenu,
   FitEdit, FIT_FIELD, FIT_WEAPONS, weaponIndex, STATE, stateCode, modeCode, infoCode, INFO, synthTick, synthAlert, menuSpot,
 } from './watchLogic.js';
-import { drawSteelMatcap, drawGlassMatcap, drawFaceAtlas, drawReadouts, drawMenu, FACE, READ, RC } from './watchArt.js';
-import { buildSteel, buildFace, buildReadouts, buildGlass, buildMenuRim } from './watchGeometry.js';
+import { drawSteelMatcap, drawGlassMatcap, drawFaceAtlas, drawMenuBackground, layoutReadouts, layoutMenu, FACE, READ, READ_REGIONS, RC } from './watchArt.js';
+import { buildSteel, buildFace, buildGlass, buildMenuRim } from './watchGeometry.js';
 
 /**
  * The wrist watch (replaces WristHud): a steel dive watch on the back of the
@@ -52,9 +54,12 @@ import { buildSteel, buildFace, buildReadouts, buildGlass, buildMenuRim } from '
  *   'fitEnd' (same object; values are the saved ones after BACK reverted any unsaved edit).
  *
  * Draws: 4 per eye while the watch is in view (steel, face + hands, readouts,
- * glass), +4 while the menu is open. Two canvas textures are redrawn on
- * change only (readouts ≤ 2/s; menu ≤ 2/s while open), each through the
- * shared one-upload-per-frame gate. Allocation-free per frame.
+ * glass), +5 while the menu is open. v0.5: NO texture upload in play: the
+ * readouts and the menu's rows are glyph boards over the shared UI atlas
+ * (src/ui/Glyphs.js, drawn once at load); a change re-lays them out (≤ 2/s
+ * each, one board per frame through the shared gate): a few hundred bytes of
+ * instanced attributes. The menu disc's background is a static texture.
+ * Allocation-free per frame.
  */
 
 const _v = new THREE.Vector3();
@@ -98,11 +103,11 @@ export class Watch {
     this.glassCap = canvasTexture(256, 256, (c) => drawGlassMatcap(c, 256), false);
     /** Static dial + bezel atlas: drawn once, mipmapped (minified ~5× on the wrist). */
     this.faceTex = canvasTexture(FACE.w, FACE.h, (c) => drawFaceAtlas(c), true);
-    /** Dynamic readouts: redrawn on change, no mipmaps. */
-    this.readTex = canvasTexture(READ.w, READ.h, null, false);
-    this.readCtx = /** @type {CanvasRenderingContext2D} */ (/** @type {HTMLCanvasElement} */ (this.readTex.image).getContext('2d'));
-    this.menuTex = canvasTexture(MENU_PX.size, MENU_PX.size, null, false);
-    this.menuCtx = /** @type {CanvasRenderingContext2D} */ (/** @type {HTMLCanvasElement} */ (this.menuTex.image).getContext('2d'));
+    /** v0.5: the shared UI glyph atlas (readout and menu glyphs, drawn once) and the menu disc's static background. */
+    const ui = uiAtlas();
+    this.atlas = ui.atlas;
+    this.art = ui.art;
+    this.menuBgTex = canvasTexture(MENU_PX.size, MENU_PX.size, (c) => drawMenuBackground(c), false);
 
     // ── materials (every program-key property fixed here, never toggled) ──
     this.steelMat = new THREE.MeshMatcapMaterial({ matcap: this.matcap, vertexColors: true, side: THREE.DoubleSide });
@@ -124,8 +129,8 @@ export class Watch {
         ].join('\n'));
     };
     this.faceMat.customProgramCacheKey = () => 'cqc-watch-face-1';
-    this.readMat = new THREE.MeshBasicMaterial({ map: this.readTex, transparent: true, toneMapped: false });
-    this.readMat.name = 'watch-readouts';
+    /** The readouts are a glyph board: the shared board material (transparent, fixed key). */
+    this.readMat = this.atlas.material;
     this.glassMat = new THREE.MeshMatcapMaterial({ matcap: this.glassCap, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false });
     this.glassMat.name = 'watch-glass';
 
@@ -136,7 +141,14 @@ export class Watch {
     this.root.visible = false;
     this.steel = mesh(buildSteel({ bracelet }), this.steelMat, 'watch-steel', 0);
     this.face = mesh(buildFace(), this.faceMat, 'watch-face', 0);
-    this.readouts = mesh(buildReadouts(), this.readMat, 'watch-readouts', 1);
+    this.readBoard = new GlyphBoard(this.atlas, { capacity: 96, name: 'watch-readouts', renderOrder: 1 });
+    this.readouts = this.readBoard.mesh;
+    this.readouts.position.z = 0.00012;
+    // region px → dial metres: each readout window sits at its own place on the dial (10 px per mm)
+    READ_REGIONS.forEach((key, i) => {
+      const R = /** @type {any} */ (READ)[key], k = 0.001 / READ.px;
+      this.readBoard.setFrame(i, R.cx * 0.001 - (R.x + R.w / 2) * k, R.cy * 0.001 + (R.y + R.h / 2) * k, k);
+    });
     this.glass = mesh(buildGlass(), this.glassMat, 'watch-glass', 2);
     this.root.add(this.steel, this.face, this.readouts, this.glass);
 
@@ -146,7 +158,7 @@ export class Watch {
     this.menuRoot.name = 'watch-menu';
     this.menuRoot.matrixAutoUpdate = false;
     this.menuRoot.visible = false;
-    this.menuMat = new THREE.MeshBasicMaterial({ map: this.menuTex, toneMapped: false });
+    this.menuMat = new THREE.MeshBasicMaterial({ map: this.menuBgTex, toneMapped: false });
     this.menuMat.name = 'watch-menu';
     this.menuDisc = mesh(new THREE.CircleGeometry(MR, 96), this.menuMat, 'watch-menu-disc', 0);
     this.menuRim = mesh(buildMenuRim(MR), this.steelMat, 'watch-menu-rim', 0);
@@ -171,7 +183,11 @@ export class Watch {
     this.cursor = mesh(new THREE.CircleGeometry(0.0026, 20), this.cursorMat, 'watch-menu-cursor', 52);
     this.cursor.position.z = 0.0016;
     this.cursor.visible = false;
-    this.menuRoot.add(this.menuDisc, this.menuRim, ...this.hiRows, this.hiZone, this.cursor);
+    /** The menu's rows and strip: a glyph board just above the disc, under the highlights. */
+    this.menuBoard = new GlyphBoard(this.atlas, { capacity: 320, name: 'watch-menu-text', renderOrder: 50 });
+    this.menuBoard.mesh.position.z = 0.0004;
+    this.menuBoard.frame(-MENU_PX.c * S0, MENU_PX.c * S0, S0);
+    this.menuRoot.add(this.menuDisc, this.menuRim, ...this.hiRows, this.hiZone, this.cursor, this.menuBoard.mesh);
 
     if (ctx && ctx.scene) { ctx.scene.add(this.root); ctx.scene.add(this.menuRoot); }
 
@@ -248,7 +264,11 @@ export class Watch {
   warmMeshes() { return [this.root, this.menuRoot]; }
 
   /** Every texture (for the record). */
-  textures() { return [this.matcap, this.glassCap, this.faceTex, this.readTex, this.menuTex]; }
+  textures() { return [this.matcap, this.glassCap, this.faceTex, this.menuBgTex, this.atlas.texture]; }
+
+  /** The strings on the dial / the menu now (tests and reports; allocates). */
+  get readTexts() { return this.readBoard.strings(); }
+  get menuTexts() { return this.menuBoard.strings(); }
 
   /** @param {boolean} on show for the warm-up draw (in front of the origin), or hide again */
   setWarm(on) {
@@ -808,23 +828,21 @@ export class Watch {
     }
   }
 
-  /** Draw the readouts and queue one upload. */
+  /** Lay the readouts out again (glyph board: a buffer range, no texture upload). */
   draw() {
     const n = this._n, s = this._s;
     for (let i = 0; i < RC.N; i++) s[i] = n[i];
-    drawReadouts(this.readCtx, n);
-    this.readTex.needsUpdate = true;
+    layoutReadouts(this.readBoard, this.art, n);
     this.draws++;
     this.dirty = false;
   }
 
-  /** Draw the menu disc and queue one upload. */
+  /** Lay the menu's rows and strip out again (glyph board). */
   drawMenuNow() {
     const n = this._n, m = this._ms;
     for (let i = 0; i < RC.N; i++) m[i] = n[i];
     const F = this.fitEdit, c = F.cur[F.weapon];
-    drawMenu(this.menuCtx, n, c[0], c[1], c[2]);
-    this.menuTex.needsUpdate = true;
+    layoutMenu(this.menuBoard, this.art, n, c[0], c[1], c[2]);
     this.menuDraws++;
     this.menuDirty = false;
   }

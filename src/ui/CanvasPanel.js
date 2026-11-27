@@ -8,9 +8,16 @@ import * as THREE from 'three';
  *   them on every upload);
  * - follows the head lazily ("tag-along") with preallocated math.
  */
-export class CanvasPanel {
-  /** @param {{ width?: number, height?: number, worldWidth?: number }} [o] */
-  constructor({ width = 1024, height = 640, worldWidth = 0.56 } = {}) {
+/**
+ * The tag-along placement shared by the canvas panel (probe sessions) and the
+ * glyph panel (play, v0.5: no texture uploads): about 0.8 m ahead and a
+ * little low, moving only when it drifts out of a comfortable zone; optional
+ * hide-while-walking. Preallocated maths.
+ */
+export class TagAlong {
+  /** @param {THREE.Object3D} mesh */
+  constructor(mesh) {
+    this.mesh = /** @type {any} */ (mesh);
     /**
      * Turn the panel's spot this far (radians, + = left) from straight ahead, so it
      * never sits between the eyes and what is straight ahead (the probe cube).
@@ -27,23 +34,6 @@ export class CanvasPanel {
     this._still = 0;
     this._lastX = NaN;
     this._lastZ = NaN;
-    this.canvas = document.createElement('canvas');
-    this.canvas.width = width;
-    this.canvas.height = height;
-    this.ctx = /** @type {CanvasRenderingContext2D} */ (this.canvas.getContext('2d'));
-    this.texture = new THREE.CanvasTexture(this.canvas);
-    this.texture.generateMipmaps = false;
-    this.texture.minFilter = THREE.LinearFilter;
-    this.texture.magFilter = THREE.LinearFilter;
-    this.texture.colorSpace = THREE.SRGBColorSpace;
-    const mat = new THREE.MeshBasicMaterial({ map: this.texture, toneMapped: false });
-    this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(worldWidth, (worldWidth * height) / width), mat);
-    this.mesh.renderOrder = 50;
-    this.mesh.frustumCulled = false;
-    this.key = '';
-    /** @type {string[]} */ this.lines = [];
-    this.dirty = false;
-    this.uploads = 0;
     this.placed = false;
     this._moving = false;
     // tag-along scratch
@@ -60,41 +50,6 @@ export class CanvasPanel {
     this._still = 0.5;
     this._lastX = NaN;
     this._lastZ = NaN;
-  }
-
-  /** @param {string[]} lines */
-  setLines(lines) {
-    const key = lines.join('\n');
-    if (key === this.key) return;
-    this.key = key;
-    this.lines = lines;
-    this.dirty = true;
-  }
-
-  /** Draw + upload if needed. Returns true when an upload was queued. */
-  flush() {
-    if (!this.dirty || !this.mesh.visible) return false;
-    const c = this.ctx, W = this.canvas.width, H = this.canvas.height;
-    c.fillStyle = '#10161d';
-    c.fillRect(0, 0, W, H);
-    c.strokeStyle = '#2f4256';
-    c.lineWidth = 4;
-    c.strokeRect(2, 2, W - 4, H - 4);
-    const n = this.lines.length;
-    const lh = Math.min(46, (H - 40) / Math.max(1, n));
-    let y = 20 + lh * 0.8;
-    for (let i = 0; i < n; i++) {
-      const s = this.lines[i];
-      const head = i === 0;
-      c.font = `${head ? '600 ' : ''}${Math.round(lh * (head ? 0.72 : 0.6))}px system-ui, sans-serif`;
-      c.fillStyle = head ? '#ffffff' : s.startsWith('✓') ? '#7ee29b' : s.startsWith('!') ? '#ffc061' : s.startsWith('[') ? '#9fb3c8' : '#dfe7ef';
-      fitText(c, s, 24, y, W - 48);
-      y += lh;
-    }
-    this.texture.needsUpdate = true;
-    this.dirty = false;
-    this.uploads++;
-    return true;
   }
 
   /**
@@ -139,6 +94,67 @@ export class CanvasPanel {
     const vis = this.shown && this._still >= 0.5;
     if (vis && !this.mesh.visible) this.placed = false; // re-place in front, no slide across the room
     this.mesh.visible = vis;
+  }
+}
+
+export class CanvasPanel extends TagAlong {
+  /** @param {{ width?: number, height?: number, worldWidth?: number }} [o] */
+  constructor({ width = 1024, height = 640, worldWidth = 0.56 } = {}) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.generateMipmaps = false;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const mat = new THREE.MeshBasicMaterial({ map: texture, toneMapped: false });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(worldWidth, (worldWidth * height) / width), mat);
+    super(mesh);
+    this.canvas = canvas;
+    this.ctx = /** @type {CanvasRenderingContext2D} */ (this.canvas.getContext('2d'));
+    this.texture = texture;
+    this.mesh.renderOrder = 50;
+    this.mesh.frustumCulled = false;
+    this.key = '';
+    /** @type {string[]} */ this.lines = [];
+    this.dirty = false;
+    this.uploads = 0;
+  }
+
+  /** @param {string[]} lines */
+  setLines(lines) {
+    const key = lines.join('\n');
+    if (key === this.key) return;
+    this.key = key;
+    this.lines = lines;
+    this.dirty = true;
+  }
+
+  /** Draw + upload if needed. Returns true when an upload was queued. */
+  flush() {
+    if (!this.dirty || !this.mesh.visible) return false;
+    const c = this.ctx, W = this.canvas.width, H = this.canvas.height;
+    c.fillStyle = '#10161d';
+    c.fillRect(0, 0, W, H);
+    c.strokeStyle = '#2f4256';
+    c.lineWidth = 4;
+    c.strokeRect(2, 2, W - 4, H - 4);
+    const n = this.lines.length;
+    const lh = Math.min(46, (H - 40) / Math.max(1, n));
+    let y = 20 + lh * 0.8;
+    for (let i = 0; i < n; i++) {
+      const s = this.lines[i];
+      const head = i === 0;
+      c.font = `${head ? '600 ' : ''}${Math.round(lh * (head ? 0.72 : 0.6))}px system-ui, sans-serif`;
+      c.fillStyle = head ? '#ffffff' : s.startsWith('✓') ? '#7ee29b' : s.startsWith('!') ? '#ffc061' : s.startsWith('[') ? '#9fb3c8' : '#dfe7ef';
+      fitText(c, s, 24, y, W - 48);
+      y += lh;
+    }
+    this.texture.needsUpdate = true;
+    this.dirty = false;
+    this.uploads++;
+    return true;
   }
 }
 

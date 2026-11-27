@@ -2,6 +2,7 @@
 import { Events } from '../core/Events.js';
 import { warmXR } from '../core/Warmup.js';
 import { World, CaptureGate, captureSnapshot, DriftWatch, pickReferencePlanes, resetTransform, createWorldBuilder } from '../world/World.js';
+import { CaptureJob } from '../world/Snapshot.js';
 import { mul4, transformPointXZ, yawOf } from '../world/Realign.js';
 import { Player } from '../game/Player.js';
 import { GameSession } from '../game/GameSession.js';
@@ -13,6 +14,13 @@ import { EnemyManager } from '../enemies/EnemyManager.js';
 import { Watch, installWatchSounds } from '../ui/Watch.js';
 import { Look } from '../fx/Look.js';
 import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
+import { VERSION } from '../version.js';
+import { Learner } from '../learn/Learner.js';
+import { createLearnClient } from '../learn/LearnClient.js';
+import { HitRays } from '../learn/HitRays.js';
+import { applyScan } from '../learn/overlay.js';
+import { DepthTap } from '../xr/DepthTap.js';
+import { ScanTint } from '../ui/ScanTint.js';
 
 /**
  * The play mode's game (CONTRACTS.md "Integration"): every system is built
@@ -51,7 +59,23 @@ import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
  *   9. rewarm: one warmXR draw (the occluder's rewritten buffers upload), and
  *      `game.realigned()` releases the hold (the normal resume protocol).
  *   A reset before the round (capture, warm, card, spot) goes back to capture
- *   silently. The watch's MODE row rebuilds the world in the other mode and
+ *   silently.
+ *
+ * v0.5 (the device record's hitches; the walkthrough scan; the learner):
+ *   - the capture is spread over frames (CaptureJob: planes, then up to 16k
+ *     mesh vertices a frame; `rec.play.capture.ms`), step COPY;
+ *   - the learner opens the house (HOUSE: its worker loads what it learned
+ *     here from IndexedDB, at most LEARN.openWaitMs) and every build uses
+ *     Space Setup + the learned overlay (src/learn/overlay.js);
+ *   - after a build, the card, the look's rebuild, its light snap and the
+ *     card's layout each get their own frame (POST), then the XR warm draw;
+ *   - SCAN (the page's Scan house, or the first play in a house with nothing
+ *     learned): after the warm draw, a short card, then nothing in the view
+ *     but a faint floor tint, the rooms found on the watch; hold a trigger
+ *     1.5 s to finish; the world is built again from the scan, then the card;
+ *   - in play the learner keeps refining at a low rate; a changed result is
+ *     applied (a worker build) only in a wave break with no enemy alive, and
+ *     saved (by the worker) at each wave break and at session end. The watch's MODE row rebuilds the world in the other mode and
  *   restarts at the card (step 3).
  *
  * The watch (src/ui/Watch.js) is the only menu: its actions come to
@@ -73,8 +97,9 @@ export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons'
  * Session steps (numbers kept from v0.2; SPOT, REBUILD and GO came with the safe-spot step, REALIGN and REWARM with
  * Roam, BUILD with the worker build in v0.4: the capture's or the MODE row's build in flight).
  */
-export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4, SPOT: 5, REBUILD: 6, GO: 7, REALIGN: 8, REWARM: 9, BUILD: 10 });
-const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm', 'build'];
+export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4, SPOT: 5, REBUILD: 6, GO: 7, REALIGN: 8, REWARM: 9, BUILD: 10,
+  COPY: 11, HOUSE: 12, SCAN: 13, POST: 14 });
+const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm', 'build', 'copy', 'house', 'scan', 'post'];
 /**
  * The card (or the round start, or the end of a realign) waits for the static colliders, at most this long (ms):
  * a dropped gun must land on the new world. Past it the physics is used as soon as it is ready.
@@ -92,6 +117,15 @@ export const CONTROLS = Object.freeze([
   'Pause: B + Y · Exit: hold Y for 2 s',
 ]);
 const CAPTURE_LINES = Object.freeze(['Get ready', 'Reading your room…', ...CONTROLS]);
+/** v0.5: the walkthrough scan's card (shown briefly; then nothing in the view but the floor tint). */
+export const SCAN_LINES = Object.freeze(['Scan your house', 'Walk through every room you will play in.', 'Look at the walls, the doorways and the furniture as you go.',
+  'Your watch counts the rooms found.', 'Hold the trigger for 2 s when you are done.', 'Pull the trigger to begin']);
+const SCAN_BUILD_LINES = Object.freeze(['Get ready', 'Building your house from the scan…', ...CONTROLS]);
+/** The scan card stays up at most this long (ms); a trigger hold this long (s) finishes the scan. */
+export const SCAN_CARD_MS = 8000;
+export const SCAN_HOLD_S = 1.5;
+/** After the finishing hold, the final analysis is waited for at most this long (ms). */
+export const SCAN_FINAL_MS = 3000;
 /** Last line of the card once the world is built (Roam / spot mode). */
 const CARD_NEXT_ROAM = 'Pull the trigger to start';
 const CARD_NEXT_SPOT = 'Pull the trigger, then stand in an open spot';
@@ -142,10 +176,11 @@ export class PlayKit {
    *   watchFit / bracelet: the watch on the wrist (URL knobs); difficultyFromUrl: ?difficulty= was given (it wins over the saved one);
    *   storage: localStorage (read here, at load; written only from a setTimeout);
    *   atlas: the decal atlas (Look's loadDecalAtlas, drawn in a worker); worldWorker (default true): build the world
-   *   in the world worker (`?worker=0`: on this thread, the v0.3 path, for A/B)
+   *   in the world worker (`?worker=0`: on this thread, the v0.3 path, for A/B); learn (default true, v0.5): the
+   *   walkthrough scan and the house learner (`?learn=0`: Space Setup only, as v0.4.1)
    */
   constructor({ gfx, assets, audio, input, fixture = null, grip = null, gloves = true, watchFit = null, bracelet = true,
-    difficultyFromUrl = false, storage = null, atlas = null, worldWorker = true }) {
+    difficultyFromUrl = false, storage = null, atlas = null, worldWorker = true, learn = true }) {
     const renderer = gfx.renderer, scene = gfx.scene;
     /** The scene camera the Loop renders with (three substitutes the XR camera). */
     this.sceneCamera = gfx.camera;
@@ -252,6 +287,32 @@ export class PlayKit {
     }
 
     this.gate = new CaptureGate();
+    /** v0.5: the capture spread over frames. */
+    this.capJob = new CaptureJob();
+
+    // ── the house learner (v0.5): the GPU depth tap (compiled and drawn here, before the warm-up), hit-test rays,
+    // the worker (IndexedDB) ──
+    /** @type {DepthTap|null} */ this.tap = null;
+    if (learn) {
+      try { this.tap = new DepthTap(renderer); this.tap.warmUp(); } catch (e) { this.tap = null; this.tapError = String(e); }
+    }
+    this.learner = new Learner({ client: learn ? createLearnClient({ appVersion: VERSION }) : null, tap: this.tap, hits: learn ? new HitRays() : null });
+    this.learnOn = !!learn;
+    /** The walkthrough scan's floor tint (the only thing it shows in the view). */
+    this.scanTint = new ScanTint();
+    scene.add(this.scanTint.mesh);
+    /** 'explicit' (the page's Scan house), 'auto' (scan when nothing is learned here yet), 'off'. */
+    this.scanMode = 'auto';
+    this.scanWanted = false;
+    this.scanDone = false;
+    this.scanS = { on: false, t0: 0, cardUp: false, hold: 0, finishing: false, finishAt: 0, finishSeq: 0, seenSeq: -1, ms: 0 };
+    this._scanStatus = { scanning: true, rooms: 0, learn: 0 };
+    /** The learned result last built into the world (its key), and whether a wave break may apply a newer one. */
+    this.appliedKey = '';
+    this.learnWindow = false;
+    /** @type {any[]} */ this.learnBuilds = [];
+    /** The post-build frames (card, look, light snap, card layout): one each. */
+    this.post = { stage: 0, next: STEP.WARM, kind: '', /** @type {readonly string[]|null} */ lines: null };
     /**
      * The world build in flight (worker): its kind, whether its promise resolved, and the main thread's cost while it ran
      * (the world step's longest frame and the longest frame of all systems but render, from the PerfMonitor).
@@ -334,6 +395,9 @@ export class PlayKit {
         this.perf.mark('run start');
       }
     });
+    // v0.5: a wave break is the learner's window (save; apply a changed result if no enemy is alive)
+    this.events.on('waveClear', () => { this.learnWindow = true; });
+    this.events.on('roundOver', () => { this.learnWindow = true; });
     this.events.on('pause', (/** @type {{ paused: boolean, reason: string }} */ p) => {
       if (this.perf) this.perf.mark(!p.paused ? 'resume' : p.reason === 'zone' ? 'pause zone' : p.reason === 'hidden' ? 'pause hidden' : 'pause');
     });
@@ -344,7 +408,7 @@ export class PlayKit {
   /** Everything the warm-up must draw (all already in the scene). */
   warmObjects() {
     return [...this.worldMeshes, ...this.weapons.warmMeshes(), ...this.enemies.warmMeshes(), ...this.game.warmMeshes(), ...this.watch.warmMeshes(),
-      ...(this.look ? this.look.warmMeshes() : [])];
+      ...(this.look ? this.look.warmMeshes() : []), this.scanTint.mesh];
   }
 
   /**
@@ -370,15 +434,18 @@ export class PlayKit {
     this.game.setWarm(on);
     this.watch.setWarm(on);
     if (this.look) this.look.setWarm(on);
+    this.scanTint.show(on);
   }
 
   /**
    * A play session starts (after attachSession).
    * @param {{ session: XRSession, space: XRReferenceSpace, rec: any, perf: import('../debug/PerfMonitor.js').PerfMonitor, warmed: any[],
    *   roam?: boolean, spaceName?: string, spaceNote?: string|null }} o
-   *   roam: Roam rules (default) or the stationary spot mode; spaceName / spaceNote: the space in use and the honest line when Roam has no `unbounded`
+   *   roam: Roam rules (default) or the stationary spot mode; spaceName / spaceNote: the space in use and the honest line when Roam has no `unbounded`;
+   *   scan (v0.5): 'explicit' (the page's Scan house), 'auto' (scan when nothing is learned in this house yet) or 'off';
+   *   liveDepth: App's LiveDepth (the learner's depth tap reads through its binding)
    */
-  begin({ session, space, rec, perf, warmed, roam = true, spaceName = '', spaceNote = null }) {
+  begin({ session, space, rec, perf, warmed, roam = true, spaceName = '', spaceNote = null, scan = 'auto', liveDepth = null }) {
     const c = this.ctx;
     c.session = session;
     c.space = space;
@@ -423,6 +490,17 @@ export class PlayKit {
     this.weapons.triggerBlocked = false;
     rec.play = { step: 'capture', mode: roam ? 'roam' : 'spot', grip: this.gripReport };
     rec.physicsLoad = this.physicsLoad;
+    // v0.5: the learner (depth tap, hit-test sources) and the scan
+    this.scanMode = this.learnOn ? scan : 'off';
+    this.scanWanted = false;
+    this.scanDone = false;
+    this.scanS.on = false;
+    this.scanTint.show(false);
+    this.appliedKey = '';
+    this.learnWindow = false;
+    this.learnBuilds = [];
+    this.capJob.active = false;
+    this.learner.begin({ session, space, liveDepth });
   }
 
   /**
@@ -436,15 +514,23 @@ export class PlayKit {
     if (this.modeWanted >= 0 && this.step !== STEP.REALIGN && this.step !== STEP.REWARM) this.switchMode(t);
     switch (this.step) {
       case STEP.CAPTURE: this.capture(t, frame); break;
+      case STEP.COPY: this.copyStep(t, frame); break;
+      case STEP.HOUSE: this.houseStep(t); break;
       case STEP.BUILD: this.buildWait(t); break;
-      case STEP.WARM: this.warmInXR(); this.step = STEP.START; break;
+      case STEP.POST: this.postStep(); break;
+      case STEP.WARM: this.warmInXR(); if (this.scanWanted && !this.scanDone) this.scanBegin(t); else this.step = STEP.START; break;
+      case STEP.SCAN: this.scanStep(dt, t); break;
       case STEP.START: this.waitCard(t); break;
       case STEP.REBUILD: this.rebuildForSpot(t); break;
       case STEP.GO: this.startRound(t); break;
-      case STEP.PLAY: this.driftStep(t, frame); break;
+      case STEP.PLAY: this.driftStep(t, frame); this.learnStep(t); break;
       case STEP.REALIGN: this.realignStep(t, frame); break;
       case STEP.REWARM: this.rewarm(t); break;
       default: break;
+    }
+    // the learner: the depth readback, a hit-test ray, the head path (each skipped on a frame near budget)
+    if (this.step !== STEP.IDLE && this.step !== STEP.CAPTURE && this.step !== STEP.COPY) {
+      this.learner.update(t, frame, ctx.space, this.player.valid ? this.player.head : null, ctx.input, this.perf);
     }
     const W = this.world, B = this._bq;
     if (B.active) {
@@ -513,13 +599,6 @@ export class PlayKit {
     return true;
   }
 
-  /** A build is in place: the look follows the house (rooms, windows, presets); lights jump, behind the panel. @param {boolean} moved */
-  worldBuilt(moved) {
-    if (!this.look) return;
-    this.look.onWorldBuilt(this.world, this.world.snapshot, { moved });
-    this.look.snap();
-  }
-
   /** @param {number} t @param {XRFrame} frame */
   capture(t, frame) {
     // A fixture needs no wait; a live capture waits for stable planes (or 3 s).
@@ -529,26 +608,89 @@ export class PlayKit {
     if (!ready || !this.player.valid) return;
     const S = this.captureStats;
     S.planes = S.meshes = S.skippedPlanes = S.skippedMeshes = 0;
-    const snap = this.takeSnapshot(frame);
+    if (this.fixture) { this._keep.length = 0; this.captured(this.fixture, t, null); return; }
+    // v0.5: the live capture over several frames (the planes now, the meshes' copies and bounds next)
+    if (this.perf) this.perf.mark('capture');
+    try {
+      this.capJob.begin(frame, this.ctx.space, { spaceName: this.spaceName || (this.rec && this.rec.granted && this.rec.granted.referenceSpace) || 'local-floor',
+        stats: this.captureStats, keep: this._keep });
+      this.step = STEP.COPY;
+    } catch (e) {
+      this._keep.length = 0;
+      this.note(`capture failed: ${e instanceof Error ? e.message : e}`);
+      this.captured(null, t, null);
+    }
+  }
+
+  /** The capture's mesh copies, a share a frame. @param {number} t @param {XRFrame} frame */
+  copyStep(t, frame) {
+    let done = false;
+    try { done = this.capJob.step(frame, this.ctx.space); } catch (e) {
+      this.capJob.active = false;
+      this.note(`capture failed: ${e instanceof Error ? e.message : e}`);
+      this.captured(null, t, this.capJob.report());
+      return;
+    }
+    if (done) this.captured(this.capJob.snap, t, this.capJob.report());
+  }
+
+  /**
+   * The snapshot is in: the drift watch's reference, the record, and the learner opens the house (its worker
+   * loads what it learned here); the build waits for that (HOUSE) at most LEARN.openWaitMs.
+   * @param {SpaceSnapshot|null} snap @param {number} t @param {{ ms: number, maxMs: number, frames: number }|null} cap
+   */
+  captured(snap, t, cap) {
+    const S = this.captureStats;
     const source = this.fixture ? 'fixture' : 'live';
     this.snapshot = snap;
     this.setDriftReference(snap, !this.fixture);
-    const p = this.player;
-    this.world.bakeBudgetMs = BAKE_CARD_MS; // the opaque card is up: bake faster (a worker build bakes there)
-    this.buildX = p.head.x;
-    this.buildZ = p.head.z;
     this.buildAtMs = Math.round(t - this.t0);
-    if (this.perf) this.perf.mark('world build');
-    const start = { x: p.head.x, z: p.head.z, r: this.game.rules.zoneR }, roam = this.game.roam;
-    this.startBuild('capture', () => this.world.buildAsync(snap, start, { roam }));
     if (this.rec) {
       // the user's real house, replayable on desktop (?emulate&snapshot=…); a worker build adds the encoded global mesh
       this.rec.spaceSnapshot = snap;
       this.rec.play = {
-        step: 'build', source, mode: roam ? 'roam' : 'spot', grip: this.gripReport,
+        step: 'build', source, mode: this.game.roam ? 'roam' : 'spot', grip: this.gripReport,
         capture: { ...S, atMs: this.buildAtMs, planesInSnapshot: snap ? snap.planes.length : 0, meshesInSnapshot: snap ? snap.meshes.length : 0, refPlanes: this.refIdx.length,
-          globalMesh: snap && snap.globalMesh ? { tris: snap.globalMesh.triangleCount, verts: snap.globalMesh.vertexCount, label: snap.globalMesh.label } : null },
+          globalMesh: snap && snap.globalMesh ? { tris: snap.globalMesh.triangleCount, verts: snap.globalMesh.vertexCount, label: snap.globalMesh.label } : null,
+          ...(cap ? { ms: cap.ms, maxMs: cap.maxMs, frames: cap.frames } : {}) },
       };
+    }
+    if (snap && this.learner.open(snap)) { this.step = STEP.HOUSE; return; }
+    this.buildFromCapture(t);
+  }
+
+  /** The learner's worker is loading the house: wait for it (bounded), then build. @param {number} t */
+  houseStep(t) {
+    const L = this.learner;
+    if (L.state === 'opening' && !L.openTimedOut()) return;
+    if (L.state === 'opening') this.note('learner: the house did not load in time; Space Setup only this session');
+    this.buildFromCapture(t);
+  }
+
+  /**
+   * Space Setup + what the learner knows about this house (src/learn/overlay.js). Remembers the result's key.
+   * @param {SpaceSnapshot|null} snap
+   */
+  mergedSnapshot(snap) {
+    const L = this.learner;
+    this.appliedKey = L.result ? L.result.key : '';
+    return /** @type {SpaceSnapshot|null} */ (applyScan(snap, L.overlay()));
+  }
+
+  /** The capture's build (worker), behind the panel. @param {number} t */
+  buildFromCapture(t) {
+    const p = this.player, L = this.learner;
+    this.world.bakeBudgetMs = BAKE_CARD_MS; // the opaque card is up: bake faster (a worker build bakes there)
+    this.buildX = p.head.x;
+    this.buildZ = p.head.z;
+    if (this.perf) this.perf.mark('world build');
+    const start = { x: p.head.x, z: p.head.z, r: this.game.rules.zoneR }, roam = this.game.roam;
+    this.scanWanted = this.scanMode === 'explicit' || (this.scanMode === 'auto' && L.state === 'open' && !L.hasHouse);
+    const snap = this.mergedSnapshot(this.snapshot);
+    this.startBuild('capture', () => this.world.buildAsync(snap, start, { roam }));
+    if (this.rec && this.rec.play) {
+      const ov = /** @type {any} */ (snap) && /** @type {any} */ (snap).scanBase ? L.overlay() : null;
+      this.rec.play.learn = { open: L.openInfo, state: L.state, scanWanted: this.scanWanted, scanMode: this.scanMode, applied: ov ? ov.counts : null, houseMs: Math.round(t - this.t0) - this.buildAtMs };
     }
     this.step = STEP.BUILD;
   }
@@ -559,13 +701,42 @@ export class PlayKit {
    */
   buildWait(_t) {
     if (!this.buildReady()) return;
-    this.finishBuild();
+    const B = this.finishBuild();
     this.world.bakeBudgetMs = BAKE_CARD_MS;
-    this.makeCard();
-    this.worldBuilt(false);
     if (this.perf) this.perf.mark('world built');
-    if (this.rec && this.rec.play) { this.rec.play.step = 'warm'; this.rec.play.world = this.worldRecord(); }
-    this.step = STEP.WARM;
+    if (this.rec && this.rec.play) {
+      this.rec.play.step = 'warm';
+      const first = this.rec.play.world;
+      this.rec.play.world = B.kind === 'scan' && first ? { ...this.worldRecord(), beforeScan: { describe: first.describe, buildMs: first.buildMs } } : this.worldRecord();
+    }
+    // the scan's build goes straight to the card (the pools were drawn in XR before the scan)
+    this.postStart(B.kind === 'scan' ? STEP.START : STEP.WARM, B.kind);
+  }
+
+  /**
+   * After a build, one frame each (v0.5: the device record showed these stacked in one frame): the card's
+   * lines, the look's rebuild for the new rooms, its light snap, the card's layout; then `next`.
+   * @param {number} next STEP @param {string} kind the build's kind ('capture', 'mode', 'scan', 'spot', 'realign', 'learn')
+   */
+  postStart(next, kind) {
+    const P = this.post;
+    P.stage = 0;
+    P.next = next;
+    P.kind = kind;
+    P.lines = kind === 'spot' ? this.builtLines : kind === 'scan' ? SCAN_BUILD_LINES : CAPTURE_LINES;
+    this.step = STEP.POST;
+  }
+
+  postStep() {
+    const P = this.post, quiet = P.kind === 'learn' || P.kind === 'realign';
+    switch (P.stage++) {
+      case 0: if (!quiet) { this.makeCard(); if (this.perf) this.perf.mark('card'); } break;
+      case 1: if (this.look) { this.look.onWorldBuilt(this.world, this.world.snapshot, { moved: P.kind === 'realign' }); if (this.perf) this.perf.mark('look rebuilt'); } break;
+      // a learned rebuild mid-session lets the lights ease (no jump without the panel)
+      case 2: if (this.look && P.kind !== 'learn') { this.look.snap(); if (this.perf) this.perf.mark('look snap'); } break;
+      case 3: if (!quiet) { P.lines = this.builtLines; if (this.perf) this.perf.mark('card layout'); } break; // laid out in this frame's ui step
+      default: this.step = P.next; break;
+    }
   }
 
   /**
@@ -688,15 +859,13 @@ export class PlayKit {
     this.buildX = z.x;
     this.buildZ = z.z;
     this.rebuilt = B.ok;
-    if (W.describe() !== this.builtLines[1]) this.makeCard();
-    this.worldBuilt(false);
     if (this.rec && this.rec.play) {
       const first = this.rec.play.world;
       this.rec.play.world = { ...this.worldRecord(), firstBuildMs: first ? first.buildMs : null,
         rebuild: { movedM: Math.round(this.spotMoved * 100) / 100, buildMs: Math.round(W.stats.buildMs * 10) / 10, waitMs: Math.round(B.waitMs),
           atMs: Math.round(t - this.t0), built: B.ok } };
     }
-    this.step = STEP.GO;
+    this.postStart(STEP.GO, 'spot');
   }
 
   /** @param {number} t */
@@ -713,6 +882,108 @@ export class PlayKit {
         r: z ? z.r : this.world.zone.r, bakeDone: this.world.bakeDone };
     }
     this.step = STEP.PLAY;
+  }
+
+  // ── the walkthrough scan (v0.5) ───────────────────────────────────────
+
+  /**
+   * The scan: a short card, then nothing in the view but the floor tint; the watch shows the rooms found and
+   * the coverage. A trigger held SCAN_HOLD_S (not on the watch) finishes it: the worker's final analysis (at
+   * most SCAN_FINAL_MS), a save, then the world built again from Space Setup + the scan, behind the card.
+   * @param {number} dt @param {number} t
+   */
+  scanStep(dt, t) {
+    const S = this.scanS, L = this.learner, I = this.ctx.input, W = this.watch, p = this.player;
+    if (!S.on) this.scanBegin(t);
+    S.ms = t - S.t0;
+    const released = !W.capture && !W.menuOpen && !!I && ((I.left && I.left.triggerUp) || (I.right && I.right.triggerUp));
+    if (S.cardUp && ((released && t - S.t0 >= CARD_MIN_MS) || t - S.t0 >= SCAN_CARD_MS)) { S.cardUp = false; S.hold = 0; }
+    if (p.valid) this.scanTint.update(p.head.x, this.world.floorY(p.head.x, p.head.z), p.head.z, dt);
+    // progress on the watch (a new result only)
+    if (L.result && L.resultSeq !== S.seenSeq) {
+      S.seenSeq = L.resultSeq;
+      const st = this._scanStatus;
+      st.rooms = L.result.rooms;
+      st.learn = L.result.coverage;
+      W.setStatus(st);
+    }
+    if (S.cardUp) return;
+    if (!S.finishing) {
+      const held = !!I && ((I.left && I.left.triggerHeld) || (I.right && I.right.triggerHeld)) && !W.capture && !W.menuOpen;
+      S.hold = held ? S.hold + dt : 0;
+      if (S.hold < SCAN_HOLD_S) return;
+      S.finishing = true;
+      S.finishAt = t;
+      S.finishSeq = L.resultSeq;
+      L.analyzeNow(t);
+      W.haptic(true, 0.6, 80);
+      if (this.perf) this.perf.mark('scan finish');
+      return;
+    }
+    if (L.resultSeq <= S.finishSeq && t - S.finishAt < SCAN_FINAL_MS) return;
+    // done: back to the silent learner's rates, saved by the worker, the world built again from the scan
+    S.on = false;
+    this.scanDone = true;
+    if (this.perf && this.perf.running && /^scan/.test(this.perf.runLabel)) this.perf.cancelRun('scan finished'); // wave 1 starts its own
+    L.setScanning(false);
+    L.save('scan');
+    this.scanTint.show(false);
+    const st = this._scanStatus;
+    st.scanning = false;
+    W.setStatus(st);
+    if (this.rec && this.rec.play) this.rec.play.scanResult = L.report().result;
+    const Wd = this.world, roam = this.game.roam;
+    const snap = this.mergedSnapshot(this.snapshot), start = { x: p.head.x, z: p.head.z, r: this.game.rules.zoneR };
+    this.buildX = p.head.x;
+    this.buildZ = p.head.z;
+    this.cardAt = -1;
+    Wd.bakeBudgetMs = BAKE_CARD_MS;
+    this.startBuild('scan', () => Wd.buildAsync(snap, start, { roam, force: true }));
+    this.step = STEP.BUILD;
+  }
+
+  /** The scan starts (its card up from this frame on). @param {number} t */
+  scanBegin(t) {
+    const S = this.scanS;
+    S.on = true; S.t0 = t; S.cardUp = true; S.hold = 0; S.finishing = false; S.seenSeq = -1;
+    this.learner.setScanning(true);
+    const st = this._scanStatus;
+    st.scanning = true; st.rooms = 0; st.learn = 0;
+    this.watch.setStatus(st);
+    this.scanTint.show(true);
+    if (this.perf) {
+      this.perf.mark('scan start');
+      if (!this.perf.running) this.perf.startRun(RUN_MS, 'scan'); // the 60 s gate applies during the scan too
+    }
+    if (this.rec && this.rec.play) this.rec.play.step = 'scan';
+    this.step = STEP.SCAN;
+  }
+
+  /**
+   * The silent learner's window (a wave break, the round over): the worker saves, and a learned result that
+   * differs from the one in the world is built in (a worker build; committed atomically, nav swapped while
+   * no enemy is alive). Never mid-fight.
+   * @param {number} t
+   */
+  learnStep(t) {
+    const B = this._bq, L = this.learner;
+    if (B.active && B.kind === 'learn') {
+      if (!this.buildReady()) return;
+      const r = this.finishBuild();
+      if (this.learnBuilds.length < 20) this.learnBuilds.push({ t: this.t0 >= 0 ? Math.round(t - this.t0) : 0, ok: r.ok, waitMs: Math.round(r.waitMs), worldMaxMs: Math.round(r.worldMaxMs * 100) / 100 });
+      this.postStart(STEP.PLAY, 'learn');
+      return;
+    }
+    if (!this.learnWindow) return;
+    this.learnWindow = false;
+    L.save('wave break');
+    const r = L.result;
+    if (!r || r.key === this.appliedKey || B.active || this.world.busy) return;
+    const g = this.game;
+    if ((g.phase !== PHASE.BREAK && g.phase !== PHASE.OVER) || this.enemies.alive() > 0) return;
+    const W = this.world, snap = this.mergedSnapshot(W.snapshot);
+    if (this.perf) this.perf.mark('learn build');
+    this.startBuild('learn', () => W.buildAsync(snap, W.start, { roam: g.roam, force: true }));
   }
 
   // ── reference-space resets, drift, realign ─────────────────────────────
@@ -734,13 +1005,15 @@ export class PlayKit {
     }
     switch (this.step) {
       case STEP.IDLE: return;
-      case STEP.CAPTURE: case STEP.BUILD: case STEP.WARM: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
+      case STEP.CAPTURE: case STEP.COPY: case STEP.HOUSE: case STEP.BUILD: case STEP.POST: case STEP.WARM: case STEP.SCAN: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
         // before the round: read the room again in the new space (the card goes back up; a build in flight is
         // superseded by the next one and its result ignored)
         if (this.game.spotting || this.game.phase !== PHASE.IDLE) this.game.stop();
         this._bq.active = false;
         this._buildSeq++;
         this.gate.reset();
+        this.capJob.active = false;
+        if (this.scanS.on) { this.scanS.on = false; this.scanTint.show(false); this.learner.setScanning(false); this.watch.setStatus({ scanning: false }); }
         this.snapshot = null;
         this.cardAt = -1;
         this.spotZone = null;
@@ -847,8 +1120,7 @@ export class PlayKit {
     else if (R.fresh) this.setDriftReference(W.snapshot, !this.fixture);
     if (W.snapshot) this.snapshot = W.snapshot;
     if (R.again) return; // another reset / drift came in meanwhile: one more build from this world (next frame)
-    this.worldBuilt(true); // the decals are cleared (they would float), the lights jump
-    this.step = STEP.REWARM;
+    this.postStart(STEP.REWARM, 'realign'); // the look follows (decals cleared, lights jump), a frame each, then the warm draw
   }
 
   /** One warm draw for the rewritten occluder, then the hold is released. @param {number} t */
@@ -874,6 +1146,7 @@ export class PlayKit {
     }
     this.realignHasM = false;
     this._rq.started = false;
+    this.learner.setFrame(this.world.snapshot); // the house frame follows the session's new coordinates
     if (this.perf) this.perf.mark('realigned');
     this.step = STEP.PLAY;
   }
@@ -1060,8 +1333,17 @@ export class PlayKit {
       };
       try { rec.play.look = this.look ? { ...this.look.report(), prep: this.lookPrep } : null; } catch (err) { rec.play.look = { error: String(err) }; }
       rec.play.enemyWarmMs = this.enemyWarmMs;
+      // v0.5: the learner (the house, the scan, the depth readbacks, hit-test, the worker, saves)
+      try {
+        rec.play.learn = { ...(rec.play.learn || {}), ...this.learner.end(), builds: this.learnBuilds.slice(), appliedKey: this.appliedKey || undefined,
+          scan: this.scanS.ms ? { ms: Math.round(this.scanS.ms), done: this.scanDone } : (this.scanWanted ? { done: this.scanDone } : undefined), tapError: this.tapError };
+      } catch (err) { rec.play.learn = { error: String(err) }; }
       try { rec.physics = this.weapons.physicsReport(); } catch (err) { rec.physics = { error: String(err) }; }
     }
+    if (!rec) this.learner.end();
+    this.scanTint.show(false);
+    this.scanS.on = false;
+    this.watch.setStatus({ scanning: false, rooms: -1, learn: -1 });
     if (this.look) this.look.reset();
     this._bq.active = false;
     this._buildSeq++;
@@ -1097,7 +1379,10 @@ export class PlayKit {
   panelLines() {
     if (this.game.spotting) return null;
     switch (this.step) {
-      case STEP.CAPTURE: case STEP.BUILD: return CAPTURE_LINES;
+      case STEP.CAPTURE: case STEP.COPY: case STEP.HOUSE: return CAPTURE_LINES;
+      case STEP.BUILD: return this._bq.kind === 'scan' ? SCAN_BUILD_LINES : this._bq.kind === 'learn' ? null : CAPTURE_LINES;
+      case STEP.POST: return this.post.kind === 'learn' || this.post.kind === 'realign' ? null : this.post.lines;
+      case STEP.SCAN: return this.scanS.cardUp ? SCAN_LINES : null;
       case STEP.WARM: case STEP.START: case STEP.REBUILD: return this.builtLines;
       case STEP.GO: return this.rebuilt ? this.builtLines : null;
       default: return null; // IDLE, SPOT (game.spotting), PLAY, REALIGN, REWARM
@@ -1105,7 +1390,11 @@ export class PlayKit {
   }
 
   /** True once the round runs (GameSession shows its own messages). */
-  get playing() { return (this.step === STEP.PLAY || this.step === STEP.REALIGN || this.step === STEP.REWARM) && this.game.phase !== PHASE.IDLE; }
+  get playing() {
+    const s = this.step;
+    return (s === STEP.PLAY || s === STEP.REALIGN || s === STEP.REWARM || (s === STEP.POST && (this.post.kind === 'learn' || this.post.kind === 'realign')))
+      && this.game.phase !== PHASE.IDLE;
+  }
 }
 
 /** @param {Float64Array} m set to the identity (column-major 4×4) */

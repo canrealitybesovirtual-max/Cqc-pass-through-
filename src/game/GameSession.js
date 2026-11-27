@@ -1,6 +1,6 @@
 // @ts-check
 import * as THREE from 'three';
-import { CanvasPanel } from '../ui/CanvasPanel.js';
+import { GlyphPanel } from '../ui/GlyphPanel.js';
 import { MSG, PAUSE, PHASE, PHASE_NAME, RULES, SurvivalRules } from './Rules.js';
 import { claimUpload } from './UploadGate.js';
 import { PAUSE_NAMES, SAFETY, VIOLATION, VIOLATION_NAMES, pauseName } from '../safety/PauseManager.js';
@@ -31,7 +31,7 @@ import { CUE_NAMES, IN, RoamSafety } from '../safety/RoamSafety.js';
  * - the damage tint: ONE full-view quad 15 cm ahead of the eyes (beyond the
  *   10 cm depth-sensing near plane), always `transparent`, opacity ≤ 0.3 for
  *   ≤ 0.3 s, stronger at the edges (PLAN §5: never cover the view);
- * - the floating message panel (CanvasPanel, tag-along).
+ * - the floating message panel (GlyphPanel, tag-along; v0.5: from the glyph atlas, no texture upload).
  *
  * Safety (src/safety/, gap audit S1–S8):
  * - every pause goes through the rules' PauseManager (`rules.pm`): the zone,
@@ -264,7 +264,8 @@ export class GameSession {
     this._tintT = 0;
     this._tintPeak = 0;
 
-    this.panel = new CanvasPanel({ width: 512, height: 128, worldWidth: 0.42 });
+    // v0.5: laid out from the shared glyph atlas: a message change is never a texture upload
+    this.panel = new GlyphPanel({ width: 512, height: 128, worldWidth: 0.42, capacity: 200, name: 'game-message' });
     this.panel.mesh.name = 'game-message';
     this.panel.mesh.visible = false;
     // hidden while the head moves (walking back to the spot): never cover the view while moving (S8)

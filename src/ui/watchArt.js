@@ -14,14 +14,19 @@
  * - the FACE atlas (1024×512, drawn once, mipmapped): dial on the left half,
  *   bezel insert on the right half, flat colour patches for the hands in the
  *   dial square's corners (outside the dial circle);
- * - the READOUTS atlas (256×128 at 10 px/mm, redrawn on change, no mipmaps):
- *   the health, ammo and wave windows and the mode and info lines;
- * - the MENU disc (512² = 0.16 m, redrawn on change, no mipmaps).
+ * - v0.5: the READOUTS (256×128 virtual px at 10 px/mm) and the MENU disc
+ *   (512² virtual px = 0.16 m) are no longer canvases redrawn in play: their
+ *   glyphs and pieces (paper windows, icons, pill caps) are drawn once at load
+ *   into the shared glyph atlas (`registerWatchArt`), and `layoutReadouts` /
+ *   `layoutMenu` place them on a GlyphBoard (src/ui/Glyphs.js): no texture
+ *   upload during play. The menu disc's background (gradient, minute track)
+ *   is a static canvas drawn once (`drawMenuBackground`).
  *
- * Nothing is formatted while drawing: numbers come from cached strings
+ * Nothing is formatted while laying out: numbers come from cached strings
  * (watchLogic numStr/degStr/mmStr) and labels are constants.
  */
 import { numStr, degStr, mmStr, MENU_PX, PAGE, PAGE_ROWS, ROW, isValueRow, rowRect, INFO, WARN, WARN_WORDS } from './watchLogic.js';
+import { ALIGN, DIGITS, TEXT_CHARS, hex } from './Glyphs.js';
 
 export const SERIF = '"Noto Serif", "DejaVu Serif", Georgia, "Times New Roman", serif';
 export const SANS = 'Roboto, Inter, "Helvetica Neue", Arial, sans-serif';
@@ -393,91 +398,117 @@ const MODE_WORD = ['', 'SAFE', 'SEMI', 'AUTO'];
 const MODE_COLOR = ['#e8e6de', '#ffc061', '#ecebe4', '#ff4a36'];
 const STATE_WORD = ['', 'READY', '', 'BREAK', 'PAUSED', 'DOWN', 'SCAN', 'SPOT'];
 const STATE_COLOR = ['#cfcabd', '#8fd3ff', '#cfcabd', '#7ee29b', '#ffc061', '#ff5a4f', '#8fd3ff', '#8fd3ff'];
+const MODE_RGB = MODE_COLOR.map(hex);
+const STATE_RGB = STATE_COLOR.map(hex);
 const PCT = /** @type {string[]} */ ([]);
 for (let i = 0; i <= 100; i++) PCT.push(`SCAN ${i}%`);
 
 /**
- * @param {C2D} c the 256×128 readout context
- * @param {Int32Array} n codes (RC)
+ * The glyph-atlas entries of the watch (fonts and stamps), registered once at load. Returns the indices the
+ * layouts use. Fonts carry only the characters they print (the dial's big numerals: digits).
+ * @param {import('./Glyphs.js').GlyphAtlas} A
  */
-export function drawReadouts(c, n) {
-  c.clearRect(0, 0, READ.w, READ.h);
-  c.textAlign = 'center';
-  c.textBaseline = 'middle';
+export function registerWatchArt(A) {
+  const f = {
+    health: A.addFont('w.health', F_HEALTH, DIGITS), ammo: A.addFont('w.ammo', F_AMMO, DIGITS), wave: A.addFont('w.wave', F_WAVE, DIGITS),
+    mode: A.addFont('w.mode', F_MODE, 'SAFEMIUTO '), gun: A.addFont('w.gun', F_GUN, 'G17AKM '), info: A.addFont('w.info', F_INFO, TEXT_CHARS),
+    row: A.addFont('m.row', F_ROW, TEXT_CHARS), val: A.addFont('m.val', F_VAL, TEXT_CHARS), s1: A.addFont('m.s1', F_STRIP1, TEXT_CHARS),
+    s2: A.addFont('m.s2', F_STRIP2, TEXT_CHARS), s3: A.addFont('m.s3', F_STRIP3, TEXT_CHARS), sign: A.addFont('m.sign', F_SIGN, '−+ '),
+  };
+  /** @type {Record<string, number>} */ const paperOf = {};
+  for (const k of ['health', 'ammo', 'wave']) {
+    const R = /** @type {any} */ (READ)[k];
+    paperOf[k] = A.addStamp(`w.paper.${k}`, R.w, R.h, (c, x, y) => paper(c, { x, y, w: R.w, h: R.h }));
+  }
+  const dot = A.addStamp('w.dot', 11, 11, (c, x, y) => { c.beginPath(); c.arc(x + 5.5, y + 5.5, 4.5, 0, Math.PI * 2); c.fillStyle = '#ffffff'; c.fill(); });
+  const ring = A.addStamp('w.ring', 11, 11, (c, x, y) => { c.beginPath(); c.arc(x + 5.5, y + 5.5, 4.5, 0, Math.PI * 2); c.lineWidth = 1.5; c.strokeStyle = '#ffffff'; c.stroke(); });
+  /** @type {number[]} */ const icons = [];
+  for (let k = 0; k < WARN_WORDS.length; k++) icons.push(A.addStamp(`w.warn.${k}`, 28, 28, (c, x, y) => warnIcon(c, k, x + 14, y + 14, '#ffffff')));
+  // menu pills: the dark body and the outline (white, tinted per row), 3-slice (caps + a stretched middle)
+  const H = MENU_PX.rowH, PW = 2 * H + 8;
+  const body = A.addStamp('m.pill.body', PW, H, (c, x, y) => pillPath(c, x, y, x + PW, y + H, '#171b20', '', 0));
+  const line2 = A.addStamp('m.pill.l2', PW, H, (c, x, y) => pillPath(c, x + 1, y + 1, x + PW - 1, y + H - 1, '', '#ffffff', 2));
+  const line3 = A.addStamp('m.pill.l3', PW, H, (c, x, y) => pillPath(c, x + 1.5, y + 1.5, x + PW - 1.5, y + H - 1.5, '', '#ffffff', 3));
+  return { f, paper: paperOf, dot, ring, icons, pill: { body, line2, line3, w: PW, h: H } };
+}
+
+/** @typedef {ReturnType<typeof registerWatchArt>} WatchArt */
+
+const C_INK = hex(INK), C_AMBER = hex(AMBER), C_RED = hex(RED);
+const C_BAR = hex('#2f8a4c'), C_CHAMBER = hex('#1a7a3c'), C_RING = hex('#8a8d90'), C_GUN = hex('#d7d4cb');
+const C_SCAN = hex('#1d4f91'), C_WARN = hex('#ffb347'), C_SEVERE = hex('#ff5a4f'), C_PCT = hex('#8fd3ff'), C_HINT = hex('#9db3c6');
+const C_KILLS = hex('#ecebe4'), C_KILLS2 = hex('#bdb8aa');
+
+/**
+ * The dial's readouts on a glyph board (virtual 256×128 px, regions mapped onto the dial by the caller's
+ * `frame` per region): health on a white wheel with a level bar, rounds + chamber dot, the wave (rooms found
+ * while scanning, blue), the fire mode, one info line. Allocation-free.
+ * @param {import('./Glyphs.js').GlyphBoard} B the board, with mapping i (B.setFrame) placing READ_REGIONS[i] on the dial
+ * @param {WatchArt} W @param {Int32Array} n codes (RC)
+ */
+export function layoutReadouts(B, W, n) {
+  B.begin();
+  const F = W.f;
   // 12 o'clock: health on a white wheel, with a level bar
   let R = READ.health;
-  paper(c, R);
+  B.useFrame(0);
+  B.stamp(W.paper.health, R.x, R.y, R.w, R.h);
   const h = n[RC.HEALTH];
-  const hc = h >= 60 ? INK : h >= 30 ? AMBER : RED;
-  c.font = F_HEALTH;
-  c.fillStyle = hc;
-  c.fillText(numStr(h), R.x + R.w / 2, R.y + R.h / 2 - 1);
-  const bw = ((R.w - 16) * Math.max(0, Math.min(100, h))) / 100;
-  c.fillStyle = h >= 60 ? '#2f8a4c' : hc;
-  c.fillRect(R.x + 8, R.y + R.h - 6, bw, 3);
+  const hc = h >= 60 ? C_INK : h >= 30 ? C_AMBER : C_RED;
+  B.text(F.health, numStr(h), R.x + (R.w >> 1), R.y + (R.h >> 1) - 1, ALIGN.CENTER, hc);
+  const bw = (((R.w - 16) * Math.max(0, Math.min(100, h))) / 100) | 0;
+  B.fill(R.x + 8, R.y + R.h - 6, bw, 3, h >= 60 ? C_BAR : hc);
   // 3 o'clock, under the cyclops: rounds in the magazine (+ the chamber dot)
   R = READ.ammo;
-  paper(c, R);
+  B.useFrame(1);
+  B.stamp(W.paper.ammo, R.x, R.y, R.w, R.h);
   if (n[RC.AMMO_ON] && n[RC.WEAPON]) {
     const mag = n[RC.MAG];
-    c.font = F_AMMO;
-    c.fillStyle = mag < 0 ? AMBER : mag === 0 ? RED : INK;
-    c.fillText(mag < 0 ? '--' : numStr(mag), R.x + R.w / 2 - 4, R.y + R.h / 2 + 1);
-    c.beginPath();
-    c.arc(R.x + R.w - 7, R.y + R.h - 9, 4.5, 0, Math.PI * 2);
-    if (n[RC.CHAMBER]) { c.fillStyle = '#1a7a3c'; c.fill(); } else { c.lineWidth = 1.5; c.strokeStyle = '#8a8d90'; c.stroke(); }
+    B.text(F.ammo, mag < 0 ? '--' : numStr(mag), R.x + (R.w >> 1) - 4, R.y + (R.h >> 1) + 1, ALIGN.CENTER, mag < 0 ? C_AMBER : mag === 0 ? C_RED : C_INK);
+    if (n[RC.CHAMBER]) B.stamp(W.dot, R.x + R.w - 13, R.y + R.h - 15, 11, 11, C_CHAMBER);
+    else B.stamp(W.ring, R.x + R.w - 13, R.y + R.h - 15, 11, 11, C_RING);
   }
   // 9 o'clock: wave number, or rooms found while scanning (blue)
   R = READ.wave;
-  paper(c, R);
+  B.useFrame(2);
+  B.stamp(W.paper.wave, R.x, R.y, R.w, R.h);
   const scanning = n[RC.SCANNING] !== 0;
   const wv = scanning ? n[RC.ROOMS] : n[RC.WAVE];
-  if (wv > 0) {
-    c.font = F_WAVE;
-    c.fillStyle = scanning ? '#1d4f91' : INK;
-    c.fillText(numStr(wv), R.x + R.w / 2, R.y + R.h / 2 + 1);
-  }
+  if (wv > 0) B.text(F.wave, numStr(wv), R.x + (R.w >> 1), R.y + (R.h >> 1) + 1, ALIGN.CENTER, scanning ? C_SCAN : C_INK);
   // 6 o'clock upper: fire mode (AKM) or the pistol's name
   R = READ.mode;
+  B.useFrame(3);
   const wc = n[RC.WEAPON];
   if (n[RC.AMMO_ON] && wc) {
     const md = n[RC.MODE];
-    if (wc === 2 && md) {
-      c.font = F_MODE;
-      c.fillStyle = MODE_COLOR[md];
-      c.fillText(MODE_WORD[md], R.x + R.w / 2, R.y + R.h / 2 + 1);
-    } else {
-      c.font = F_GUN;
-      c.fillStyle = '#d7d4cb';
-      c.fillText(wc === 1 ? 'G17' : 'AKM', R.x + R.w / 2, R.y + R.h / 2 + 1);
-    }
+    if (wc === 2 && md) B.text(F.mode, MODE_WORD[md], R.x + (R.w >> 1), R.y + (R.h >> 1) + 1, ALIGN.CENTER, MODE_RGB[md]);
+    else B.text(F.gun, wc === 1 ? 'G17' : 'AKM', R.x + (R.w >> 1), R.y + (R.h >> 1) + 1, ALIGN.CENTER, C_GUN);
   }
   // 6 o'clock lower: one line of info (warning > state > scan > hint > kills)
   R = READ.info;
-  const cxI = R.x + R.w / 2, cyI = R.y + R.h / 2 + 1;
-  c.font = F_INFO;
+  B.useFrame(4);
+  const cxI = R.x + (R.w >> 1), cyI = R.y + (R.h >> 1) + 1;
   const info = n[RC.INFO];
   if (info === INFO.WARN) {
     const k = n[RC.WARN];
-    const col = n[RC.SEVERE] ? '#ff5a4f' : '#ffb347';
-    warnIcon(c, k, cxI - 46, cyI, col);
-    c.fillStyle = col;
-    c.textAlign = 'left';
-    fit(c, WARN_WORDS[k] || '', cxI - 30, cyI, 86);
-    c.textAlign = 'center';
+    const col = n[RC.SEVERE] ? C_SEVERE : C_WARN;
+    if (k >= 0 && k < W.icons.length) B.stamp(W.icons[k], cxI - 46 - 14, cyI - 14, 28, 28, col);
+    B.text(F.info, WARN_WORDS[k] || '', cxI - 30, cyI, ALIGN.LEFT, col, 86);
   } else if (info === INFO.STATE) {
-    const s = n[RC.STATE];
-    c.fillStyle = STATE_COLOR[s];
-    fit(c, STATE_WORD[s], cxI, cyI, 110);
+    const st = n[RC.STATE];
+    B.text(F.info, STATE_WORD[st], cxI, cyI, ALIGN.CENTER, STATE_RGB[st], 110);
   } else if (info === INFO.SCAN) {
-    c.fillStyle = '#8fd3ff';
-    fit(c, PCT[Math.max(0, Math.min(100, n[RC.LEARN]))], cxI, cyI, 110);
+    B.text(F.info, PCT[Math.max(0, Math.min(100, n[RC.LEARN]))], cxI, cyI, ALIGN.CENTER, C_PCT, 110);
   } else if (info === INFO.HINT) {
-    c.fillStyle = '#9db3c6';
-    fit(c, 'TAP · MENU', cxI, cyI, 110);
+    B.text(F.info, 'TAP · MENU', cxI, cyI, ALIGN.CENTER, C_HINT, 110);
   } else if (info === INFO.KILLS) {
-    pair(c, numStr(n[RC.KILLS]), ' KILLS', cxI, cyI, '#ecebe4', '#bdb8aa');
+    const a = numStr(n[RC.KILLS]);
+    const wa = B.measure(F.info, a), wb = B.measure(F.info, ' KILLS');
+    const x0 = cxI - ((wa + wb) >> 1);
+    B.text(F.info, a, x0, cyI, ALIGN.LEFT, C_KILLS);
+    B.text(F.info, ' KILLS', x0 + wa, cyI, ALIGN.LEFT, C_KILLS2);
   }
+  B.end();
 }
 
 /**
@@ -492,36 +523,6 @@ function paper(c, R) {
   g.addColorStop(1, 'rgba(0,0,0,0)');
   c.fillStyle = g;
   c.fillRect(R.x, R.y, R.w, 7);
-}
-
-/**
- * Text squeezed horizontally when wider than `max` (no allocation besides the
- * canvas's own measureText result).
- * @param {C2D} c @param {string} s @param {number} x @param {number} y @param {number} max
- */
-function fit(c, s, x, y, max) {
-  const w = c.measureText(s).width;
-  if (w <= max) { c.fillText(s, x, y); return; }
-  c.save();
-  c.translate(x, y);
-  c.scale(max / w, 1);
-  c.fillText(s, 0, 0);
-  c.restore();
-}
-
-/**
- * Two strings centred as one ("12" + " KILLS") without concatenating.
- * @param {C2D} c @param {string} a @param {string} b @param {number} x @param {number} y @param {string} ca @param {string} cb
- */
-function pair(c, a, b, x, y, ca, cb) {
-  const wa = c.measureText(a).width, wb = c.measureText(b).width;
-  const x0 = x - (wa + wb) / 2;
-  c.textAlign = 'left';
-  c.fillStyle = ca;
-  c.fillText(a, x0, y);
-  c.fillStyle = cb;
-  c.fillText(b, x0 + wa, y);
-  c.textAlign = 'center';
 }
 
 /**
@@ -567,15 +568,14 @@ const ROW_LABEL = ['RESUME', 'RESTART', 'DIFFICULTY', 'MODE', 'GUN FIT', 'AMMO L
   'GUN', 'PITCH', 'HEIGHT', 'FORWARD', 'SAVE', 'RESET', 'BACK'];
 const ROW_COLOR = ['#9ff0c8', '#e8edf2', '#e8edf2', '#e8edf2', '#e8edf2', '#e8edf2', '#ffb0a0',
   '#e8edf2', '#e8edf2', '#e8edf2', '#e8edf2', '#9ff0c8', '#e8edf2', '#e8edf2'];
+const ROW_RGB = ROW_COLOR.map(hex);
 const _rr = { x0: 0, x1: 0, y0: 0, y1: 0 };
 
 /**
- * The menu disc: a status strip at the top, then seven pill rows.
+ * The menu disc's static background (drawn once at load: never redrawn): the gradient disc and the minute track.
  * @param {C2D} c 512² context
- * @param {Int32Array} n codes (RC, menu entries included)
- * @param {number} fitPitchDeg @param {number} fitUp @param {number} fitFwd the selected gun's fit values
  */
-export function drawMenu(c, n, fitPitchDeg, fitUp, fitFwd) {
+export function drawMenuBackground(c) {
   const M = MENU_PX, cx = M.c;
   c.fillStyle = '#000';
   c.fillRect(0, 0, M.size, M.size);
@@ -598,52 +598,46 @@ export function drawMenu(c, n, fitPitchDeg, fitUp, fitFwd) {
     c.lineTo(cx + s * 249, cx - co * 249);
     c.stroke();
   }
+}
+
+const C_STRIP = hex('#ecebe4'), C_LABEL = hex('#9db3c6'), C_SEP = hex('#59606a'), C_SIGN = hex('#e8edf2'), C_VLABEL = hex('#c5ccd4');
+const C_VAL = hex('#9ff0c8'), C_PEND = hex('#ff8466'), C_ACTIVE = hex('#8cffd7'), C_PILL = hex('#343c46');
+const C_HL = hex('#ffc061');
+
+/**
+ * The menu disc's dynamic part on a glyph board (virtual 512² px; the background is the static disc):
+ * a status strip at the top, then seven pill rows. Allocation-free.
+ * @param {import('./Glyphs.js').GlyphBoard} B @param {WatchArt} W @param {Int32Array} n codes (RC, menu entries included)
+ * @param {number} fitPitchDeg @param {number} fitUp @param {number} fitFwd the selected gun's fit values
+ */
+export function layoutMenu(B, W, n, fitPitchDeg, fitUp, fitFwd) {
+  const M = MENU_PX, cx = M.c, F = W.f;
+  B.begin();
   const page = n[RC.PAGE];
-  c.textBaseline = 'middle';
-  c.textAlign = 'center';
   if (page === PAGE.FIT) {
-    c.font = F_STRIP1;
-    c.fillStyle = '#ecebe4';
-    c.fillText(n[RC.FIT_W] === 1 ? 'GUN FIT · AKM' : 'GUN FIT · GLOCK', cx, 74);
-    c.font = F_STRIP2;
-    c.fillStyle = '#9db3c6';
-    c.fillText('right stick ↕ adjusts the green line', cx, 104);
-  } else strip(c, n);
+    B.text(F.s1, n[RC.FIT_W] === 1 ? 'GUN FIT · AKM' : 'GUN FIT · GLOCK', cx, 74, ALIGN.CENTER, C_STRIP);
+    B.text(F.s2, 'right stick ↕ adjusts the green line', cx, 104, ALIGN.CENTER, C_LABEL);
+  } else strip(B, F, n);
   const rows = PAGE_ROWS[page] || PAGE_ROWS[0];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     rowRect(i, _rr);
     const pending = n[RC.CONFIRM] === row;
     const active = page === PAGE.FIT && isValueRow(row) && n[RC.FIT_F] === row - ROW.PITCH;
-    pill(c, _rr, pending ? '#ff8466' : active ? '#8cffd7' : '#343c46', pending || active ? 3 : 2);
-    const ym = (_rr.y0 + _rr.y1) / 2 + 1;
+    pill(B, W, _rr, pending ? C_PEND : active ? C_ACTIVE : C_PILL, pending || active ? 3 : 2);
+    const ym = ((_rr.y0 + _rr.y1) >> 1) + 1;
     if (isValueRow(row)) {
-      c.font = F_SIGN;
-      c.fillStyle = '#e8edf2';
-      c.textAlign = 'center';
-      c.fillText('−', _rr.x0 + 26, ym);
-      c.fillText('+', _rr.x1 - 26, ym);
-      c.font = F_ROW;
-      c.textAlign = 'right';
-      c.fillStyle = '#c5ccd4';
-      c.fillText(ROW_LABEL[row], cx - 6, ym);
-      c.textAlign = 'left';
-      c.fillStyle = '#9ff0c8';
-      c.fillText(row === ROW.PITCH ? degStr(fitPitchDeg) : row === ROW.HEIGHT ? mmStr(fitUp) : mmStr(fitFwd), cx + 8, ym);
+      B.text(F.sign, '−', _rr.x0 + 26, ym, ALIGN.CENTER, C_SIGN);
+      B.text(F.sign, '+', _rr.x1 - 26, ym, ALIGN.CENTER, C_SIGN);
+      B.text(F.row, ROW_LABEL[row], cx - 6, ym, ALIGN.RIGHT, C_VLABEL);
+      B.text(F.row, row === ROW.PITCH ? degStr(fitPitchDeg) : row === ROW.HEIGHT ? mmStr(fitUp) : mmStr(fitFwd), cx + 8, ym, ALIGN.LEFT, C_VAL);
       continue;
     }
-    c.font = F_ROW;
-    c.textAlign = 'left';
-    c.fillStyle = pending ? '#ff8466' : ROW_COLOR[row];
-    c.fillText(pending ? 'TAP AGAIN' : ROW_LABEL[row], _rr.x0 + 20, ym);
+    B.text(F.row, pending ? 'TAP AGAIN' : ROW_LABEL[row], _rr.x0 + 20, ym, ALIGN.LEFT, pending ? C_PEND : ROW_RGB[row]);
     const v = rowValue(row, n);
-    if (v) {
-      c.font = F_VAL;
-      c.textAlign = 'right';
-      c.fillStyle = '#9ff0c8';
-      c.fillText(v, _rr.x1 - 20, ym);
-    }
+    if (v) B.text(F.val, v, _rr.x1 - 20, ym, ALIGN.RIGHT, C_VAL);
   }
+  B.end();
 }
 
 /**
@@ -665,85 +659,85 @@ function rowValue(row, n) {
 
 /**
  * Status strip: "HEALTH 100 · 17+1 SEMI" and "WAVE 3 · 12 KILLS" (+ the house line when learning).
- * @param {C2D} c @param {Int32Array} n
+ * @param {import('./Glyphs.js').GlyphBoard} B @param {WatchArt['f']} F @param {Int32Array} n
  */
-function strip(c, n) {
+function strip(B, F, n) {
   const cx = MENU_PX.c;
-  c.font = F_STRIP1;
   runReset();
   const h = n[RC.HEALTH];
-  runAdd('HEALTH ', '#9db3c6');
-  runAdd(numStr(h), h >= 60 ? '#ecebe4' : h >= 30 ? '#ffc061' : '#ff5a4f');
+  runAdd('HEALTH ', C_LABEL);
+  runAdd(numStr(h), h >= 60 ? C_STRIP : h >= 30 ? C_HL : C_SEVERE);
   if (n[RC.WEAPON]) {
-    runAdd('  ·  ', '#59606a');
+    runAdd('  ·  ', C_SEP);
     const mag = n[RC.MAG];
-    runAdd(mag < 0 ? '--' : numStr(mag), mag < 0 ? '#ffc061' : '#ecebe4');
-    runAdd(n[RC.CHAMBER] ? '+1' : '+0', '#9db3c6');
+    runAdd(mag < 0 ? '--' : numStr(mag), mag < 0 ? C_HL : C_STRIP);
+    runAdd(n[RC.CHAMBER] ? '+1' : '+0', C_LABEL);
     const md = n[RC.MODE];
-    if (n[RC.WEAPON] === 2 && md) { runAdd(' ', '#000'); runAdd(MODE_WORD[md], MODE_COLOR[md]); }
+    if (n[RC.WEAPON] === 2 && md) { runAdd(' ', 0); runAdd(MODE_WORD[md], MODE_RGB[md]); }
   }
-  runDraw(c, cx, 70);
-  c.font = F_STRIP2;
+  runDraw(B, F.s1, cx, 70);
   runReset();
-  runAdd('WAVE ', '#9db3c6');
-  runAdd(numStr(n[RC.WAVE]), '#ecebe4');
-  runAdd('  ·  ', '#59606a');
-  runAdd(numStr(n[RC.KILLS]), '#ecebe4');
-  runAdd(' KILLS', '#9db3c6');
+  runAdd('WAVE ', C_LABEL);
+  runAdd(numStr(n[RC.WAVE]), C_STRIP);
+  runAdd('  ·  ', C_SEP);
+  runAdd(numStr(n[RC.KILLS]), C_STRIP);
+  runAdd(' KILLS', C_LABEL);
   if (n[RC.SPARES] >= 0) {
-    runAdd('  ·  ', '#59606a');
-    runAdd(numStr(n[RC.SPARES]), '#ecebe4');
-    runAdd(' MAGS', '#9db3c6');
+    runAdd('  ·  ', C_SEP);
+    runAdd(numStr(n[RC.SPARES]), C_STRIP);
+    runAdd(' MAGS', C_LABEL);
   }
-  runDraw(c, cx, 97);
+  runDraw(B, F.s2, cx, 97);
   if (n[RC.LEARN] >= 0 || n[RC.ROOMS] >= 0) {
     runReset();
-    runAdd('HOUSE ', '#9db3c6');
-    if (n[RC.LEARN] >= 0) { runAdd(numStr(n[RC.LEARN]), '#8fd3ff'); runAdd('%', '#8fd3ff'); }
-    if (n[RC.ROOMS] >= 0) { runAdd('  ·  ', '#59606a'); runAdd(numStr(n[RC.ROOMS]), '#8fd3ff'); runAdd(' ROOMS', '#9db3c6'); }
-    c.font = F_STRIP3;
-    runDraw(c, cx, 116);
+    runAdd('HOUSE ', C_LABEL);
+    if (n[RC.LEARN] >= 0) { runAdd(numStr(n[RC.LEARN]), C_PCT); runAdd('%', C_PCT); }
+    if (n[RC.ROOMS] >= 0) { runAdd('  ·  ', C_SEP); runAdd(numStr(n[RC.ROOMS]), C_PCT); runAdd(' ROOMS', C_LABEL); }
+    runDraw(B, F.s3, cx, 116);
   }
 }
 
-// A run of coloured strings drawn centred as one line (fixed scratch, no arrays per draw).
+// A run of coloured strings laid out centred as one line (fixed scratch, no arrays per layout).
 const RUN_S = /** @type {string[]} */ (new Array(16).fill(''));
-const RUN_C = /** @type {string[]} */ (new Array(16).fill(''));
+const RUN_C = new Int32Array(16);
 let runN = 0;
 function runReset() { runN = 0; }
-/** @param {string} s @param {string} col */
+/** @param {string} s @param {number} col */
 function runAdd(s, col) { if (runN < 16) { RUN_S[runN] = s; RUN_C[runN] = col; runN++; } }
-/** @param {C2D} c @param {number} cx @param {number} y */
-function runDraw(c, cx, y) {
+/** @param {import('./Glyphs.js').GlyphBoard} B @param {number} f @param {number} cx @param {number} y */
+function runDraw(B, f, cx, y) {
   let w = 0;
-  for (let i = 0; i < runN; i++) w += c.measureText(RUN_S[i]).width;
-  let x = cx - w / 2;
-  c.textAlign = 'left';
-  for (let i = 0; i < runN; i++) {
-    c.fillStyle = RUN_C[i];
-    c.fillText(RUN_S[i], x, y);
-    x += c.measureText(RUN_S[i]).width;
-  }
-  c.textAlign = 'center';
+  for (let i = 0; i < runN; i++) w += B.measure(f, RUN_S[i]);
+  let x = cx - (w >> 1);
+  for (let i = 0; i < runN; i++) x += B.text(f, RUN_S[i], x, y, ALIGN.LEFT, RUN_C[i]);
 }
 
 /**
- * @param {C2D} c @param {{ x0: number, x1: number, y0: number, y1: number }} r @param {string} stroke @param {number} lw
+ * A row's pill: the dark body and the outline, each as caps + a stretched middle.
+ * @param {import('./Glyphs.js').GlyphBoard} B @param {WatchArt} W @param {{ x0: number, x1: number, y0: number, y1: number }} r
+ * @param {number} stroke @param {number} lw
  */
-function pill(c, r, stroke, lw) {
-  const h = r.y1 - r.y0, rad = h / 2;
+function pill(B, W, r, stroke, lw) {
+  const P = W.pill, cap = ((r.y1 - r.y0) >> 1) + 2;
+  B.slice3(P.body, r.x0, r.y0, r.x1, r.y1, cap, 0xffffff);
+  B.slice3(lw >= 3 ? P.line3 : P.line2, r.x0, r.y0, r.x1, r.y1, cap, stroke);
+}
+
+/**
+ * A pill path filled and / or stroked (atlas drawing, load time).
+ * @param {C2D} c @param {number} x0 @param {number} y0 @param {number} x1 @param {number} y1 @param {string} fill @param {string} stroke @param {number} lw
+ */
+function pillPath(c, x0, y0, x1, y1, fill, stroke, lw) {
+  const rad = (y1 - y0) / 2;
   c.beginPath();
-  c.moveTo(r.x0 + rad, r.y0);
-  c.lineTo(r.x1 - rad, r.y0);
-  c.arc(r.x1 - rad, r.y0 + rad, rad, -Math.PI / 2, Math.PI / 2);
-  c.lineTo(r.x0 + rad, r.y1);
-  c.arc(r.x0 + rad, r.y0 + rad, rad, Math.PI / 2, Math.PI * 1.5);
+  c.moveTo(x0 + rad, y0);
+  c.lineTo(x1 - rad, y0);
+  c.arc(x1 - rad, y0 + rad, rad, -Math.PI / 2, Math.PI / 2);
+  c.lineTo(x0 + rad, y1);
+  c.arc(x0 + rad, y0 + rad, rad, Math.PI / 2, Math.PI * 1.5);
   c.closePath();
-  c.fillStyle = '#171b20';
-  c.fill();
-  c.lineWidth = lw;
-  c.strokeStyle = stroke;
-  c.stroke();
+  if (fill) { c.fillStyle = fill; c.fill(); }
+  if (stroke) { c.lineWidth = lw; c.strokeStyle = stroke; c.stroke(); }
 }
 
 /** Every string the dial and menu can print (tests check there is no brand name). */

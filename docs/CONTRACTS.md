@@ -25,6 +25,13 @@ Read first: `CLAUDE.md`, `docs/PLAN.md` (§5, §8–10, §14), `docs/ARCHITECTUR
 - **World:** `NAV_HIDDEN` (nav flag 2048, `nav.isHidden(x, z)`) marks unscanned space: door pockets, and rooms behind the real walls. `layout.curtains` holds the depth-only door curtains. They are drawn after the boxes in the box occluder while `world.curtainsOn`, which `world.update` sets from `ctx.player.head`. `world.report().hidden` gives `{ rooms, curtains, pocketCells }`, and `doors[].curtain` is reported too. Floor heights come from the scan where it covers them (`meshStats.floorFix`). Where floors overlap, the smallest polygon wins.
 - **Enemies:** `ENEMY.heightMin` / `heightMax` (1.70 / 1.85 m). Each spawn sets `Animator.k`, `EnemyRig.setScale(k)` and `Hitbox.k`. `stats.heightMin` / `heightMax` go in the record. The Brain never sees or shoots from `NAV_HIDDEN` cells, and never picks an engagement point there, while `world.curtainsOn`.
 
+**v0.5 changes** (details in DECISIONS.md):
+- **Session steps:** CAPTURE → COPY (the capture over frames) → HOUSE (the learner opens the house) → BUILD → POST (one frame each: card, look, snap, layout) → WARM → [SCAN] → START → … `rec.play.capture.ms`, `rec.play.learn`, `rec.play.scanResult`.
+- **Learner** (`src/learn/`): `new Learner({ client, tap, hits })`; `begin({ session, space, liveDepth })`, `open(snapshot)`, `update(t, frame, space, head, input, perf)` in the world step, `setScanning`, `analyzeNow`, `save(reason)`, `overlay()`, `setFrame(snapshot)` after a realign, `end()` → `rec.play.learn`. `applyScan(snapshot, overlay)` is the only way learned data reaches the world (`scanBase`, `scanWalked` on the snapshot; `normalizeSnapshot` and `transformSnapshot` keep them).
+- **Depth:** play requests `depth-sensing` (App `cfg.learn`); `LiveDepth.shareWithThree` is false in play unless `cfg.depth`; DepthTap reads through `liveDepth._orig`.
+- **UI:** `GlyphPanel` (same interface as CanvasPanel: `setLines`, `flush`, `follow`, `mesh`, `lines`, `shown`, `placed`) for GameSession's messages and App's play card (`app.card`); the watch's `readTexts` / `menuTexts` give the strings shown (tests).
+- **PerfMonitor:** `lastCpu`, `sessionReport()`, hitch entries with `late`, `prev`, `prevCpu`, `prevInterval`, `next`, `markerAgeMs`, `exportHitches().gaps`.
+
 ## Rules for every module
 
 - **Ownership.** Each builder writes **only its own directories** (see "Ownership" at the end). You may read anything. If you need something from another module, code against the interface in this file. Never edit another module's files.

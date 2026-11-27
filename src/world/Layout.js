@@ -97,7 +97,7 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
  * @typedef {{ floors: Floor[], ceilings: Ceiling[], walls: Wall[], doors: Door[], boxes: Box[], furniture: Box[],
  *   floorRef: number, floorY0: number, ceilingY: number, virtual: boolean, partialVirtual: boolean,
  *   bounds: { x0: number, x1: number, z0: number, z1: number }, notes: string[],
- *   mappedFloors: number, inferredWalls: number, pockets: number, curtains?: Box[] }} Layout
+ *   mappedFloors: number, inferredWalls: number, pockets: number, curtains?: Box[], scanWalked?: number[][]|null }} Layout
  *   curtains (v0.4.1, set by WorldCore after the nav bake): depth-only boxes in the open doors that lead from
  *   scanned rooms into unscanned space (a pocket, or floor behind the real walls); occluder only (no nav, no shapes).
  */
@@ -509,6 +509,8 @@ export function buildLayout(snapshot, start, opts = {}) {
     floors, ceilings, walls, doors, boxes, furniture, floorRef, floorY0, ceilingY,
     virtual: false, partialVirtual, bounds: { x0, x1, z0, z1 }, notes,
     mappedFloors, inferredWalls, pockets,
+    // v0.5: where the walkthrough scan walked (WorldCore.markHidden: a walked room is scanned space)
+    scanWalked: snapshot && Array.isArray(/** @type {any} */ (snapshot).scanWalked) ? /** @type {any} */ (snapshot).scanWalked : null,
   };
 }
 

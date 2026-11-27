@@ -34,7 +34,9 @@ export const MODES = Object.freeze({
 });
 
 /**
- * @typedef {{ depth?: boolean, bodyTracking?: boolean, space?: 'auto'|'local-floor', scale?: number, foveation?: number }} XRConfig
+ * @typedef {{ depth?: boolean, bodyTracking?: boolean, space?: 'auto'|'local-floor', scale?: number, foveation?: number, learn?: boolean }} XRConfig
+ *   learn (v0.5; App sets it): the game modes also ask for depth-sensing, for the house learner only (src/xr/DepthTap.js;
+ *   LiveDepth hides the depth from three unless `depth`, the dynamic occlusion setting, is on)
  */
 
 /**
@@ -46,7 +48,7 @@ export function featuresFor(mode, cfg = {}) {
   const m = MODES[mode];
   if (!m) throw new Error(`unknown mode ${mode}`);
   const f = [...m.features];
-  if (m.userOptions && cfg.depth && !f.includes('depth-sensing')) f.push('depth-sensing');
+  if (m.userOptions && (cfg.depth || cfg.learn === true) && mode !== 'setup' && !f.includes('depth-sensing')) f.push('depth-sensing');
   if (m.userOptions && cfg.bodyTracking && !f.includes('body-tracking')) f.push('body-tracking');
   return f;
 }

@@ -154,14 +154,19 @@ test('construction: watch and menu in the scene, 4 + 4 meshes, fixed program key
   assert.ok(S.scene.children.includes(w.root) && S.scene.children.includes(w.menuRoot));
   assert.deepEqual(w.root.children.map((m) => m.name), ['watch-steel', 'watch-face', 'watch-readouts', 'watch-glass']);
   assert.deepEqual(w.menuRoot.children.map((m) => m.name), ['watch-menu-disc', 'watch-menu-rim',
-    ...[0, 1, 2, 3, 4, 5, 6].map((i) => `watch-menu-hi-${i}`), 'watch-menu-hi-zone', 'watch-menu-cursor']);
+    ...[0, 1, 2, 3, 4, 5, 6].map((i) => `watch-menu-hi-${i}`), 'watch-menu-hi-zone', 'watch-menu-cursor', 'watch-menu-text']);
   assert.ok(w.hiRows.every((h) => h.material === w.hiMat) && w.hiZone.material === w.hiMat, 'one highlight material');
   assert.equal(w.root.visible, false, 'hidden until a left pose arrives');
   assert.equal(w.warmMeshes().length, 2);
   assert.equal(w.textures().length, 5);
   assert.equal(w.faceTex.generateMipmaps, true);
-  assert.equal(w.readTex.generateMipmaps, false);
-  assert.equal(w.menuTex.generateMipmaps, false);
+  // v0.5: no dynamic canvas: the readouts and the menu rows are glyph boards over the shared atlas (drawn once)
+  assert.equal(w.atlas.texture.generateMipmaps, false);
+  assert.equal(w.menuBgTex.generateMipmaps, false);
+  assert.equal(w.readouts.material, w.atlas.material);
+  assert.equal(w.menuBoard.mesh.material, w.atlas.material, 'one board material');
+  assert.equal(w.atlas.material.customProgramCacheKey(), 'cqc-glyph-board-1');
+  assert.equal(w.atlas.overflow, 0, 'every glyph fits the atlas');
   assert.equal(w.readMat.transparent, true);
   assert.equal(w.glassMat.transparent, true);
   assert.equal(w.glassMat.blending, THREE.AdditiveBlending);
@@ -300,7 +305,7 @@ test('menu: touch RESUME → resume + close; RESTART and EXIT need two taps with
   assert.equal(S.watch.menuOpen, true);
   assert.equal(S.watch._n[RC.CONFIRM], ROW.EXIT, 'the row shows TAP AGAIN');
   S.step(40);
-  assert.ok(S.watch.menuCtx.texts.includes('TAP AGAIN'));
+  assert.ok(S.watch.menuTexts.includes('TAP AGAIN'));
   touchRow(S, 6);
   assert.deepEqual(names(S), ['menu', 'exit', 'menu']);
   // RESTART with a 4 s gap: not confirmed
@@ -344,11 +349,11 @@ test('menu: ray + trigger presses rows; DIFFICULTY, MODE and AMMO LINE toggle wi
   assert.deepEqual(S.actions.at(-1), ['ammoLine', false]);
   S.step(40);
   assert.equal(w._n[RC.AMMO_ON], 0, 'the dial hides the ammo window');
-  assert.ok(w.menuCtx.texts.includes('REALISTIC') && w.menuCtx.texts.includes('SPOT') && w.menuCtx.texts.includes('OFF'));
+  assert.ok(w.menuTexts.includes('REALISTIC') && w.menuTexts.includes('SPOT') && w.menuTexts.includes('OFF'));
   // setStatus from the integrator (saved settings)
   w.setStatus({ difficulty: 'test', playMode: 'roam', ammoLine: true });
   S.step(40);
-  assert.ok(w.menuCtx.texts.includes('TEST') && w.menuCtx.texts.includes('ROAM'));
+  assert.ok(w.menuTexts.includes('TEST') && w.menuTexts.includes('ROAM'));
 });
 
 test('gun fit page: enters with the held gun, − / + taps and the right stick edit live, SAVE emits per changed gun, BACK reverts', () => {
@@ -364,7 +369,7 @@ test('gun fit page: enters with the held gun, − / + taps and the right stick e
   assert.equal(w.page, PAGE.FIT);
   assert.deepEqual(S.actions.at(-1), ['fitBegin', 'akm']);
   S.step(40);
-  assert.ok(w.menuCtx.texts.includes('GUN FIT · AKM'));
+  assert.ok(w.menuTexts.includes('GUN FIT · AKM'));
   touchRow(S, 1, 1); // PITCH +
   assert.deepEqual(S.actions.at(-1), ['fit', { weapon: 'akm', pitchDeg: 0.5, up: 0, fwd: 0 }]);
   { // hovering the + end lights the end disc, not the whole pill
@@ -438,16 +443,18 @@ test('dial readouts: health, ammo, chamber, fire mode, wave, kills; scan progres
   S.step(40);
   const w = S.watch, n = w._s;
   assert.deepEqual([n[RC.HEALTH], n[RC.WEAPON], n[RC.MAG], n[RC.CHAMBER], n[RC.MODE], n[RC.WAVE]], [100, 2, 23, 1, 3, 1]);
-  const texts = w.readCtx.texts;
+  let texts = w.readTexts;
   for (const s of ['100', '23', 'AUTO', '1']) assert.ok(texts.includes(s), s);
   S.weapons.a = { weapon: 'akm', mag: null, chambered: false, mode: 'safe' };
   S.step(40);
+  texts = w.readTexts;
   assert.ok(texts.includes('--') && texts.includes('SAFE'));
   // scanning: rooms in the 9 o'clock window, progress on the info line
   w.setStatus({ scanning: true, rooms: 4, learn: 0.62 });
   S.game.phaseName = 'ready';
   S.game.phaseName = 'spot';
   S.step(40);
+  texts = w.readTexts;
   assert.ok(texts.includes('4') && texts.includes('SCAN 62%'));
   // the redraw limit: a value changing every frame for 3 s
   const d0 = w.draws;
@@ -500,12 +507,12 @@ test('warnings: the left hand vibrates in the kind\'s pattern, the dial shows th
   S.step(40);
   assert.equal(S.watch._s[RC.WARN], WARN.OBSTACLE);
   assert.equal(S.watch._s[RC.SEVERE], 1);
-  assert.ok(S.watch.readCtx.texts.includes('WALL'));
+  assert.ok(S.watch.readTexts.includes('WALL'));
   assert.ok(S.audio.ui.some((u) => u[0] === 'watchAlert'), 'a quiet alert at full level');
   S.watch.warn('run', 0.5);
   S.watch.warn('obstacle', 0);
   S.step(40);
-  assert.ok(S.watch.readCtx.texts.includes('SLOW'));
+  assert.ok(S.watch.readTexts.includes('SLOW'));
   S.watch.clearWarnings();
   S.L.pulses.length = 0;
   S.step(72 * 2);
@@ -525,7 +532,7 @@ test('no brand names on the watch: every label is generic', async () => {
   for (const s of ALL_LABELS) assert.ok(!banned.test(s), s);
   const S = setup();
   S.step(40);
-  for (const s of [...S.watch.readCtx.texts, ...S.watch.menuCtx.texts]) assert.ok(!banned.test(s), s);
+  for (const s of [...S.watch.readTexts, ...S.watch.menuTexts]) assert.ok(!banned.test(s), s);
   const face = setup().watch.faceTex.image.getContext('2d').texts;
   assert.ok(face.includes('CQC'), 'the game\'s own maker mark');
   for (const s of face) assert.ok(!banned.test(s), s);
@@ -574,7 +581,7 @@ test('allocation-free frame: pose, wake, menu hover and presses, stick, warnings
     const { profile } = await s.post('HeapProfiler.stopSampling');
     s.disconnect();
     const b = {};
-    const files = ['/src/ui/Watch.js', '/src/ui/watchLogic.js', '/src/ui/watchArt.js'];
+    const files = ['/src/ui/Watch.js', '/src/ui/watchLogic.js', '/src/ui/watchArt.js', '/src/ui/Glyphs.js'];
     const walk = (n) => {
       const u = n.callFrame.url;
       const key = `${n.callFrame.functionName}@${n.callFrame.lineNumber}`;
