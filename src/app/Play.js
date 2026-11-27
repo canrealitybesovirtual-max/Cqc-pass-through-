@@ -58,7 +58,6 @@ export class PlayKit {
     scene.add(this.world.occluder);
     this.planner = this.world.createPlanner({ maxRequests: 16 });
     this.player = new Player();
-    /** One reused hit record for the combined raycast's world pass. */
     this.fixture = fixture;
     this.audio = audio || null;
 
