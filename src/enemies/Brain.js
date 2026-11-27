@@ -63,6 +63,33 @@ export const AI = Object.freeze({
 
 export const ST = Object.freeze({ IDLE: 0, MOVE: 1, HOLD: 2, DEAD: 3 });
 
+// World queries take their numbers from a typed array: a double passed to a
+// function V8 does not inline is boxed (allocated), and these wrappers are small
+// enough for the world's query to be inlined into them.
+/** @param {WorldLike} w @param {Float64Array} P [ax, ay, az, bx, by, bz] */
+function clearLine(w, P) { return w.segmentClear(P[0], P[1], P[2], P[3], P[4], P[5]); }
+/** @param {import('../world/NavGrid.js').NavGrid} nav @param {Float64Array} P [x, z] */
+function walkable(nav, P) { return nav.isWalkable(P[0], P[1]); }
+/** @param {WorldLike} w @param {Float64Array} P [x, z] → P[2] = floor y */
+function floorAt(w, P) { P[2] = w.floorY(P[0], P[1]); }
+/** Next random number into R[i] (a returned double would be boxed). @param {Rng} rng @param {Float64Array} R @param {number} i */
+function rand(rng, R, i) { R[i] = rng.next(); }
+/**
+ * Snap (P[0], P[1]) onto a walkable cell within 0.5 m. P[3] = cell or −1,
+ * P[4] = its region, P[5] = its clearance (m).
+ * @param {import('../world/NavGrid.js').NavGrid} nav @param {Float64Array} P
+ */
+function snapWalkable(nav, P) {
+  let c = nav.index(P[0], P[1]);
+  if (c < 0 || !nav.isWalkable(P[0], P[1])) {
+    c = nav.nearestWalkable(P[0], P[1], 0.5);
+    if (c >= 0) { P[0] = nav.centerX(c); P[1] = nav.centerZ(c); }
+  }
+  P[3] = c;
+  P[4] = c >= 0 ? nav.region[c] : 0;
+  P[5] = c >= 0 ? nav.clr[c] : 0;
+}
+
 const PATH_PTS = 64;
 
 export class Agent {
@@ -83,6 +110,8 @@ export class Agent {
     this.think = 0;
     // perception
     this.los = false; this.losT = 0; this.lostAt = -1e9; this.aware = false; this.alertT = -1e9;
+    /** Last line-of-sight query: where he and the player were, and the answer. */
+    this.seeX = 1e9; this.seeZ = 1e9; this.seePX = 1e9; this.seePY = 1e9; this.seePZ = 1e9; this.seeOK = false;
     this.reactT = -1;
     // aim and fire
     /** @type {number} */ this.aimErr = AI.aimErr0;
@@ -127,11 +156,17 @@ export class Brain {
     this.time = 0;
     this.shooters = 0;
     this.waiting = 0;
+    /** When a shooter slot was last given up: the next taker waits one 600 rpm cycle. */
+    this.slotFreedAt = -1e9;
     // player (copied each frame)
     this.px = 0; this.py = 1.6; this.pz = 0; // head
     this.cx = 0; this.cy = 1.2; this.cz = 0; // chest
     this.palive = true;
     this.stats = { thinks: 0, goals: 0, goalFails: 0, repaths: 0, shots: 0, blocked: 0 };
+    /** Scratch for world queries (see clearLine) and random numbers. */
+    this.Q = new Float64Array(6);
+    this.S = new Float64Array(6);
+    this.R = new Float64Array(4);
   }
 
   /**
@@ -165,6 +200,7 @@ export class Brain {
     a.progT = 0; a.progX = x; a.progZ = z; a.repaths = 0;
     a.think = (i / this.n) / AI.thinkHz; // staggered
     a.los = false; a.losT = 0; a.lostAt = -1e9; a.aware = false; a.alertT = -1e9; a.reactT = -1;
+    a.seeX = 1e9; a.seeOK = false;
     a.aimErr = AI.aimErr0; a.aimT = 0; a.raise = 0; a.raiseNow = 0;
     a.aimX = x + Math.sin(yaw) * 5; a.aimY = a.y + 1.4; a.aimZ = z + Math.cos(yaw) * 5;
     a.slot = false; a.slotT = 0; a.slotCool = 0;
@@ -174,7 +210,7 @@ export class Brain {
 
   /** @param {Agent} a @param {boolean} [deactivate] */
   release(a, deactivate = false) {
-    if (a.slot) { a.slot = false; this.shooters--; }
+    if (a.slot) { a.slot = false; this.shooters--; this.slotFreedAt = this.time; }
     if (this.planner) this.planner.cancel(a.i);
     a.pathWait = false;
     a.burstLeft = 0;
@@ -221,7 +257,7 @@ export class Brain {
       const a = this.agents[i];
       if (!a.alive) continue;
       const pd = nav ? nav.pathDistance(a.x, a.z) : 0;
-      if (!(pd <= AI.hearPath) && Math.hypot(a.x - x, a.z - z) > AI.hearPath * 0.5) continue;
+      if (!(pd <= AI.hearPath) && Math.sqrt((a.x - x) * (a.x - x) + (a.z - z) * (a.z - z)) > AI.hearPath * 0.5) continue;
       a.aware = true;
       a.alertT = this.time;
       // near miss: closest approach of the round to his chest
@@ -274,14 +310,24 @@ export class Brain {
     this.stats.thinks++;
     const w = this.world;
     const ex = a.x, ey = a.y + AI.eye, ez = a.z;
-    const dx = this.px - ex, dz = this.pz - ez, dist = Math.hypot(dx, dz);
+    const dx = this.px - ex, dz = this.pz - ez, dist = Math.sqrt(dx * dx + dz * dz);
     // sight: cone + line of sight to the head or the chest
     let see = false;
     if (this.palive) {
       const fx = Math.sin(a.yaw), fz = Math.cos(a.yaw);
       const inCone = dist < AI.noticeR || (dx * fx + dz * fz) > AI.cone * dist;
-      if (inCone && w) see = w.segmentClear(ex, ey, ez, this.px, this.py, this.pz) || w.segmentClear(ex, ey, ez, this.cx, this.cy, this.cz);
-      else if (inCone) see = true;
+      if (inCone && w) {
+        // the world is static: the last answer holds while neither of them moved 3 cm
+        const mx = ex - a.seeX, mz = ez - a.seeZ, qx = this.px - a.seePX, qy = this.py - a.seePY, qz = this.pz - a.seePZ;
+        if (mx * mx + mz * mz < 0.0009 && qx * qx + qy * qy + qz * qz < 0.0009) see = a.seeOK;
+        else {
+          const Q = this.Q;
+          Q[0] = ex; Q[1] = ey; Q[2] = ez; Q[3] = this.px; Q[4] = this.py; Q[5] = this.pz;
+          see = clearLine(w, Q);
+          if (!see) { Q[3] = this.cx; Q[4] = this.cy; Q[5] = this.cz; see = clearLine(w, Q); }
+          a.seeX = ex; a.seeZ = ez; a.seePX = this.px; a.seePY = this.py; a.seePZ = this.pz; a.seeOK = see;
+        }
+      } else if (inCone) see = true;
     }
     if (see && !a.los) {
       a.los = true;
@@ -289,7 +335,8 @@ export class Brain {
       a.aimT = 0;
       a.aimErr = Math.max(a.aimErr, AI.aimErr0);
       const quick = this.time - a.lostAt < AI.reacquireWithin;
-      a.reactT = quick ? AI.reacquire : this.rng.range(AI.react[0], AI.react[1]) * (this.time - a.alertT < 5 ? 0.85 : 1);
+      rand(this.rng, this.R, 0);
+      a.reactT = quick ? AI.reacquire : (AI.react[0] + (AI.react[1] - AI.react[0]) * this.R[0]) * (this.time - a.alertT < 5 ? 0.85 : 1);
       a.aware = true;
     } else if (!see && a.los) {
       a.los = false;
@@ -305,7 +352,7 @@ export class Brain {
       }
     }
     // goal management
-    const atGoal = a.hasGoal && Math.hypot(a.goalX - a.x, a.goalZ - a.z) < 0.35;
+    const atGoal = a.hasGoal && Math.sqrt((a.goalX - a.x) * (a.goalX - a.x) + (a.goalZ - a.z) * (a.goalZ - a.z)) < 0.35;
     let need = !a.hasGoal && a.pathFails < 4;
     if (a.hasGoal && a.state === ST.HOLD) {
       if (!a.los && this.time - a.lostAt > AI.repositionNoSight) need = true;
@@ -326,39 +373,42 @@ export class Brain {
   chooseGoal(a) {
     const w = this.world;
     if (!w) return;
-    const nav = w.nav;
-    const ci = nav.index(a.x, a.z);
-    const region = ci >= 0 ? nav.region[ci] : 0;
+    const nav = w.nav, R = this.R, S = this.S, Q = this.Q, rng = this.rng;
+    S[0] = a.x; S[1] = a.z;
+    snapWalkable(nav, S);
+    const region = S[3] >= 0 ? S[4] : 0;
     let best = -Infinity, bx = 0, bz = 0, bestLos = false;
-    const base = this.rng.next() * Math.PI * 2;
+    rand(rng, R, 0);
+    const base = R[0] * Math.PI * 2;
     const N = AI.samples;
     for (let k = 0; k < N; k++) {
-      const ang = base + (k / N) * Math.PI * 2 + (this.rng.next() - 0.5) * 0.25;
-      const r = AI.ringMin + 0.2 + this.rng.next() * (AI.ringMax - AI.ringMin - 0.4);
-      let x = this.px + Math.sin(ang) * r, z = this.pz + Math.cos(ang) * r;
-      let c = nav.index(x, z);
-      if (c < 0 || !nav.isWalkable(x, z)) {
-        c = nav.nearestWalkable(x, z, 0.5);
-        if (c < 0) continue;
-        x = nav.centerX(c); z = nav.centerZ(c);
-      }
-      if (region && nav.region[c] !== region) continue;
-      const dp = Math.hypot(x - this.px, z - this.pz);
+      rand(rng, R, 0); rand(rng, R, 1); rand(rng, R, 2);
+      const ang = base + (k / N) * Math.PI * 2 + (R[0] - 0.5) * 0.25;
+      const r = AI.ringMin + 0.2 + R[1] * (AI.ringMax - AI.ringMin - 0.4);
+      S[0] = this.px + Math.sin(ang) * r; S[1] = this.pz + Math.cos(ang) * r;
+      snapWalkable(nav, S);
+      if (S[3] < 0 || (region && S[4] !== region)) continue;
+      const x = S[0], z = S[1];
+      const dp = Math.sqrt((x - this.px) * (x - this.px) + (z - this.pz) * (z - this.pz));
       if (dp < AI.ringMin || dp > AI.ringMax + 0.5) continue;
-      const fy = w.floorY(x, z) + AI.eye - 0.05;
-      const los = w.segmentClear(x, fy, z, this.px, this.py, this.pz) || w.segmentClear(x, fy, z, this.cx, this.cy, this.cz);
+      Q[0] = x; Q[1] = z;
+      floorAt(w, Q);
+      Q[1] = Q[2] + AI.eye - 0.05; Q[0] = x; Q[2] = z; Q[3] = this.px; Q[4] = this.py; Q[5] = this.pz;
+      let los = clearLine(w, Q);
+      if (!los) { Q[3] = this.cx; Q[4] = this.cy; Q[5] = this.cz; los = clearLine(w, Q); }
       // score: sight first; then not far from where he is; spread from mates; mid distances; a wall or furniture close by
-      const da = Math.hypot(x - a.x, z - a.z);
-      let s = (los ? 10 : 0) - da * 0.5 - Math.abs(dp - 4.5) * 0.4 + this.rng.next() * 0.6;
-      if (nav.clearance(x, z) < 0.6) s += 0.4;
+      const da = Math.sqrt((x - a.x) * (x - a.x) + (z - a.z) * (z - a.z));
+      const off = dp - 4.5;
+      let sc = (los ? 10 : 0) - da * 0.5 - (off < 0 ? -off : off) * 0.4 + R[2] * 0.6;
+      if (S[5] < 0.6) sc += 0.4;
       for (let j = 0; j < this.n; j++) {
         const o = this.agents[j];
         if (j === a.i || !o.alive) continue;
         const gx = o.hasGoal ? o.goalX : o.x, gz = o.hasGoal ? o.goalZ : o.z;
-        const dd = Math.hypot(x - gx, z - gz);
-        if (dd < AI.spread) s -= (AI.spread - dd) * 4;
+        const dd = Math.sqrt((x - gx) * (x - gx) + (z - gz) * (z - gz));
+        if (dd < AI.spread) sc -= (AI.spread - dd) * 4;
       }
-      if (s > best) { best = s; bx = x; bz = z; bestLos = los; }
+      if (sc > best) { best = sc; bx = x; bz = z; bestLos = los; }
     }
     if (best === -Infinity) {
       // nothing on the ring: walk toward the player as far as the nav allows
@@ -369,7 +419,8 @@ export class Brain {
     a.hasGoal = true;
     a.goalX = bx; a.goalZ = bz; a.goalLos = bestLos;
     a.holdT = 0;
-    a.holdFor = this.rng.range(AI.holdTime[0], AI.holdTime[1]);
+    rand(rng, R, 0);
+    a.holdFor = AI.holdTime[0] + (AI.holdTime[1] - AI.holdTime[0]) * R[0];
     a.blockedT = 0;
     a.state = ST.MOVE;
     a.pathN = 0;
@@ -385,16 +436,16 @@ export class Brain {
   move(a, dt) {
     const w = this.world;
     let tvx = 0, tvz = 0;
-    const toPx = this.px - a.x, toPz = this.pz - a.z, pd = Math.hypot(toPx, toPz);
+    const toPx = this.px - a.x, toPz = this.pz - a.z, pd = Math.sqrt(toPx * toPx + toPz * toPz);
     const engaged = a.aware && (a.los || pd < 6);
     // follow the path
     if (a.state === ST.MOVE && a.pathN > 1 && a.flinchT <= 0) {
       let tx = a.path[a.pathI * 2], tz = a.path[a.pathI * 2 + 1];
-      let d = Math.hypot(tx - a.x, tz - a.z);
+      let d = Math.sqrt((tx - a.x) * (tx - a.x) + (tz - a.z) * (tz - a.z));
       while (d < 0.25 && a.pathI < a.pathN - 1) {
         a.pathI++;
         tx = a.path[a.pathI * 2]; tz = a.path[a.pathI * 2 + 1];
-        d = Math.hypot(tx - a.x, tz - a.z);
+        d = Math.sqrt((tx - a.x) * (tx - a.x) + (tz - a.z) * (tz - a.z));
       }
       const last = a.pathI >= a.pathN - 1;
       if (last && d < 0.12) { a.state = ST.HOLD; a.holdT = 0; a.pathN = 0; }
@@ -409,7 +460,7 @@ export class Brain {
     for (let j = 0; j < this.n; j++) {
       const o = this.agents[j];
       if (j === a.i || !o.alive) continue;
-      const ox = a.x - o.x, oz = a.z - o.z, od = Math.hypot(ox, oz);
+      const ox = a.x - o.x, oz = a.z - o.z, od = Math.sqrt(ox * ox + oz * oz);
       if (od < AI.separation && od > 1e-4) { const k = (AI.separation - od) / AI.separation * 1.2; tvx += ox / od * k; tvz += oz / od * k; }
     }
     // the player: never closer than keepAway; back off if he comes in
@@ -421,25 +472,36 @@ export class Brain {
     }
     if (a.flinchT > 0) { tvx *= 0.2; tvz *= 0.2; }
     // accelerate toward the wanted velocity
-    const dvx = tvx - a.vx, dvz = tvz - a.vz, dv = Math.hypot(dvx, dvz), mx = AI.accel * dt;
+    const dvx = tvx - a.vx, dvz = tvz - a.vz, dv = Math.sqrt(dvx * dvx + dvz * dvz), mx = AI.accel * dt;
     if (dv > mx) { a.vx += dvx / dv * mx; a.vz += dvz / dv * mx; } else { a.vx = tvx; a.vz = tvz; }
-    // move, never off walkable cells, never within keepAway
+    // move, never off walkable cells, never within keepAway (x and z first, then each alone)
     if (a.vx !== 0 || a.vz !== 0) {
       const nx = a.x + a.vx * dt, nz = a.z + a.vz * dt;
-      if (this.canStand(a, nx, nz)) { a.x = nx; a.z = nz; }
-      else if (this.canStand(a, nx, a.z)) { a.x = nx; a.vz = 0; }
-      else if (this.canStand(a, a.x, nz)) { a.z = nz; a.vx = 0; }
-      else { a.vx = 0; a.vz = 0; }
+      const nav = w ? w.nav : null, Q = this.Q, keep = AI.keepAway;
+      const ex0 = a.x - this.px, ez0 = a.z - this.pz, d0 = ex0 * ex0 + ez0 * ez0;
+      let moved = false;
+      for (let tryk = 0; tryk < 3 && !moved; tryk++) {
+        const tx = tryk === 2 ? a.x : nx, tz = tryk === 1 ? a.z : nz;
+        const ex = tx - this.px, ez = tz - this.pz, d1 = ex * ex + ez * ez;
+        if (d1 < keep * keep && d1 < d0) continue;
+        if (nav) { Q[0] = tx; Q[1] = tz; if (!walkable(nav, Q)) continue; }
+        a.x = tx; a.z = tz;
+        if (tryk === 1) a.vz = 0; else if (tryk === 2) a.vx = 0;
+        moved = true;
+      }
+      if (!moved) { a.vx = 0; a.vz = 0; }
       if (w) {
-        const fy = w.floorY(a.x, a.z);
-        a.y += (fy - a.y) * Math.min(1, dt * 12);
+        Q[0] = a.x; Q[1] = a.z;
+        floorAt(w, Q);
+        const k = dt * 12;
+        a.y += (Q[2] - a.y) * (k < 1 ? k : 1);
       }
     }
     // stuck: wants to move, makes no progress
     if (a.state === ST.MOVE && a.pathN > 1) {
       a.progT += dt;
       if (a.progT >= AI.stuckWindow) {
-        if (Math.hypot(a.x - a.progX, a.z - a.progZ) < AI.stuckDist && a.flinchT <= 0) {
+        if (Math.sqrt((a.x - a.progX) * (a.x - a.progX) + (a.z - a.progZ) * (a.z - a.progZ)) < AI.stuckDist && a.flinchT <= 0) {
           a.repaths++;
           this.stats.repaths++;
           if (this.planner && a.hasGoal) { this.planner.request(a.i, a.x, a.z, a.goalX, a.goalZ); a.pathWait = true; a.pathN = 0; }
@@ -449,7 +511,7 @@ export class Brain {
     } else { a.progT = 0; a.progX = a.x; a.progZ = a.z; }
     // facing: the player when engaged, else where he walks
     let want = a.yaw;
-    const sp = Math.hypot(a.vx, a.vz);
+    const sp = Math.sqrt(a.vx * a.vx + a.vz * a.vz);
     if (engaged && pd > 1e-3) want = Math.atan2(toPx, toPz);
     else if (sp > 0.2) want = Math.atan2(a.vx, a.vz);
     else if (a.state === ST.MOVE && a.pathN > 1) want = Math.atan2(a.path[a.pathI * 2] - a.x, a.path[a.pathI * 2 + 1] - a.z);
@@ -464,17 +526,6 @@ export class Brain {
       const fx = Math.sin(a.yaw), fz = Math.cos(a.yaw);
       a.aimX = a.x + fx * 4; a.aimY = a.y + 1.0; a.aimZ = a.z + fz * 4;
     }
-  }
-
-  /**
-   * Walkable, and not stepping toward the player inside keepAway.
-   * @param {Agent} a @param {number} x @param {number} z
-   */
-  canStand(a, x, z) {
-    const w = this.world;
-    if (w && !w.nav.isWalkable(x, z)) return false;
-    const d0 = Math.hypot(a.x - this.px, a.z - this.pz), d1 = Math.hypot(x - this.px, z - this.pz);
-    return !(d1 < AI.keepAway && d1 < d0);
   }
 
   // ─────────────────────────────────────────────────────────── shooting (per frame)
@@ -504,15 +555,17 @@ export class Brain {
       const lost = !a.los && this.time - a.lostAt > AI.lostRelease;
       if (lost || a.reloadT > 0 || (a.slotT > AI.slotHold && this.waiting > 0 && a.burstLeft === 0) || !this.palive) {
         a.slot = false; this.shooters--; a.slotCool = AI.slotCooldown; a.burstLeft = 0;
+        this.slotFreedAt = this.time;
       }
     }
     const facing = Math.abs(wrapAngle(Math.atan2(this.px - a.x, this.pz - a.z) - a.yaw)) < 0.35;
     const ready = a.los && this.palive && a.reactT <= 0 && a.flinchT <= 0 && a.suppressT <= 0 && a.reloadT <= 0 && a.raiseNow >= 0.95 && facing;
-    if (ready && !a.slot && a.slotCool <= 0 && this.shooters < AI.maxShooters) { a.slot = true; a.slotT = 0; this.shooters++; }
+    if (ready && !a.slot && a.slotCool <= 0 && this.shooters < AI.maxShooters && this.time - this.slotFreedAt > 0.15) { a.slot = true; a.slotT = 0; this.shooters++; }
     if (!a.slot || !ready) { if (!ready) a.burstLeft = 0; return; }
     if (a.burstLeft === 0) {
       if (a.gapT > 0) return;
-      a.burstLeft = AI.burst[0] + Math.floor(this.rng.next() * (AI.burst[1] - AI.burst[0] + 1));
+      rand(this.rng, this.R, 0);
+      a.burstLeft = AI.burst[0] + Math.floor(this.R[0] * (AI.burst[1] - AI.burst[0] + 1));
       a.shotT = 0;
     }
     a.shotT -= dt;
@@ -534,7 +587,7 @@ export class Brain {
     a.burstLeft--;
     a.mag--;
     a.aimErr += AI.aimPerShot;
-    if (a.burstLeft === 0) a.gapT = this.rng.range(AI.burstGap[0], AI.burstGap[1]);
+    if (a.burstLeft === 0) { rand(this.rng, this.R, 0); a.gapT = AI.burstGap[0] + (AI.burstGap[1] - AI.burstGap[0]) * this.R[0]; }
     if (a.mag <= 0) { a.reloadT = AI.reload; a.reloadStart = true; a.burstLeft = 0; }
   }
 
@@ -562,7 +615,7 @@ export class Brain {
   scatter(dx, dy, dz, err, out) {
     // basis perpendicular to d
     let ux = -dz, uy = 0, uz = dx;
-    let ul = Math.hypot(ux, uz);
+    let ul = Math.sqrt(ux * ux + uz * uz);
     if (ul < 1e-6) { ux = 1; uz = 0; ul = 1; }
     ux /= ul; uz /= ul;
     const vx = dy * uz - dz * uy, vy = dz * ux - dx * uz, vz = dx * uy - dy * ux;

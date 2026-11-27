@@ -88,7 +88,6 @@ const _v = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
 const _q = new THREE.Quaternion();
-const _q2 = new THREE.Quaternion();
 const _ZN = new THREE.Vector3(0, 0, -1);
 const _XA = new THREE.Vector3(1, 0, 0);
 const _YA = new THREE.Vector3(0, 1, 0);
@@ -154,6 +153,8 @@ class Weapon {
     this.assistT = -1;
     this.twoHand = false;
     this.scale = 1;
+    /** Floor under the let-go point (a dropped gun rests on it until it returns). */
+    this.dropFloor = 0;
   }
 }
 
@@ -235,6 +236,7 @@ export class WeaponSystem {
     if (!(dt >= 0)) dt = 0;
     this.now = t / 1000;
     this.ctx = ctx;
+    this.fx.world = ctx.world || null;
     const I = ctx.input || null;
     this._readHand(this.L, I ? I.left : null, dt);
     this._readHand(this.R, I ? I.right : null, dt);
@@ -308,11 +310,11 @@ export class WeaponSystem {
 
   /** Slot frames (world) from the body estimate. */
   _slotFrames() {
-    const B = this.body, H = B.holster, K = B.back;
-    this.glock.slotP.set(H.p[0], H.p[1], H.p[2]);
-    this.glock.slotQ.set(H.q[0], H.q[1], H.q[2], H.q[3]);
-    this.akm.slotP.set(K.p[0], K.p[1], K.p[2]);
-    this.akm.slotQ.set(K.q[0], K.q[1], K.q[2], K.q[3]);
+    const B = this.body;
+    this.glock.slotP.fromArray(B.holster.p);
+    this.glock.slotQ.fromArray(B.holster.q);
+    this.akm.slotP.fromArray(B.back.p);
+    this.akm.slotQ.fromArray(B.back.q);
   }
 
   /**
@@ -377,6 +379,7 @@ export class WeaponSystem {
     w.relP.copy(v.root.position);
     w.relQ.copy(v.root.quaternion);
     w.dropV.copy(this.R.vel);
+    w.dropFloor = this._floorY(w.relP.x, w.relP.z) + SYSTEM.dropRest;
     this._endLeftOn(w);
     w.inst.setTrigger(0);
     w.recoil.reset();
@@ -416,7 +419,7 @@ export class WeaponSystem {
         break;
       }
       case CARRY_DROP: {
-        const fy = this._floorY(w.relP.x, w.relP.z) + SYSTEM.dropRest;
+        const fy = w.dropFloor;
         if (dt > 0 && w.relP.y > fy) {
           w.dropV.y -= 9.81 * dt;
           w.relP.addScaledVector(w.dropV, dt);

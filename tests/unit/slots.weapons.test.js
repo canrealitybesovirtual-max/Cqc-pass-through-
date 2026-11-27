@@ -26,6 +26,7 @@ const { SLIDE_LOCKED } = await import('../../src/weapons/WeaponInstance.js');
 const MANIFEST = JSON.parse(readFileSync(new URL('../../assets/manifest.json', import.meta.url), 'utf8'));
 const DT = 1 / 90;
 const REC = { on: true };
+const EVN = { n: 0 };   // sound + haptic calls (counted without allocating)
 
 // ── synthetic models (gun space as in the manifest) ───────────────────────────
 function boxPart(geos, parts, w, h, d, x, y, z, part) {
@@ -71,7 +72,7 @@ function fakeHand(side) {
   const pulses = [];
   const gripSpace = { pose: { transform: { matrix: new Float32Array(16) } } };
   const raySpace = { pose: { transform: { matrix: new Float32Array(16) } } };
-  const gamepad = { buttons, axes: [0, 0, 0, 0], hapticActuators: [{ pulse: (v, ms) => { if (REC.on) pulses.push([v, ms]); return null; } }] };
+  const gamepad = { buttons, axes: [0, 0, 0, 0], hapticActuators: [{ pulse: (v, ms) => { EVN.n++; if (REC.on) pulses.push([v, ms]); return null; } }] };
   const src = { handedness: side, gamepad, gripSpace, targetRaySpace: raySpace, hand: null };
   const ray = new THREE.Matrix4(), grip = new THREE.Matrix4();
   return {
@@ -94,7 +95,7 @@ function setup() {
   const scene = new THREE.Scene();
   const events = new Events();
   const sounds = [];
-  const audio = { play(key, x, y, z, g) { if (REC.on) sounds.push({ key, x, y, z, g }); return 1; } };
+  const audio = { play(key, x, y, z, g) { EVN.n++; if (REC.on) sounds.push({ key, x, y, z, g }); return 1; } };
   const lights = [new THREE.PointLight(0xffc27a, 0, 4, 2), new THREE.PointLight(0xffc27a, 0, 4, 2)];
   const wallZ = -5;
   const enemy = { on: false, x: 0, y: 0, z: 0, r: 0.12 };
@@ -505,7 +506,7 @@ test('part matrices: trigger blade swings back, Glock slide stop front rises, AK
   const g = W.glock.view;
   R.set(0, 0.6); S.step(20);   // partly pressed (below the break)
   const m = new THREE.Matrix4().fromArray(g.uPart.value, 32);
-  const blade = g.trigPivot.clone().add(v3(0, -0.015, 0));
+  const blade = g.trig.pivot.clone().add(v3(0, -0.015, 0));
   const moved = blade.clone().applyMatrix4(m);
   assert.ok(moved.z > blade.z + 0.002, 'trigger blade moves toward the shooter');
   R.set(0, 0); S.step(20);
@@ -596,7 +597,97 @@ test('reset re-issues both guns and clears the effects; a gun in the hand stays 
   assert.equal(W.akm.carry.state, CARRY_SLOT);
 });
 
-test('per-frame weapon paths allocate nothing (sampling heap profiler)', async () => {
+const PROFILED = ['/src/weapons/WeaponSystem.js', '/src/weapons/WeaponView.js', '/src/weapons/WeaponFX.js', '/src/player/BodyEstimator.js', '/src/player/Slots.js', '/src/player/Handling.js'];
+
+/**
+ * Bytes allocated in the W2 files while `run` runs: the best of up to 5 sampled runs, because V8's
+ * own one-off work (feedback vectors, inline-cache and map transitions, re-optimisation) is
+ * charged to whatever function is running; a real per-frame allocation shows in every run.
+ */
+async function sampled(run) {
+  let best = Infinity, by = null, events = 0;
+  for (let r = 0; r < 5 && best > 0; r++) {
+    globalThis.gc?.();
+    const ses = new Session();
+    ses.connect();
+    await ses.post('HeapProfiler.startSampling', { samplingInterval: 16 });
+    const e0 = EVN.n;
+    run();
+    const ev = EVN.n - e0;
+    const { profile } = await ses.post('HeapProfiler.stopSampling');
+    ses.disconnect();
+    const b = {};
+    const walk = (n, path) => {
+      const u = n.callFrame.url;
+      const here = `${u.split('/').pop()}:${n.callFrame.functionName}:${n.callFrame.lineNumber + 1}`;
+      if (n.selfSize > 0 && PROFILED.some((f) => u.endsWith(f))) {
+        const k = process.env.W2_ALLOC_PATH ? `${path.slice(-3).join('<')}<${here}` : here;
+        b[k] = (b[k] || 0) + n.selfSize;
+      }
+      for (const c of n.children) walk(c, process.env.W2_ALLOC_PATH ? path.concat(here) : path);
+    };
+    walk(profile.head, []);
+    const t = Object.values(b).reduce((x, y) => x + y, 0);
+    if (t < best) { best = t; by = b; events = ev; }
+  }
+  return { bytes: best, by, events };
+}
+
+test('the per-frame path allocates nothing: held two-handed AKM, aim sway, flying cases and magazines (sampling heap profiler)', async () => {
+  const S = setup();
+  const { W, L, R } = S;
+  REC.on = false;
+  const Q0 = new THREE.Quaternion(), q = new THREE.Quaternion(), e = new THREE.Euler(), tmp = v3(), vel = v3(0.5, 1.5, 0.3);
+  R.pose(backPoint(W), Q0); R.set(1, 1); S.step(3);
+  R.pose(AIM_POS, Q0); S.step(20);
+  L.pose(W.akm.view.toWorld(W.akm.view.support, tmp), Q0); L.set(1, 1); S.step(2);
+  assert.equal(W.lRole, 2);
+  let i = 0;
+  const run = (n) => {
+    for (let k = 0; k < n; k++, i++) {
+      e.set(0.05 * Math.sin(i * 0.05), 0.2 * Math.sin(i * 0.013), 0.03 * Math.sin(i * 0.07));
+      q.setFromEuler(e);
+      R.pose(AIM_POS, q);
+      W.akm.view.toWorld(W.akm.view.support, tmp);
+      L.pose(tmp, Q0);
+      if (i % 30 === 0) W.fx.eject(0.2, 1.3, -0.4, 1, 1.5, 0.2, W.akm.view.root.quaternion, FIT.akm.caseRL, '');   // silent cases
+      if (i % 200 === 0) { W.fx.dropMag('akm', tmp, Q0, vel, 2); W.fx.mags.akm.sound.fill(''); }
+      S.step(1);
+    }
+  };
+  run(4000);
+  const { bytes, by } = await sampled(() => run(6000));
+  assert.equal(bytes, 0, JSON.stringify(by));
+  // empty hands roaming near (not into) the grab zones, and the one-handed Glock
+  R.pose(backPoint(W), Q0); S.step(2); R.set(1, 0); L.set(1, 0); S.step(60);
+  assert.equal(W.held, null);
+  const roam = (n) => {
+    for (let k = 0; k < n; k++, i++) {
+      const a = i * 0.02;
+      R.pose(tmp.set(0.3 + 0.1 * Math.sin(a), 1.1 + 0.25 * Math.sin(a * 0.7), -0.45 + 0.08 * Math.cos(a)), Q0);
+      L.pose(tmp.set(-0.35 - 0.1 * Math.sin(a), 1.25 + 0.1 * Math.cos(a), -0.3), Q0);
+      S.step(1);
+    }
+  };
+  roam(3000);
+  const empty = await sampled(() => roam(6000));
+  assert.equal(empty.bytes, 0, JSON.stringify(empty.by));
+  R.pose(holsterPoint(W), Q0); R.set(1, 1); S.step(3);
+  assert.equal(W.held, W.glock);
+  const aim = (n) => {
+    for (let k = 0; k < n; k++, i++) {
+      e.set(0.05 * Math.sin(i * 0.05), 0.2 * Math.sin(i * 0.013), 0);
+      R.pose(AIM_POS, q.setFromEuler(e));
+      S.step(1);
+    }
+  };
+  aim(3000);
+  const one = await sampled(() => aim(6000));
+  REC.on = true;
+  assert.equal(one.bytes, 0, JSON.stringify(one.by));
+});
+
+test('a full handling cycle allocates only the boxed numbers handed to the audio and haptics APIs', async () => {
   const S = setup();
   const { W, L, R } = S;
   REC.on = false;
@@ -605,7 +696,7 @@ test('per-frame weapon paths allocate nothing (sampling heap profiler)', async (
   const pouch = () => tmp.set(W.body.pouch.p[0], W.body.pouch.p[1], W.body.pouch.p[2]);
   let i = 0;
   // One 1200-frame cycle: AKM two-handed auto bursts, magazine drop, pouch, guided seat, rack,
-  // holster the AKM; draw the Glock, shoot, drop its magazine, assisted reload, holster.
+  // back onto the shoulder; draw the Glock, shoot, drop its magazine, assisted reload, holster.
   const frame = () => {
     const c = i % 1200;
     e.set(0.05 * Math.sin(i * 0.05), 0.2 * Math.sin(i * 0.013), 0);
@@ -614,13 +705,13 @@ test('per-frame weapon paths allocate nothing (sampling heap profiler)', async (
     else if (c < 600) {
       R.pose(AIM_POS, q);
       const w = W.akm, v = w.view;
-      if (c === 30) { if (w.inst.mode !== 'auto') { R.set(3, 1); } }
+      if (c === 30 && w.inst.mode !== 'auto') R.set(3, 1);
       if (c === 31) R.set(3, 0);
       if (c >= 40 && c < 300) { v.toWorld(v.support, tmp2); L.pose(tmp2, Q0); L.set(1, 1); R.set(0, (c % 90) < 60 ? 1 : 0); }
       if (c === 300) { R.set(0, 0); L.set(1, 0); R.set(4, 1); }
       if (c === 301) R.set(4, 0);
       if (c >= 310 && c < 320) { L.pose(pouch(), Q0); L.set(1, c >= 312 ? 1 : 0); }
-      if (c >= 320 && c < 400) {   // guided push into the well
+      if (c >= 320 && c < 400) {
         const d = -0.06 + (c - 320) * 0.001;
         v.toWorld(v.palm, tmp2).addScaledVector(v.dirWorld(v.magAxis, tmp), d);
         lq.copy(v.root.quaternion);
@@ -629,16 +720,14 @@ test('per-frame weapon paths allocate nothing (sampling heap profiler)', async (
       if (c >= 400 && c < 420) { v.toWorld(v.rackLocal(0, tmp), tmp2); L.pose(tmp2, Q0); L.set(1, c >= 402 ? 1 : 0); }
       if (c >= 420 && c < 440) { v.toWorld(v.rackLocal((c - 420) / 19, tmp), tmp2); L.pose(tmp2, Q0); }
       if (c === 440) L.set(1, 0);
-      if (c >= 500 && c < 560) { R.pose(backPoint(W), q); }
+      if (c >= 500 && c < 560) R.pose(backPoint(W), q);
       if (c === 560) R.set(1, 0);
     } else if (c < 620) { R.pose(holsterPoint(W), Q0); R.set(1, c >= 605 ? 1 : 0); }
     else if (c < 1150) {
       R.pose(AIM_POS, q);
       if (c >= 650 && c < 900) R.set(0, (c % 12) < 2 ? 1 : 0);
-      if (c === 900) R.set(4, 1);
-      if (c === 901) R.set(4, 0);
-      if (c === 910) R.set(4, 1);
-      if (c === 911) R.set(4, 0);
+      if (c === 900 || c === 910) R.set(4, 1);
+      if (c === 901 || c === 911) R.set(4, 0);
       if (c >= 1080 && c < 1150) R.pose(holsterPoint(W), Q0);
     } else if (c === 1150) R.set(1, 0);
     if (c === 1199) { W.akm.inst.reset(30, true, 'auto'); W.glock.inst.reset(); }
@@ -648,29 +737,9 @@ test('per-frame weapon paths allocate nothing (sampling heap profiler)', async (
   for (let k = 0; k < 3600; k++) frame();
   assert.ok(W.stats.shots > 100 && W.stats.draws >= 4 && W.stats.reloads >= 3, JSON.stringify(W.stats));
   assert.ok(W.fx.mags.akm.count > 0 && W.fx.mags.glock.count > 0 && W.fx.decals.count > 0 && W.fx.brass.count > 0);
-  let best = Infinity, by = null;
-  const files = ['/src/weapons/WeaponSystem.js', '/src/weapons/WeaponView.js', '/src/weapons/WeaponFX.js', '/src/player/BodyEstimator.js', '/src/player/Slots.js', '/src/player/Handling.js'];
-  for (let r = 0; r < 3 && best > 0; r++) {
-    const ses = new Session();
-    ses.connect();
-    await ses.post('HeapProfiler.startSampling', { samplingInterval: 16 });
-    for (let k = 0; k < 4800; k++) frame();
-    const { profile } = await ses.post('HeapProfiler.stopSampling');
-    ses.disconnect();
-    const b = {};
-    const walk = (n, path) => {
-      const u = n.callFrame.url;
-      const here = `${u.split('/').pop()}:${n.callFrame.functionName}:${n.callFrame.lineNumber + 1}`;
-      if (n.selfSize > 0 && files.some((f) => u.endsWith(f))) {
-        const k = process.env.W2_ALLOC_PATH ? `${path.slice(-3).join('<')}<${here}` : here;
-        b[k] = (b[k] || 0) + n.selfSize;
-      }
-      for (const c of n.children) walk(c, process.env.W2_ALLOC_PATH ? path.concat(here) : path);
-    };
-    walk(profile.head, []);
-    const t = Object.values(b).reduce((x, y) => x + y, 0);
-    if (t < best) { best = t; by = b; }
-  }
+  const { bytes, by, events } = await sampled(() => { for (let k = 0; k < 4800; k++) frame(); });
   REC.on = true;
-  assert.equal(best, 0, JSON.stringify(by));
+  assert.ok(events > 200, `${events} sound / haptic calls`);
+  // at most four boxed numbers (x, y, z, gain / strength, ms) per call into AudioEngine.play or pulse()
+  assert.ok(bytes <= events * 64, `${bytes} B for ${events} API calls: ${JSON.stringify(by)}`);
 });

@@ -96,6 +96,17 @@ export function smooth(a, b, x) {
 
 /** @param {number} v @param {number} a @param {number} b */
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+/**
+ * Hot-path angle wrap for finite input (inputs are checked in setHead). Kept tiny so V8 always
+ * inlines it: a helper that returns a double and is not inlined boxes it on every call.
+ * @param {number} a
+ */
+const wr = (a) => a - TAU * Math.round(a / TAU);
+/**
+ * Hot-path smoothstep (see `smooth`), kept tiny for the same reason.
+ * @param {number} a @param {number} b @param {number} x
+ */
+const ss = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 
 /**
  * out = q · v (v at out[o..o+2]).
@@ -321,12 +332,12 @@ export class BodyEstimator {
     const sp = -W[7], k = B.upWeight * (sp > 0 ? 1 : sp < 0 ? -1 : 0);
     const hx = W[6] + W[9] * k, hz = W[8] + W[10] * k;
     const raw = hx * hx + hz * hz > 1e-12 ? Math.atan2(-hx, -hz) : this.heading;
-    let frz = smooth(B.freezeFrom, B.freezeTo, W[4]);
+    let frz = ss(B.freezeFrom, B.freezeTo, W[4]);
     frz *= 1 - B.walkFreezeK * clamp(this.speed / B.walkFreezeSpeed, 0, 1);
     this.freeze = frz;
     if (this._first) this.heading = raw;
     const tau = B.tauAhead + (B.tauDown - B.tauAhead) * frz;
-    this.heading = wrap(this.heading + wrap(raw - this.heading) * (1 - Math.exp(-dt / tau)));
+    this.heading = wr(this.heading + wr(raw - this.heading) * (1 - Math.exp(-dt / tau)));
   }
 
   /** 2. Raised hands in front say where the chest faces (never while looking down or reaching low). */
@@ -337,10 +348,10 @@ export class BodyEstimator {
       const o = i * 4;
       if (!h[o + 3]) continue;
       const dx = h[o] - H[0], dz = h[o + 2] - H[2], drop = H[1] - h[o + 1];
-      const d = wrap(Math.atan2(-dx, -dz) - hh);
-      let w = smooth(B.voteDropOut * s, B.voteDropIn * s, drop) * smooth(B.voteNear * s, B.voteFar * s, Math.sqrt(dx * dx + dz * dz))
-        * smooth(B.voteAngOut, B.voteAngIn, Math.abs(d));
-      w *= (1 - frz) * smooth(B.reachDropOut * s, B.reachDropIn * s, drop);
+      const d = wr(Math.atan2(-dx, -dz) - hh);
+      let w = ss(B.voteDropOut * s, B.voteDropIn * s, drop) * ss(B.voteNear * s, B.voteFar * s, Math.sqrt(dx * dx + dz * dz))
+        * ss(B.voteAngOut, B.voteAngIn, Math.abs(d));
+      w *= (1 - frz) * ss(B.reachDropOut * s, B.reachDropIn * s, drop);
       if (!(w > 0)) continue;
       if (this._gun[i]) w = Math.min(1, w * B.gunHandK);
       sx += w * Math.sin(d); cx += w * Math.cos(d); wt += w;
@@ -349,8 +360,8 @@ export class BodyEstimator {
     if (this._first) { this.handConf = 0; this.handYaw = hh; }
     this.handConf += (Math.min(1, wt / B.voteSum) - this.handConf) * kh;
     const haT = wt > 1e-3 ? hh + Math.atan2(sx, cx) : hh;
-    this.handYaw = wrap(this.handYaw + wrap(haT - this.handYaw) * kh);
-    const hOff = wrap(this.handYaw - hh) * this.handConf;
+    this.handYaw = wr(this.handYaw + wr(haT - this.handYaw) * kh);
+    const hOff = wr(this.handYaw - hh) * this.handConf;
     W[11] = hh + hOff * B.handsGain;                                   // where the hips aim
     W[12] = hh + hOff * Math.min(1, B.handsGain + B.chestGain);        // where the chest aims
   }
@@ -358,19 +369,19 @@ export class BodyEstimator {
   /** 3. Hips: dead zone, capped catch-up, slow settle; nearly frozen while looking down. */
   _hips() {
     const B = BODY_EST, W = this._w, dt = W[0], frz = this.freeze, fYaw = W[11];
-    if (this._first) this.yaw = wrap(fYaw);
-    let dYaw = wrap(fYaw - this.yaw);
+    if (this._first) this.yaw = wr(fYaw);
+    let dYaw = wr(fYaw - this.yaw);
     const dead = B.dead + B.deadFrozenAdd * frz, ex = Math.abs(dYaw) - dead;
     if (ex > 0) {
       const st = Math.min(ex, (B.catchUp + (B.catchUpFrozen - B.catchUp) * frz) * dt) * (dYaw > 0 ? 1 : -1);
-      this.yaw = wrap(this.yaw + st);
+      this.yaw = wr(this.yaw + st);
       dYaw -= st;
     }
     dYaw = clamp(dYaw, -dead, dead);
     const rate = (B.settle + this.speed * B.settleWalk) * (1 - (1 - B.settleFrozenK) * frz);
-    this.yaw = wrap(this.yaw + dYaw * (1 - Math.exp(-dt * rate)));
+    this.yaw = wr(this.yaw + dYaw * (1 - Math.exp(-dt * rate)));
     const yaw = this.yaw;
-    this.chestYaw = wrap(yaw + clamp(wrap(W[12] - yaw), -B.chestMax, B.chestMax) * (B.chestFollow + B.chestGain * this.handConf));
+    this.chestYaw = wr(yaw + clamp(wr(W[12] - yaw), -B.chestMax, B.chestMax) * (B.chestFollow + B.chestGain * this.handConf));
   }
 
   /** 4. Neck chain: eyes → atlas → C7 (half the nod), body 8 cm forward, torso down to the pelvis. */
@@ -416,13 +427,13 @@ export class BodyEstimator {
       for (let k = 0; k < n; k++) {
         for (let i = 0; i < 8; i++) {
           let e = T[i] - X[i];
-          if (i >= 6) e = wrap(e);
+          if (i >= 6) e = wr(e);
           V[i] += (w2 * e - c * V[i]) * h;
           X[i] += V[i] * h;
         }
       }
-      X[6] = wrap(X[6]);
-      X[7] = wrap(X[7]);
+      X[6] = wr(X[6]);
+      X[7] = wr(X[7]);
     }
     const pS = this.pelvisS;
     pS[0] = X[0]; pS[1] = X[1]; pS[2] = X[2];

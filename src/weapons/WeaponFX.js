@@ -11,7 +11,8 @@ import * as THREE from 'three';
  *   0.5 × brightness, so it brightens the passthrough instead of covering it
  *   (PLAN §5). 13–16 ms, 6–7.5 cm on the pistol (CQC). `flashLights[0]` lights
  *   the virtual scene for 15 ms, 6 cm ahead of the muzzle, fading as k².
- * - Spent cases: ONE instanced pool. Ballistic, bounce on `world.floorY`,
+ * - Spent cases: ONE instanced pool. Ballistic, bounce on `world.floorY` (sampled once
+ *   under the spawn point: they land within a metre or two),
  *   the landing sound only on the first landing (CQC), then lie on their side.
  * - Dropped magazines: one instanced pool per weapon (the magazine geometry
  *   and the gun material), ballistic, bounce once or twice and lie flat.
@@ -188,6 +189,7 @@ class BodyPool {
     this.scl = new Float32Array(n * 3).fill(1);
     this.rq = new Float32Array(n * 4);       // rest orientation
     this.rh = new Float32Array(n);           // rest / contact height of the centre
+    this.floor = new Float32Array(n);        // floor height under the spawn point
     this.state = new Uint8Array(n);
     this.bounces = new Uint8Array(n);
     this.sounded = new Uint8Array(n);
@@ -217,39 +219,56 @@ class BodyPool {
     this.mesh.visible = false;
   }
 
-  /** @param {number} i */
+  /**
+   * Instance matrix = T(centre − R·S·c) · R · S, written straight into the
+   * instance buffer (no three calls in the per-frame loop).
+   * @param {number} i
+   */
   write(i) {
-    const p = this.pos, q = this.quat, o = i * 3, o4 = i * 4;
-    _q.set(q[o4], q[o4 + 1], q[o4 + 2], q[o4 + 3]);
-    _s.set(this.scl[o], this.scl[o + 1], this.scl[o + 2]);
-    // instance origin = centre − R·(S·centreLocal)
-    _v.set(this.centre.x * _s.x, this.centre.y * _s.y, this.centre.z * _s.z).applyQuaternion(_q);
-    _p.set(p[o] - _v.x, p[o + 1] - _v.y, p[o + 2] - _v.z);
-    _m.compose(_p, _q, _s);
-    this.mesh.setMatrixAt(i, _m);
+    const p = this.pos, q = this.quat, sc = this.scl, o = i * 3, o4 = i * 4, e = this.mesh.instanceMatrix.array, k = i * 16;
+    const x = q[o4], y = q[o4 + 1], z = q[o4 + 2], w = q[o4 + 3];
+    const sx = sc[o], sy = sc[o + 1], sz = sc[o + 2];
+    const x2 = x + x, y2 = y + y, z2 = z + z, xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2;
+    const wx = w * x2, wy = w * y2, wz = w * z2;
+    const r00 = 1 - (yy + zz), r10 = xy + wz, r20 = xz - wy;
+    const r01 = xy - wz, r11 = 1 - (xx + zz), r21 = yz + wx;
+    const r02 = xz + wy, r12 = yz - wx, r22 = 1 - (xx + yy);
+    const c = this.centre, cx = c.x * sx, cy = c.y * sy, cz = c.z * sz;
+    e[k] = r00 * sx; e[k + 1] = r10 * sx; e[k + 2] = r20 * sx; e[k + 3] = 0;
+    e[k + 4] = r01 * sy; e[k + 5] = r11 * sy; e[k + 6] = r21 * sy; e[k + 7] = 0;
+    e[k + 8] = r02 * sz; e[k + 9] = r12 * sz; e[k + 10] = r22 * sz; e[k + 11] = 0;
+    e[k + 12] = p[o] - (r00 * cx + r01 * cy + r02 * cz);
+    e[k + 13] = p[o + 1] - (r10 * cx + r11 * cy + r12 * cz);
+    e[k + 14] = p[o + 2] - (r20 * cx + r21 * cy + r22 * cz);
+    e[k + 15] = 1;
     this.dirty = true;
   }
 
   /**
    * @param {number} dt
-   * @param {{ floorY: (x: number, z: number) => number } | null} world
    * @param {{ play?: (key: string, x: number, y: number, z: number, gain?: number, rate?: number) => number } | null} audio
    * @param {number} bounce
    */
-  update(dt, world, audio, bounce) {
-    const P = this.pos, V = this.vel, Q = this.quat, W = this.ang, st = this.state;
+  update(dt, audio, bounce) {
+    const P = this.pos, V = this.vel, Q = this.quat, W = this.ang, st = this.state, F = this.floor;
+    const kSettle = 1 - Math.exp(-FX.settleRate * dt);
     for (let i = 0; i < this.count; i++) {
       const s = st[i];
       if (s === FREE || s === REST) continue;
       const o = i * 3, o4 = i * 4;
       if (s === SETTLE) {
-        _q.set(Q[o4], Q[o4 + 1], Q[o4 + 2], Q[o4 + 3]);
-        _q2.set(this.rq[o4], this.rq[o4 + 1], this.rq[o4 + 2], this.rq[o4 + 3]);
-        _q.slerp(_q2, 1 - Math.exp(-FX.settleRate * dt));
-        Q[o4] = _q.x; Q[o4 + 1] = _q.y; Q[o4 + 2] = _q.z; Q[o4 + 3] = _q.w;
-        const fy = world ? world.floorY(P[o], P[o + 2]) : 0;
-        P[o + 1] += ((Number.isFinite(fy) ? fy : 0) + this.rh[i] - P[o + 1]) * (1 - Math.exp(-FX.settleRate * dt));
-        if (_q.angleTo(_q2) < 0.01) st[i] = REST;
+        // normalised lerp toward the resting orientation (small steps; nothing leaves this loop)
+        const R = this.rq;
+        let ax = Q[o4], ay = Q[o4 + 1], az = Q[o4 + 2], aw = Q[o4 + 3];
+        let bx = R[o4], by = R[o4 + 1], bz = R[o4 + 2], bw = R[o4 + 3];
+        if (ax * bx + ay * by + az * bz + aw * bw < 0) { bx = -bx; by = -by; bz = -bz; bw = -bw; }
+        ax += (bx - ax) * kSettle; ay += (by - ay) * kSettle; az += (bz - az) * kSettle; aw += (bw - aw) * kSettle;
+        const n = Math.sqrt(ax * ax + ay * ay + az * az + aw * aw) || 1;
+        ax /= n; ay /= n; az /= n; aw /= n;
+        Q[o4] = ax; Q[o4 + 1] = ay; Q[o4 + 2] = az; Q[o4 + 3] = aw;
+        P[o + 1] += (F[i] + this.rh[i] - P[o + 1]) * kSettle;
+        const d = Math.abs(ax * bx + ay * by + az * bz + aw * bw);
+        if (d > 0.99999) st[i] = REST;          // within ~0.5°
         this.write(i);
         continue;
       }
@@ -257,18 +276,16 @@ class BodyPool {
       P[o] += V[o] * dt; P[o + 1] += V[o + 1] * dt; P[o + 2] += V[o + 2] * dt;
       // q += ½ (0, ω) q dt
       const wx = W[o], wy = W[o + 1], wz = W[o + 2];
-      let qx = Q[o4], qy = Q[o4 + 1], qz = Q[o4 + 2], qw = Q[o4 + 3];
+      const qx = Q[o4], qy = Q[o4 + 1], qz = Q[o4 + 2], qw = Q[o4 + 3];
       const h = 0.5 * dt;
       const nx = qx + h * (wx * qw + wy * qz - wz * qy);
       const ny = qy + h * (wy * qw + wz * qx - wx * qz);
       const nz = qz + h * (wz * qw + wx * qy - wy * qx);
       const nw = qw - h * (wx * qx + wy * qy + wz * qz);
-      const ql = Math.hypot(nx, ny, nz, nw) || 1;
-      qx = nx / ql; qy = ny / ql; qz = nz / ql; qw = nw / ql;
-      Q[o4] = qx; Q[o4 + 1] = qy; Q[o4 + 2] = qz; Q[o4 + 3] = qw;
-      let fy = world ? world.floorY(P[o], P[o + 2]) : 0;
-      if (!Number.isFinite(fy)) fy = 0;
-      const contact = this.rh[i] * 0.8;
+      const ql = Math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw) || 1;
+      Q[o4] = nx / ql; Q[o4 + 1] = ny / ql; Q[o4 + 2] = nz / ql; Q[o4 + 3] = nw / ql;
+      // the floor under where it was spawned (sampled once: it lands within a metre or two)
+      const fy = F[i], contact = this.rh[i] * 0.8;
       if (P[o + 1] < fy + contact) {
         P[o + 1] = fy + contact;
         if (V[o + 1] < 0) {
@@ -281,7 +298,8 @@ class BodyPool {
           W[o] *= FX.spinKeep; W[o + 1] *= FX.spinKeep; W[o + 2] *= FX.spinKeep;
           this.bounces[i]++;
         }
-        if (Math.hypot(V[o], V[o + 1], V[o + 2]) < FX.restSpeed || this.bounces[i] >= FX.maxBounces) this._settle(i);
+        const vx = V[o], vy = V[o + 1], vz = V[o + 2];
+        if (vx * vx + vy * vy + vz * vz < FX.restSpeed * FX.restSpeed || this.bounces[i] >= FX.maxBounces) this._settle(i);
       }
       this.write(i);
     }
@@ -401,6 +419,8 @@ export class WeaponFX {
 
     this._warm = false;
     this._warmCounts = new Array(1 + this.magPools.length).fill(0);
+    /** @type {{ floorY?: (x: number, z: number) => number } | null} the world (set by the system each frame) */
+    this.world = null;
   }
 
   /**
@@ -441,6 +461,7 @@ export class WeaponFX {
     B.ang[o] = _v.x; B.ang[o + 1] = _v.y; B.ang[o + 2] = _v.z;
     B.scl[o] = caseRL[0]; B.scl[o + 1] = caseRL[1]; B.scl[o + 2] = caseRL[0];
     B.rh[i] = caseRL[0];
+    B.floor[i] = this._floorAt(px, pz);
     B.state[i] = FLY; B.bounces[i] = 0; B.sounded[i] = 0;
     B.sound[i] = sound; B.gain[i] = 0.6 + 0.3 * r[3];
     B.write(i);
@@ -466,9 +487,20 @@ export class WeaponFX {
     _v.set(r[0] - 0.5, r[1] - 0.5, r[2] - 0.5).normalize().multiplyScalar(spin * (0.5 + r[3]));
     B.ang[o] = _v.x; B.ang[o + 1] = _v.y; B.ang[o + 2] = _v.z;
     B.rh[i] = Math.min(B.half.x, B.half.y, B.half.z);
+    B.floor[i] = this._floorAt(_v.x, _v.z);
     B.state[i] = FLY; B.bounces[i] = 0; B.sounded[i] = 0;
     B.sound[i] = 'magDrop'; B.gain[i] = 0.9;
     B.write(i);
+  }
+
+  /**
+   * Floor height at (x, z) from the world, once per spawned body (event time).
+   * @param {number} x @param {number} z
+   */
+  _floorAt(x, z) {
+    const W = this.world;
+    const y = W && W.floorY ? W.floorY(x, z) : 0;
+    return Number.isFinite(y) ? y : 0;
   }
 
   /**
@@ -533,9 +565,9 @@ export class WeaponFX {
       } else if (L.intensity !== 0) L.intensity = 0;
     }
     if (step > 0) {
-      const world = ctx.world || null, audio = ctx.audio || null;
-      this.brass.update(step, world, audio, FX.brassBounce);
-      for (let i = 0; i < this.magPools.length; i++) this.magPools[i].update(step, world, audio, FX.magBounce);
+      const audio = ctx.audio || null;
+      this.brass.update(step, audio, FX.brassBounce);
+      for (let i = 0; i < this.magPools.length; i++) this.magPools[i].update(step, audio, FX.magBounce);
     }
   }
 

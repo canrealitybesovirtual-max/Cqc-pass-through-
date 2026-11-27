@@ -179,22 +179,23 @@ export class WeaponView {
       this.magHoldPos.copy(this.magSeat).sub(this.palm);
     }
 
-    // Parts: pivots, axes and directions.
-    this.trigPivot = vec(M.trigger.pivot);
-    this.trigAxis = vec(M.trigger.axis).normalize();
+    // Parts (gun space): 1 slides along the slide axis, 2 turns about the trigger pin,
+    // 3 turns about the slide-stop / selector pin, 4 slides along the catch axis.
+    this.slide = new Shift(this.slideAxis);
+    this.trig = new Pivot(vec(M.trigger.pivot), vec(M.trigger.axis).normalize());
     this.trigPull = M.trigger.pullRad;
-    /** @type {{ pivot: THREE.Vector3, axis: THREE.Vector3, angles: Record<string, number>, lift: number } | null} */
+    /** @type {(Pivot & { angles: Record<string, number>, lift: number }) | null} */
     this.p3 = null;
     if (M.slideStop) {
       const pivot = vec(M.slideStop.pivot), axis = vec(M.slideStop.axis).normalize();
       // The manifest says the front rises into the slide notch; pick the sign that does that.
       const s = this._lifts(pivot, axis, 1) ? 1 : -1;
-      this.p3 = { pivot, axis, angles: {}, lift: s * M.slideStop.liftRad };
+      this.p3 = Object.assign(new Pivot(pivot, axis), { angles: {}, lift: s * M.slideStop.liftRad });
     } else if (M.selector) {
       const S = M.selector;
-      this.p3 = { pivot: vec(S.pivot), axis: vec(S.axis).normalize(), angles: { safe: S.safe, auto: S.auto, semi: S.semi }, lift: 0 };
+      this.p3 = Object.assign(new Pivot(vec(S.pivot), vec(S.axis).normalize()), { angles: { safe: S.safe, auto: S.auto, semi: S.semi }, lift: 0 });
     }
-    this.catchAxis = M.magCatch ? vec(M.magCatch.axis).normalize() : new THREE.Vector3(1, 0, 0);
+    this.catch = new Shift(M.magCatch ? vec(M.magCatch.axis).normalize() : new THREE.Vector3(1, 0, 0));
     this.catchTravel = M.magCatch ? M.magCatch.travel : 0;
 
     // Smoothed part state (the model only; the mechanism is WeaponInstance).
@@ -373,18 +374,16 @@ export class WeaponView {
     if (P) a3 = P.lift ? (w.stopRaised ? P.lift : 0) : (P.angles[w.mode] || 0);
     this.p3Vis += (a3 - this.p3Vis) * (P && P.lift ? k40 : k25);
     const U = this.uPart.value;
-    // 1: slide / carrier
-    _v.copy(this.slideAxis).multiplyScalar(w.slidePos * this.travel);
-    _m.makeTranslation(_v.x, _v.y, _v.z).toArray(U, 16);
-    // 2: trigger
-    pivotRotation(this.trigPivot, this.trigAxis, this.trigVis * this.trigPull, _m).toArray(U, 32);
-    // 3: slide stop / selector
-    if (P) pivotRotation(P.pivot, P.axis, this.p3Vis, _m).toArray(U, 48);
-    // 4: magazine catch
-    _v.copy(this.catchAxis).multiplyScalar(this.catchVis * this.catchTravel);
-    _m.makeTranslation(_v.x, _v.y, _v.z).toArray(U, 64);
+    this.slide.d = w.slidePos * this.travel;
+    writeShift(U, 16, this.slide);
+    this.trig.angle = this.trigVis * this.trigPull;
+    writePivot(U, 32, this.trig);
+    if (P) { P.angle = this.p3Vis; writePivot(U, 48, P); }
+    this.catch.d = this.catchVis * this.catchTravel;
+    writeShift(U, 64, this.catch);
     // seated magazine (pushed out along the well while it slides home)
-    this.mag.position.copy(this.magSeat).addScaledVector(this.magAxis, -this.magOut);
+    const mp = this.mag.position, ms = this.magSeat, ma = this.magAxis, mo = this.magOut;
+    mp.x = ms.x - ma.x * mo; mp.y = ms.y - ma.y * mo; mp.z = ms.z - ma.z * mo;
   }
 
   /**
@@ -394,18 +393,49 @@ export class WeaponView {
   rackLocal(slidePos, out) { return out.copy(this.rackPoint).addScaledVector(this.slideAxis, slidePos * this.travel); }
 }
 
+/** A part that turns `angle` rad about the unit `axis` through `pivot` (gun space). */
+export class Pivot {
+  /** @param {THREE.Vector3} pivot @param {THREE.Vector3} axis */
+  constructor(pivot, axis) { this.pivot = pivot; this.axis = axis; this.angle = 0; }
+}
+
+/** A part that slides `d` m along the unit `axis` (gun space). */
+export class Shift {
+  /** @param {THREE.Vector3} axis */
+  constructor(axis) { this.axis = axis; this.d = 0; }
+}
+
 /**
- * T(p) · R(axis, angle) · T(−p).
- * @param {THREE.Vector3} p @param {THREE.Vector3} axis @param {number} angle @param {THREE.Matrix4} out
+ * Write T(p) · R(axis, angle) · T(−p), column-major, at U[o .. o+15]. The
+ * numbers stay inside (descriptor in, nothing returned), so nothing is boxed.
+ * @param {Float32Array} U @param {number} o @param {Pivot} P
  */
-function pivotRotation(p, axis, angle, out) {
-  out.makeRotationAxis(axis, angle);
-  _v2.copy(p).applyMatrix4(out);
-  out.setPosition(p.x - _v2.x, p.y - _v2.y, p.z - _v2.z);
-  return out;
+export function writePivot(U, o, P) {
+  const a = P.axis, x = a.x, y = a.y, z = a.z, c = Math.cos(P.angle), s = Math.sin(P.angle), t = 1 - c;
+  const r00 = t * x * x + c, r01 = t * x * y - s * z, r02 = t * x * z + s * y;
+  const r10 = t * x * y + s * z, r11 = t * y * y + c, r12 = t * y * z - s * x;
+  const r20 = t * x * z - s * y, r21 = t * y * z + s * x, r22 = t * z * z + c;
+  const p = P.pivot, px = p.x, py = p.y, pz = p.z;
+  U[o] = r00; U[o + 1] = r10; U[o + 2] = r20; U[o + 3] = 0;
+  U[o + 4] = r01; U[o + 5] = r11; U[o + 6] = r21; U[o + 7] = 0;
+  U[o + 8] = r02; U[o + 9] = r12; U[o + 10] = r22; U[o + 11] = 0;
+  U[o + 12] = px - (r00 * px + r01 * py + r02 * pz);
+  U[o + 13] = py - (r10 * px + r11 * py + r12 * pz);
+  U[o + 14] = pz - (r20 * px + r21 * py + r22 * pz);
+  U[o + 15] = 1;
+}
+
+/**
+ * Write the translation axis · d, column-major, at U[o .. o+15].
+ * @param {Float32Array} U @param {number} o @param {Shift} S
+ */
+export function writeShift(U, o, S) {
+  const a = S.axis, d = S.d;
+  U[o] = 1; U[o + 1] = 0; U[o + 2] = 0; U[o + 3] = 0;
+  U[o + 4] = 0; U[o + 5] = 1; U[o + 6] = 0; U[o + 7] = 0;
+  U[o + 8] = 0; U[o + 9] = 0; U[o + 10] = 1; U[o + 11] = 0;
+  U[o + 12] = a.x * d; U[o + 13] = a.y * d; U[o + 14] = a.z * d; U[o + 15] = 1;
 }
 
 /** @param {number} x */
 function smooth01(x) { const t = x < 0 ? 0 : x > 1 ? 1 : x; return t * t * (3 - 2 * t); }
-
-export { pivotRotation };

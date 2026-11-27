@@ -13,8 +13,70 @@ export class HomePage {
     $('ver').textContent = version;
     this.msg = $('msg');
     this.support = $('support');
+    this.loadBox = $('load');
+    this.loadBar = /** @type {HTMLProgressElement} */ ($('loadBar'));
+    this.loadText = $('loadText');
     /** @type {import('../app/App.js').App|null} */ this.app = null;
     /** @type {import('../debug/Diagnostics.js').Diagnostics|null} */ this.diag = null;
+    /** @type {any} */ this.sup = {};
+    /**
+     * Preload state (src/core/Preload.js). Every session button waits while
+     * loading (the warm-up draw must finish before XR); Enter MR needs 'ready'.
+     * @type {'idle'|'loading'|'ready'|'failed'}
+     */
+    this.load = 'idle';
+    this.pct = -1;
+    /**
+     * Called synchronously inside the button's click, right after app.enter(mode)
+     * (for work that needs the user gesture, like unlocking audio).
+     * @type {((mode: string) => void)|null}
+     */
+    this.onEnter = null;
+  }
+
+  /**
+   * Progress of the preload: "Loading 63%". Touches the DOM only when the whole
+   * percent changes; reaches 100 % only at the very end.
+   * @param {number} fraction 0..1
+   * @param {string} [label]
+   */
+  loading(fraction, label = '') {
+    const first = this.load !== 'loading';
+    this.load = 'loading';
+    this.loadBox.hidden = false;
+    const pct = Math.max(0, Math.min(100, Math.floor(fraction * 100)));
+    if (first) this.setButtons(true);
+    if (pct === this.pct) return;
+    this.pct = pct;
+    this.loadBar.value = pct / 100;
+    this.loadText.textContent = `Loading ${pct}%`;
+    this.loadText.title = label;
+    this.loadText.className = '';
+  }
+
+  /**
+   * Everything is loaded and warmed: Enter MR becomes available.
+   * @param {{ times: { totalMs: number }, warnings: string[] }} p
+   */
+  loaded(p) {
+    this.load = 'ready';
+    this.loadBar.value = 1;
+    const warn = p.warnings.length ? ` · ${p.warnings[0]}` : '';
+    this.loadText.textContent = `Ready (loaded in ${(p.times.totalMs / 1000).toFixed(1)} s)${warn}`;
+    this.loadText.className = p.warnings.length ? 'bad' : 'ok';
+    this.setButtons(true);
+  }
+
+  /**
+   * The preload failed: say why; the probe sessions stay usable.
+   * @param {string} error
+   */
+  loadFailed(error) {
+    this.load = 'failed';
+    this.loadBox.hidden = false;
+    this.loadText.textContent = `Loading failed: ${error}. Enter MR needs the game files; the probe sessions still work. Reload the page to try again.`;
+    this.loadText.className = 'bad';
+    this.setButtons(true);
   }
 
   /** @param {string} text */
@@ -31,20 +93,23 @@ export class HomePage {
   bind(app, diag, sup) {
     this.app = app;
     this.diag = diag;
+    this.sup = sup || {};
     const ar = !!sup.ar, vr = !!sup.vr;
     if (!sup.secureContext) this.unsupported('This page needs HTTPS for WebXR.');
     else if (!sup.webxr) this.unsupported('WebXR is not available here. Open this page in the Meta Quest Browser.');
     else if (!ar) this.unsupported(`Mixed reality (immersive-ar) is not supported here.${vr ? ' VR test only.' : ''}`);
     else { this.support.textContent = 'Mixed reality is supported.'; this.support.className = 'ok'; }
 
-    /** @type {[string, string, boolean][]} */
-    const buttons = [['bPlay', 'play', ar], ['bProbe', 'probe', ar], ['bBounds', 'bounds', ar], ['bVR', 'vr', vr], ['bRetry', 'reduced', ar]];
-    for (const [id, mode, ok] of buttons) {
-      const b = /** @type {HTMLButtonElement} */ ($(id));
-      b.disabled = !ok;
+    /** @type {[string, string][]} */
+    const buttons = [['bPlay', 'play'], ['bProbe', 'probe'], ['bBounds', 'bounds'], ['bVR', 'vr'], ['bRetry', 'reduced']];
+    for (const [id, mode] of buttons) {
       // No await, no work before enter(): the click is the user gesture requestSession needs.
-      b.addEventListener('click', () => app.enter(mode));
+      $(id).addEventListener('click', () => {
+        app.enter(mode);
+        if (this.onEnter) this.onEnter(mode);
+      });
     }
+    this.setButtons(true);
     $('bCopy').addEventListener('click', async () => this.note(await diag.copy()));
     $('bDownload').addEventListener('click', () => this.note(diag.download()));
     $('bShare').addEventListener('click', async () => this.note(await diag.share()));
@@ -80,9 +145,10 @@ export class HomePage {
 
   /** @param {boolean} on */
   setButtons(on) {
-    const sup = (this.diag && this.diag.data.support) || {};
+    const sup = this.sup || {};
+    const ready = this.load === 'ready', idle = this.load !== 'loading';
     /** @type {[string, boolean][]} */
-    const gate = [['bPlay', !!sup.ar], ['bProbe', !!sup.ar], ['bBounds', !!sup.ar], ['bVR', !!sup.vr], ['bRetry', !!sup.ar]];
+    const gate = [['bPlay', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
     for (const [id, ok] of gate) /** @type {HTMLButtonElement} */ ($(id)).disabled = !on || !ok;
   }
 

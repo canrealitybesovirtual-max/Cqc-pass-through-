@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CQC Pass-Through</title>
-  <script type="importmap">{ "imports": { "three": "./vendor/three/three.module.js" } }</script>
+  <script type="importmap">{ "imports": { "three": "./vendor/three/three.module.js", "three/addons/": "./vendor/three/addons/" } }</script>
   <link rel="stylesheet" href="./src/ui/page.css">
 </head>
 <body>
@@ -14,6 +14,7 @@
 
     <section>
       <h2>Start</h2>
+      <div id="load" hidden><progress id="loadBar" max="1" value="0"></progress> <span id="loadText">Loading 0%</span></div>
       <div class="row">
         <button id="bPlay" disabled>Enter MR</button>
         <button id="bProbe" disabled>Probe session</button>
@@ -26,6 +27,7 @@
 
     <section>
       <h2>Phase 1 headset tests</h2>
+      <p>Wait until the bar under Start says <b>Ready</b> (the game files load and warm up first).</p>
       <ol>
         <li><b>Probe session.</b> You should see your room with an orange cube ahead. Check the panel's lines.
           <ul>

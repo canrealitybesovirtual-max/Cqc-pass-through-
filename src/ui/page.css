@@ -16,3 +16,8 @@ button.quiet { font-weight: 400; color: var(--dim); }
 ol li, ul li { margin: 4px 0; }
 #summary ul { padding-left: 18px; }
 #summary li { font-size: 15px; }
+#load { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; color: var(--dim); }
+#load[hidden] { display: none; }
+#loadBar { flex: 0 0 220px; height: 12px; accent-color: var(--ok); }
+#loadText.ok { color: var(--ok); }
+#loadText.bad { color: var(--bad); }

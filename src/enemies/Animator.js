@@ -75,9 +75,16 @@ export const ANIM = Object.freeze({
 });
 
 /** Pocket (butt in the right shoulder) in the rest model frame, and the low-ready rifle axes. */
+/** Rifle at low ready, in the chest's rest frame: butt position, muzzle direction, rifle up. */
+export const LOW = {
+  // butt high in the shoulder, muzzle 40° down and 42° across the body (searched so
+  // that this model's 0.57 m arms reach both the grip and the handguard)
+  butt: new V3(-0.13, 1.4, 0.05),
+  fwd: new V3(0.513, -0.643, 0.569).normalize(),
+  up: new V3(0.15, 0.72, 0.676).normalize(),
+};
+/** The aimed rifle's butt sits in the shoulder pocket (used by the clavicle). */
 const POCKET = new V3(-0.115, 1.415, 0.085);
-const LOW_FWD = new V3(0.36, -0.62, 0.7).normalize(); // muzzle direction at low ready (chest frame, rest)
-const LOW_UP = new V3(-0.2, 0.55, 0.8).normalize();
 /** Left hand on the handguard, rifle space: finger direction, palm normal, wrist position. */
 const SUP_F = new V3(0.72, 0.18, -0.67).normalize();
 const SUP_N = new V3(0.35, 0.94, 0).normalize();
@@ -87,11 +94,27 @@ const CURL_L = [[0.95, 1.05, 0.65], [1.05, 1.15, 0.7], [1.1, 1.2, 0.75], [1.15, 
 const CURL_D = [[0.3, 0.45, 0.3], [0.35, 0.5, 0.35], [0.4, 0.55, 0.35], [0.45, 0.6, 0.4], [0.1, 0.2, 0.15]];
 
 const UP = new V3(0, 1, 0);
+/** Rifle-space points used to land a dropped rifle on the floor (magazine tip, front sight). */
+const MAG_TIP = new V3(0, -0.2, 0.02);
+const SIGHT_TOP = new V3(0, 0.05, 0);
 const TAU = Math.PI * 2;
 const SUB = 0.004; // spring sub-step (s)
 
-/** @typedef {{ px: number, pz: number, yaw: number, planted: boolean, swingT: number,
- *   fromX: number, fromZ: number, fromYaw: number, fromPitch: number, pitch: number, landT: number, err: number }} Foot */
+/**
+ * One foot of the stepping gait (world space). Number fields start as
+ * non-integers so V8 stores them as unboxed doubles from the first write
+ * (a field that starts as a small integer and later holds a fraction can
+ * allocate on stores in some optimised code).
+ */
+class Foot {
+  constructor() {
+    this.px = 0.5; this.pz = 0.5; this.yaw = 0.5;
+    this.planted = true;
+    this.swingT = 0.5;
+    this.fromX = 0.5; this.fromZ = 0.5; this.fromYaw = 0.5; this.fromPitch = 0.5;
+    this.pitch = 0.5; this.landT = 0.5; this.err = 0.5;
+  }
+}
 
 export class Animator {
   /**
@@ -121,6 +144,7 @@ export class Animator {
 
     // inputs (world space), set by the owner before update()
     this.rootX = 0; this.rootY = 0; this.rootZ = 0; this.rootYaw = 0;
+    this.goodX = 0; this.goodY = 0; this.goodZ = 0; this.goodYaw = 0;
     this.vx = 0; this.vz = 0;
     this.aimX = 0; this.aimY = 1.4; this.aimZ = 5;
     /** 0 low ready … 1 aimed. */
@@ -133,7 +157,7 @@ export class Animator {
     this.gaitOn = false;
     this.phi = 0;
     /** @type {Foot[]} */
-    this.feet = [0, 1].map(() => ({ px: 0, pz: 0, yaw: 0, planted: true, swingT: 0, fromX: 0, fromZ: 0, fromYaw: 0, fromPitch: 0, pitch: 0, landT: 1, err: 0 }));
+    this.feet = [new Foot(), new Foot()];
     this.stepLen = ANIM.stepLen[0];
     /** @type {number} */ this.period = ANIM.shufflePeriod;
     this.moveAmt = 0; // 0 standing … 1 walking (smoothed)
@@ -160,6 +184,7 @@ export class Animator {
     this.fallX = 0; this.fallZ = -1; // model-space horizontal fall direction
     this.extendL = 0; this.extendR = 0; this.extendToL = 0.6; this.extendToR = 0.9;
     this.drop = 0; // floor-contact correction (m)
+    this.low = 0; // lowest body point (lowest())
     this.footDL = new V3(); this.footDR = new V3(); // model-space feet at death
     /** Local pose captured at death (blended out over the first 0.2 s). */
     /** @type {Q[]} */ this.deathLq = mk(CORE_COUNT, () => new Q());
@@ -327,6 +352,13 @@ export class Animator {
     if (!(dt >= 0)) dt = 0;
     if (dt > 0.25) dt = 0.25;
     this.dt = dt;
+    // inputs that are not finite keep their last good value (x − x is 0 only for finite x)
+    if (this.rootX - this.rootX === 0 && this.rootZ - this.rootZ === 0 && this.rootY - this.rootY === 0 && this.rootYaw - this.rootYaw === 0) {
+      this.goodX = this.rootX; this.goodY = this.rootY; this.goodZ = this.rootZ; this.goodYaw = this.rootYaw;
+    } else { this.rootX = this.goodX; this.rootY = this.goodY; this.rootZ = this.goodZ; this.rootYaw = this.goodYaw; }
+    if (!(this.vx - this.vx === 0 && this.vz - this.vz === 0)) { this.vx = 0; this.vz = 0; }
+    if (!(this.aimX - this.aimX === 0 && this.aimY - this.aimY === 0 && this.aimZ - this.aimZ === 0)) { this.aimX = this.sx; this.aimY = this.sy; this.aimZ = this.sz; }
+    if (!(this.raiseTarget >= 0)) this.raiseTarget = 0;
     this.cosY = Math.cos(this.rootYaw);
     this.sinY = Math.sin(this.rootYaw);
     this.stepEvents = 0;
@@ -618,13 +650,13 @@ export class Animator {
     const d = this.def, v = this._v, q = this._q, r = this.raiseE;
     const chestD = q[0].mulConj(this.mq[B.spine3], d.restModelQ[B.spine3]);
     // shoulder pocket now
-    const pocket = v[0].subVectors(POCKET, d.restModelP[B.spine3]).applyQ(chestD).add(this.mp[B.spine3]);
+    const pocket = v[0].subVectors(LOW.butt, d.restModelP[B.spine3]).applyQ(chestD).add(this.mp[B.spine3]);
     // low ready: the chest's heading only (stays low when he leans or looks up)
     const fwd = v[1].set(0, 0, 1).applyQ(chestD);
     const hy = Math.atan2(fwd.x, fwd.z) * 0.5;
     const qy = q[1];
     qy.x = 0; qy.y = Math.sin(hy); qy.z = 0; qy.w = Math.cos(hy);
-    const lf = v[2].copy(LOW_FWD).applyQ(qy), lu = v[3].copy(LOW_UP).applyQ(qy);
+    const lf = v[2].copy(LOW.fwd).applyQ(qy), lu = v[3].copy(LOW.up).applyQ(qy);
     const Zr = v[4].copy(lf).scale(-1), Xr = v[5].cross(lu, Zr).normalize(), Yr = v[6].cross(Zr, Xr);
     const qLow = q[2].setFromBasis(Xr, Yr, Zr);
     const pLow = v[7].copy(d.rifle.butt).applyQ(qLow).scale(-1).add(pocket);
@@ -785,6 +817,7 @@ export class Animator {
 
   updateDeath() {
     const d = this.def, v = this._v, q = this._q, A = ANIM, dt = this.dt, E = this.E;
+    // (scalar maths is written out here: a double passed to a helper V8 does not inline is boxed)
     this.deathT += dt;
     const t = this.deathT;
     // torso topples about the hips: θ'' = (g / L)·sin θ (an inverted pendulum)
@@ -807,8 +840,11 @@ export class Animator {
       this.th += this.om * dt;
       if (this.th >= thEnd) { this.th = thEnd; this.om = 0; }
     }
-    const prog = clamp(this.th / thEnd, 0, 1);
-    this.twist = this.twistTo * smooth(prog * 1.15);
+    let prog = this.th / thEnd;
+    prog = prog < 0 ? 0 : prog > 1 ? 1 : prog;
+    let w = prog * 1.15;
+    w = w > 1 ? 1 : w;
+    this.twist = this.twistTo * w * w * (3 - 2 * w);
     const ke = dt > 0 ? 1 - Math.exp(-dt / 0.45) : 1;
     if (this.landed) {
       this.extendL += (this.extendToL - this.extendL) * ke;
@@ -816,29 +852,38 @@ export class Animator {
     }
     if (t > 2.5) this.settled = true;
 
-    // body rotation: fall about axis = up × fallDir, after the twist
-    const ax = v[0].set(this.fallZ, 0, -this.fallX); // up × (fx, 0, fz) = (fz, 0, −fx)
-    const qf = q[0].setAxisAngle(ax.x, ax.y, ax.z, this.th);
-    const qt = q[1].setAxisAngle(0, 1, 0, this.twist);
+    // body rotation: fall about axis = up × fallDir = (fz, 0, −fx), after the twist
+    const hf = this.th * 0.5, sf = Math.sin(hf), ht = this.twist * 0.5;
+    const qf = q[0], qt = q[1];
+    qf.x = this.fallZ * sf; qf.y = 0; qf.z = -this.fallX * sf; qf.w = Math.cos(hf);
+    qt.x = 0; qt.y = Math.sin(ht); qt.z = 0; qt.w = Math.cos(ht);
     const body = q[2].mul(qf, qt);
     // hips: drop as the knees give way (and as the torso goes down), moving back over the fall
-    const u = clamp(t / this.dropT, 0, 1);
-    const yr = A.restPelvis;
-    let py = Math.min(this.y0 - (this.y0 - yr) * u * u, yr + (this.y0 - yr) * Math.cos(this.th));
-    if (this.faceDown && this.th < 0.9) py = Math.max(py, 0.5); // onto the knees first
-    const hT = this.hEnd * smooth(Math.max(u, prog));
+    let u = t / this.dropT;
+    u = u > 1 ? 1 : u;
+    const yr = A.restPelvis, y0 = this.y0;
+    let py = y0 - (y0 - yr) * u * u;
+    const pyT = yr + (y0 - yr) * Math.cos(this.th);
+    if (pyT < py) py = pyT;
+    if (this.faceDown && this.th < 0.9 && py < 0.5) py = 0.5; // onto the knees first
+    let um = u > prog ? u : prog;
+    um = um * um * (3 - 2 * um);
+    const hT = this.hEnd * um;
     const P = this.mp[B.pelvis];
-    P.set(this.p0.x + this.fallX * hT, py < yr ? yr : py, this.p0.z + this.fallZ * hT);
+    P.x = this.p0.x + this.fallX * hT; P.y = py < yr ? yr : py; P.z = this.p0.z + this.fallZ * hT;
     this.mq[B.pelvis].mul(body, d.restModelQ[B.pelvis]);
 
     // spine and head: limp, lagging the fall; the head rolls to a side once down
     const D = this._dq;
-    const lag = clamp(-this.om * 0.08, -0.25, 0.25);
+    let lag = -this.om * 0.08;
+    lag = lag < -0.25 ? -0.25 : lag > 0.25 ? 0.25 : lag;
     for (let i = 0; i < 3; i++) {
       E[0] = lag * 0.33 + this.spr[0] * 0.3; E[1] = this.spr[1] * 0.3; E[2] = this.spr[2] * 0.3;
       this.fkDelta(B.spine1 + i, this.euler(D));
     }
-    const roll = this.landed ? smooth((t - 0.9) / 0.6) * (this.extendToL > this.extendToR ? 0.6 : -0.6) : 0;
+    let ur = (t - 0.9) / 0.6;
+    ur = ur < 0 ? 0 : ur > 1 ? 1 : ur;
+    const roll = this.landed ? ur * ur * (3 - 2 * ur) * (this.extendToL > this.extendToR ? 0.6 : -0.6) : 0;
     E[0] = lag * 0.5; E[1] = roll * 0.5; E[2] = 0;
     this.fkDelta(B.neck, this.euler(D));
     E[0] = lag * 0.5 + this.spr[3]; E[1] = roll; E[2] = 0;
@@ -848,32 +893,40 @@ export class Animator {
     this.fkDelta(B.clavR, D);
     // arms: limp, swinging out with the fall, then lying
     // (rest is an A-pose: −0.55 brings a limp arm in to hang by the body)
-    const swing = Math.sin(Math.PI * clamp(t / 0.9, 0, 1)) * 0.35 * prog;
-    const abd = -0.55 + 0.35 * smooth(prog * 1.3) + swing;
+    const us = t / 0.9;
+    const swing = Math.sin(Math.PI * (us > 1 ? 1 : us)) * 0.35 * prog;
+    let ua = prog * 1.3;
+    ua = ua > 1 ? 1 : ua;
+    const abd = -0.55 + 0.35 * ua * ua * (3 - 2 * ua) + swing;
     for (let side = 0; side < 2; side++) {
-      const ua = side === 0 ? B.upperArmL : B.upperArmR, la = side === 0 ? B.lowerArmL : B.lowerArmR, ha = side === 0 ? B.handL : B.handR;
-      const sg = side === 0 ? 1 : -1;
-      E[0] = -0.1 - swing * 0.4; E[1] = 0; E[2] = sg * abd;
-      this.fkDelta(ua, this.euler(D));
-      const ch = d.chains[side];
-      D.setAxisAngle(ch.hinge.x, ch.hinge.y, ch.hinge.z, 0.35 + swing * 0.3);
-      this.fkDelta(la, D);
+      const ub = side === 0 ? B.upperArmL : B.upperArmR, lb = side === 0 ? B.lowerArmL : B.lowerArmR, hb = side === 0 ? B.handL : B.handR;
+      E[0] = -0.1 - swing * 0.4; E[1] = 0; E[2] = (side === 0 ? 1 : -1) * abd;
+      this.fkDelta(ub, this.euler(D));
+      const hg = d.chains[side].hinge, he = (0.35 + swing * 0.3) * 0.5, se = Math.sin(he);
+      D.x = hg.x * se; D.y = hg.y * se; D.z = hg.z * se; D.w = Math.cos(he);
+      this.fkDelta(lb, D);
       E[0] = 0.2; E[1] = 0; E[2] = 0;
-      this.fkDelta(ha, this.euler(D));
+      this.fkDelta(hb, this.euler(D));
     }
     // blend out of the pose he died in (everything above the hips) over 0.2 s
-    const bo = smooth(t / 0.22);
+    let ub0 = t / 0.22;
+    ub0 = ub0 > 1 ? 1 : ub0;
+    const bo = ub0 * ub0 * (3 - 2 * ub0);
     if (bo < 1) {
+      const b0 = 1 - bo;
       for (let b = B.spine1; b <= B.handR; b++) {
-        const lq = q[3].conjMul(this.mq[d.parent[b]], this.mq[b]);
-        lq.slerp(this.deathLq[b], lq, bo);
-        this.mq[b].mul(this.mq[d.parent[b]], lq);
-        this.mp[b].copy(d.restLocalT[b]).applyQ(this.mq[d.parent[b]]).add(this.mp[d.parent[b]]);
+        const pb = d.parent[b];
+        const lq = q[3].conjMul(this.mq[pb], this.mq[b]), s0 = this.deathLq[b];
+        const k1 = s0.x * lq.x + s0.y * lq.y + s0.z * lq.z + s0.w * lq.w < 0 ? -bo : bo;
+        lq.x = s0.x * b0 + lq.x * k1; lq.y = s0.y * b0 + lq.y * k1; lq.z = s0.z * b0 + lq.z * k1; lq.w = s0.w * b0 + lq.w * k1;
+        lq.normalize();
+        this.mq[b].mul(this.mq[pb], lq);
+        this.mp[b].copy(d.restLocalT[b]).applyQ(this.mq[pb]).add(this.mp[pb]);
       }
     }
     // the floor: nothing below it; once down, the lowest point rests on it
-    let low = this.lowest();
-    let lift = -low;
+    this.lowest();
+    let lift = -this.low;
     if (this.landed) {
       const k = dt > 0 ? 1 - Math.exp(-dt / 0.08) : 1;
       this.drop += (lift - this.drop) * k;
@@ -884,32 +937,41 @@ export class Animator {
     if (this.landed) this.headToFloor();
     this.armsToFloor();
     // legs: to the feet he stood on, sliding out straight once down
+    const legL = d.len.thigh + d.len.calf;
     for (let f = 0; f < 2; f++) {
       const ft = f === 0 ? this.footDL : this.footDR, ex = f === 0 ? this.extendL : this.extendR;
       const hipB = f === 0 ? B.thighL : B.thighR;
       const hip = v[2].copy(d.restLocalT[hipB]).applyQ(this.mq[B.pelvis]).add(this.mp[B.pelvis]);
       // straight-leg place: from the hip, away from the head, on the floor
       const bodyAxis = v[3].set(0, 1, 0).applyQ(body);
-      const sx = hip.x - bodyAxis.x * (d.len.thigh + d.len.calf) * 0.97, sz = hip.z - bodyAxis.z * (d.len.thigh + d.len.calf) * 0.97;
-      const an = this._ankle[f].set(ft.x + (sx - ft.x) * ex, d.ankleY * (1 - 0.4 * ex), ft.z + (sz - ft.z) * ex);
+      const sx = hip.x - bodyAxis.x * legL * 0.97, sz = hip.z - bodyAxis.z * legL * 0.97;
+      const an = this._ankle[f];
+      an.x = ft.x + (sx - ft.x) * ex; an.y = d.ankleY * (1 - 0.4 * ex); an.z = ft.z + (sz - ft.z) * ex;
       // a foot the hips have left behind is dragged along
       const dx = an.x - hip.x, dy = an.y - hip.y, dz = an.z - hip.z, dl = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      const reach = (d.len.thigh + d.len.calf) * 0.99;
+      const reach = legL * 0.99;
       if (dl > reach) {
         const k = reach / dl;
-        an.set(hip.x + dx * k, hip.y + dy * k, hip.z + dz * k);
+        an.x = hip.x + dx * k; an.y = hip.y + dy * k; an.z = hip.z + dz * k;
         if (an.y < d.ankleY * 0.6) an.y = d.ankleY * 0.6;
-        if (f === 0) { this.footDL.x = an.x; this.footDL.z = an.z; } else { this.footDR.x = an.x; this.footDR.z = an.z; }
+        ft.x = an.x; ft.z = an.z;
       }
       const pole = v[4].set(0, 0, 1).applyQ(body);
       pole.y += 0.3;
       this.ik(f === 0 ? 2 : 3, an, pole);
       // a bent leg keeps its foot flat on the floor; a straight one lies with the body
       const fb = f === 0 ? B.footL : B.footR, tb = f === 0 ? B.ballL : B.ballR;
-      const flat = q[4].setAxisAngle(0, 1, 0, this.twist * 0.4);
-      const lying = q[5].mul(qf, qt).postMul(q[6].setAxisAngle(1, 0, 0, 0.45 + (f === 0 ? 0.15 : -0.1)));
-      this._dq.slerp(flat, lying, smooth(ex)).postMul(d.restModelQ[fb]);
-      this.fkAbs(fb, this._dq);
+      const hy = this.twist * 0.2, hp = (0.45 + (f === 0 ? 0.15 : -0.1)) * 0.5;
+      const flat = q[4], tilt = q[6];
+      flat.x = 0; flat.y = Math.sin(hy); flat.z = 0; flat.w = Math.cos(hy);
+      tilt.x = Math.sin(hp); tilt.y = 0; tilt.z = 0; tilt.w = Math.cos(hp);
+      const lying = q[5].mul(qf, qt).postMul(tilt);
+      let ue = ex < 0 ? 0 : ex > 1 ? 1 : ex;
+      ue = ue * ue * (3 - 2 * ue);
+      const k1 = flat.x * lying.x + flat.y * lying.y + flat.z * lying.z + flat.w * lying.w < 0 ? -ue : ue, k0 = 1 - ue;
+      D.x = flat.x * k0 + lying.x * k1; D.y = flat.y * k0 + lying.y * k1; D.z = flat.z * k0 + lying.z * k1; D.w = flat.w * k0 + lying.w * k1;
+      D.normalize().postMul(d.restModelQ[fb]);
+      this.fkAbs(fb, D);
       this.fkDelta(tb, D.identity());
     }
     this.updateRifleDrop();
@@ -917,15 +979,17 @@ export class Animator {
     this.twists();
   }
 
-  /** Lowest body point above the floor (y − radius), model space. */
+  /** Lowest body point above the floor (y − radius), model space, into this.low. */
   lowest() {
     const P = this.mp, d = this.def;
-    let m = Infinity;
     const hd = this._v[6].copy(d.eyeR).scale(0.5).applyQ(this._q[3].mulConj(this.mq[B.head], d.restModelQ[B.head])).add(P[B.head]);
-    m = Math.min(m, hd.y - 0.1);
-    m = Math.min(m, P[B.spine3].y - 0.13, P[B.spine2].y - 0.13, P[B.pelvis].y - 0.11);
-    m = Math.min(m, P[B.upperArmL].y - 0.07, P[B.upperArmR].y - 0.07);
-    return m;
+    let m = hd.y - 0.1;
+    if (P[B.spine3].y - 0.13 < m) m = P[B.spine3].y - 0.13;
+    if (P[B.spine2].y - 0.13 < m) m = P[B.spine2].y - 0.13;
+    if (P[B.pelvis].y - 0.11 < m) m = P[B.pelvis].y - 0.11;
+    if (P[B.upperArmL].y - 0.07 < m) m = P[B.upperArmL].y - 0.07;
+    if (P[B.upperArmR].y - 0.07 < m) m = P[B.upperArmR].y - 0.07;
+    this.low = m;
   }
 
   /**
@@ -934,17 +998,23 @@ export class Animator {
    */
   armsToFloor() {
     const v = this._v, q = this._q;
-    const k = this.landed ? smooth((this.deathT - (this.dropT * 0.5)) / 0.6) : 0;
+    let k = 0;
+    if (this.landed) {
+      k = (this.deathT - this.dropT * 0.5) / 0.6;
+      k = k < 0 ? 0 : k > 1 ? 1 : k;
+      k = k * k * (3 - 2 * k);
+    }
     for (let side = 0; side < 2; side++) {
       const hb = side === 0 ? B.handL : B.handR, ub = side === 0 ? B.upperArmL : B.upperArmR, lb = side === 0 ? B.lowerArmL : B.lowerArmR;
       const hand = this.mp[hb], elbow = this.mp[lb];
       const want = 0.045;
-      const low = Math.min(hand.y, elbow.y + 0.01);
+      const low = hand.y < elbow.y + 0.01 ? hand.y : elbow.y + 0.01;
       if (low >= want && k <= 0) continue;
       let ty = hand.y;
       if (low < want) ty += want - low;
       ty += (want - ty) * k;
-      const tgt = v[2].set(hand.x, ty, hand.z);
+      const tgt = v[2];
+      tgt.x = hand.x; tgt.y = ty; tgt.z = hand.z;
       const pole = v[3].subVectors(elbow, this.mp[ub]).rejectFrom(v[4].subVectors(hand, this.mp[ub]).normalize());
       pole.y += 0.05;
       const hq = q[3].copy(this.mq[hb]);
@@ -966,8 +1036,13 @@ export class Animator {
     // rotate about the horizontal axis perpendicular to the neck→head direction
     const axis = v[9].cross(arm, UP).normalize();
     if (axis.x * axis.x + axis.y * axis.y + axis.z * axis.z < 1e-6) return;
-    const ang = -clamp(Math.asin(clamp(gap / L, 0, 1)), 0, 0.5);
-    const r = q[4].setAxisAngle(axis.x, axis.y, axis.z, ang);
+    let sn = gap / L;
+    sn = sn > 1 ? 1 : sn;
+    let ang = Math.asin(sn);
+    ang = ang > 0.5 ? 0.5 : ang;
+    const hs = -ang * 0.5, s = Math.sin(hs);
+    const r = q[4];
+    r.x = axis.x * s; r.y = axis.y * s; r.z = axis.z * s; r.w = Math.cos(hs);
     this.mq[B.neck].preMul(r);
     this.mq[B.head].preMul(r);
     this.mp[B.head].subVectors(this.mp[B.head], nk).applyQ(r).add(nk);
@@ -979,22 +1054,27 @@ export class Animator {
     this.rifleT += dt;
     const t = this.rifleT, rv = this.rV;
     // ballistic until the lowest end reaches the floor, rotating toward lying flat
-    const k = smooth(t / 0.55);
-    this.rifleQ.slerp(this.rQ0, this.rQ1, k);
-    const tt = Math.min(t, 1.5);
-    this.rifleP.set(this.rP0.x + rv.x * tt, this.rP0.y + rv.y * tt - 4.9 * tt * tt, this.rP0.z + rv.z * tt);
+    let k = t / 0.55;
+    k = k > 1 ? 1 : k;
+    k = k * k * (3 - 2 * k);
+    const a = this.rQ0, b = this.rQ1, RQ = this.rifleQ, k0 = 1 - k;
+    const k1 = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0 ? -k : k;
+    RQ.x = a.x * k0 + b.x * k1; RQ.y = a.y * k0 + b.y * k1; RQ.z = a.z * k0 + b.z * k1; RQ.w = a.w * k0 + b.w * k1;
+    RQ.normalize();
+    const tt = t < 1.5 ? t : 1.5, RP = this.rifleP;
+    RP.x = this.rP0.x + rv.x * tt; RP.y = this.rP0.y + rv.y * tt - 4.9 * tt * tt; RP.z = this.rP0.z + rv.z * tt;
     // floor contact: lift so the rifle's lowest sample point is on the floor
     const R = this.def.rifle, v = this._v[10];
     let low = Infinity;
     for (let i = 0; i < 4; i++) {
-      if (i === 0) v.copy(R.muzzle); else if (i === 1) v.copy(R.butt); else if (i === 2) v.set(0, -0.2, 0.02); else v.set(0, 0.05, 0);
-      v.applyQ(this.rifleQ).add(this.rifleP);
+      if (i === 0) v.copy(R.muzzle); else if (i === 1) v.copy(R.butt); else if (i === 2) v.copy(MAG_TIP); else v.copy(SIGHT_TOP);
+      v.applyQ(RQ).add(RP);
       if (v.y < low) low = v.y;
     }
     if (low < 0.025) {
-      this.rifleP.y += 0.025 - low;
+      RP.y += 0.025 - low;
       // stop sliding once it has landed
-      if (t > 0.3) { this.rP0.x = this.rifleP.x - rv.x * tt; this.rP0.z = this.rifleP.z - rv.z * tt; rv.x *= 0.85; rv.z *= 0.85; }
+      if (t > 0.3) { this.rP0.x = RP.x - rv.x * tt; this.rP0.z = RP.z - rv.z * tt; rv.x *= 0.85; rv.z *= 0.85; }
     }
   }
 
