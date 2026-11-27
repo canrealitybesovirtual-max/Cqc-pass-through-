@@ -14,7 +14,7 @@ function meanShot(r, def, twoHand = false) {
 const finite = (r) => [r.back, r.pitch, r.yaw, r.vBack, r.vPitch, r.vYaw].every(Number.isFinite);
 const inBounds = (r) => Math.abs(r.back) < RECOIL_MAX_BACK && Math.abs(r.pitch) < RECOIL_MAX_ROT && Math.abs(r.yaw) < RECOIL_MAX_ROT;
 
-/** Single-shot peaks, settle time and the full-auto mean from 1 ms steps. */
+/** Single-shot peaks, settle time and the full-auto mean, in 1 ms steps (the model's figures). */
 function measure(def, twoHand) {
   const r = new Recoil(def.recoil, SEED);
   meanShot(r, def, twoHand);
@@ -50,7 +50,7 @@ test('integrator matches the analytic damped oscillator (Glock pitch, single imp
   }
   const tPeak = Math.atan2(wd, z * w0) / wd;
   // CQC tuned its numbers on this integrator (semi-implicit Euler, <= 4 ms steps), so it is kept
-  // even though it runs ~9 % behind the exact solution around the peak; it must stay close.
+  // rather than solved exactly; at 90 Hz it must stay within 12 % of the exact curve (it is ~9 %).
   assert.ok(maxErr < 0.12 * exact(tPeak), `max error ${maxErr} rad vs peak ${exact(tPeak)}`);
 });
 

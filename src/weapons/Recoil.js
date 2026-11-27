@@ -11,13 +11,16 @@
  * moves. Each shot adds a velocity impulse (`fire`); `update` integrates.
  *
  * Integration: semi-implicit Euler in sub-steps of at most 4 ms (a long frame is split, never taken
- * as one big step, which is what made CQC's first spring blow up). Robustness:
+ * as one big step, which is what made CQC's first spring blow up). CQC tuned the Glock numbers on
+ * exactly this integrator, so it is kept rather than replaced by the exact solution (at 72-90 Hz
+ * frames it runs within 10 % of it). Robustness:
  * - dt that is NaN, negative or 0 advances nothing;
  * - a frame at least `settleDt` long (the time for the slowest spring to decay to 1/1000) puts the
  *   springs at rest, which is where they would be anyway, without iterating;
  * - a runaway guard resets the springs if anything leaves a sane range or stops being finite.
  *
- * No allocation after construction.
+ * Per-shot randomness comes from a private seeded xorshift32 (deterministic in tests; Math.random
+ * allocates when it refills its cache). No allocation after construction.
  */
 
 /** Largest integration sub-step (s). */

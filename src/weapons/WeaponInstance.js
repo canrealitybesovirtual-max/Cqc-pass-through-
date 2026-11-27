@@ -365,12 +365,25 @@ export class WeaponInstance {
       const s = this.slide;
       if (s === SLIDE_CYCLE) {
         const need = (1 - this.slidePos) * sd.backS;
-        if (left < need) { this.slidePos += left / sd.backS; left = 0; } else { left -= need; this._atRear(); }
+        if (left < need) {
+          const pos = this.slidePos + left / sd.backS;
+          this.slidePos = pos < 1 ? pos : 1;           // rounding never overshoots the rear
+          left = 0;
+        } else { left -= need; this._atRear(); }
       } else if (s === SLIDE_FORWARD) {
         const need = (this.slidePos - this.stopPos) * sd.homeS;
-        if (left < need) { this.slidePos -= left / sd.homeS; left = 0; } else { left -= need; this._arrive(); }
+        if (left < need) {
+          const pos = this.slidePos - left / sd.homeS;
+          this.slidePos = pos > this.stopPos ? pos : this.stopPos;
+          left = 0;
+        } else { left -= need; this._arrive(); }
       } else if (s === SLIDE_BATTERY && this.autoT >= 0) {
-        if (left < this.autoT) { this.autoT -= left; left = 0; } else { left -= this.autoT; this.autoT = -1; this.late = left; this._release(); }
+        if (left < this.autoT) { this.autoT -= left; left = 0; } else {
+          left -= this.autoT;
+          this.autoT = -1;
+          this.late = left;
+          this._release();                             // the auto sear lets the hammer go
+        }
       } else {
         left = 0;
       }
