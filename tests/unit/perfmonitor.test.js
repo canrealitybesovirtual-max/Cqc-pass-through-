@@ -121,3 +121,36 @@ test('cancelled runs are reported once', () => {
   assert.equal(got[0].cancelled, 'hidden');
   assert.equal(got[0].elapsedS, 1);
 });
+
+test('measured rate replaces the guess and follows a switch', () => {
+  const { pm, clock } = make(); // guess 72 Hz
+  pm.setRates([72, 80, 90, 120]);
+  const changes = [];
+  pm.onRateChange = (hz) => changes.push(hz);
+  drive(pm, clock, new Array(40).fill(1000 / 90));
+  assert.equal(pm.hz, 90, 'first window adopts 90 Hz');
+  drive(pm, clock, new Array(36).fill(1000 / 72)); // one window at 72: not yet
+  assert.equal(pm.hz, 90);
+  drive(pm, clock, new Array(40).fill(1000 / 72));
+  assert.equal(pm.hz, 72, 'two windows confirm 72 Hz');
+  assert.deepEqual(changes, [90, 72]);
+});
+
+test('noisy intervals that match no offered rate change nothing', () => {
+  const { pm, clock } = make();
+  pm.setRates([72, 90]);
+  drive(pm, clock, new Array(100).fill(21));
+  assert.equal(pm.hz, 72);
+  assert.equal(pm.measured, false);
+});
+
+test('a measured 13.9 ms frame at 72 Hz is not a miss, but at a wrong 120 Hz guess it would be', () => {
+  const { pm, clock } = make();
+  pm.setRates([72, 80, 90, 120]);
+  pm.setRate(120); // wrong guess, like a lagging frameRate attribute
+  drive(pm, clock, new Array(80).fill(1000 / 72));
+  assert.equal(pm.hz, 72);
+  const before = pm.hitchCount;
+  drive(pm, clock, new Array(100).fill(1000 / 72));
+  assert.equal(pm.hitchCount, before, 'no false misses once measured');
+});

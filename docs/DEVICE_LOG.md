@@ -16,4 +16,37 @@ Add one entry per phase test. Each entry records the build version (shown on the
 
 ## Entries
 
-_None yet._
+### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)
+
+Sessions run: VR test, Boundary probe, Play. The Probe session and the 60 s timing runs were not run yet.
+
+**Device facts (device-verified)**
+
+| Item | Result |
+|---|---|
+| GPU | Adreno 740 |
+| Max texture size | 8192 |
+| Layer | `XRProjectionLayer`, 3360×1760 (1680×1760 per eye at scale 1.0); native framebuffer scale 1 |
+| Fixed foveation | Read-back 0.5 (works) |
+| Offered refresh rates | 72 / 80 / 90 / 120. Switching works. |
+| Default refresh rate in AR | **90 Hz**: 89.96 fps measured in the boundary probe without switching |
+| `session.frameRate` | **Reads 0 at session start** and lags a switch, so the app measures the rate itself (p1.1) |
+| Play (`local-floor`) features | `plane-detection`, `mesh-detection`, `hit-test`, `anchors`, `hand-tracking`. Blend `alpha-blend`. |
+| Anchors in `local-floor` | Created in 22 ms; pose after 1 frame |
+| Space Setup | **50 planes** (16 wall, 6 door, 10 table, 7 shelf, 3 bed, 2 couch, 2 ceiling, 2 wall art, **2 floor**: 111 m² and 14.4 m²); 25 meshes (largest 35,794 triangles); available 0.36 s after start. **More than one room's data reaches the browser.** |
+| Plane `lastChangedTime` | Changes about 3 times per second with no change in plane count. The importer must snapshot on demand, not on every change. |
+| Hit-test inside the Space Setup area | 75 % of trigger samples hit; average distance 2.39 m, max 5.14 m |
+| `bounded-floor` in AR | Granted; `boundsGeometry` is a 4-point 9.2 × 1.48 m rectangle from the first sample. **Not the real boundary: never use it for safety.** |
+| GL extensions | `OVR_multiview2` + `OCULUS_multiview` (with multisample), `WEBGL_multisampled_render_to_texture`, `WEBGL_multi_draw`, ASTC, ETC. **No `KHR_parallel_shader_compile`** (so the warm-up must be a draw), **no GPU timer queries** (GPU time comes from OVR Metrics only). |
+| WebGPU | `navigator.gpu` and `XRGPUBinding` exist (not used) |
+| `depthUsage` / `depthDataFormat` attributes | Present even when depth was not requested |
+| Idle CPU per frame | 0.42–0.47 ms |
+| Reference-space reset | One `reset` with a transform about 260 ms after a VR session started |
+
+**Bugs found and fixed in p1.1**
+
+- Holding both grips ended the session inside the frame callback, which caused "XRFrame access outside the callback" errors at every exit. The end is now deferred.
+- The miss threshold assumed 72 Hz (the `frameRate` attribute read 0). The rate is now measured, and the switch target comes from the measured rate.
+- The depth probe ran without the depth feature (the attributes are present anyway). It is now gated on `enabledFeatures`.
+- A "planes" event was logged on every `lastChangedTime` tick (filling the 300-event log). It is now logged only when the count changes, and the ticks are counted.
+- The panel uploaded 679 times in 121 s. It is now limited to 2 redraws per second, and 1 per 10 s during timing runs.

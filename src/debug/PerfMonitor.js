@@ -44,6 +44,17 @@ export class PerfMonitor {
     this.interval = 0;
     this.periodMs = 1000 / 72;
     this.hz = 72;
+    // Measured rate: Quest Browser reports session.frameRate = 0 at start and the
+    // attribute lags a switch, so the period used for "missed" comes from the
+    // median of the last 36 intervals snapped to an offered rate.
+    /** @type {number[]} */ this.rates = [72, 80, 90, 120];
+    this.medBuf = new Float32Array(36);
+    this.medTmp = new Float32Array(36);
+    this.medN = 0;
+    this.pendingHz = 0;
+    this.pendingCount = 0;
+    this.measured = false;
+    /** @type {((hz: number) => void)|null} */ this.onRateChange = null;
     // Hitch log: t, interval, cpu, then one value per system
     this.hitchStride = 3 + this.nSys;
     this.hitchCapacity = hitchCapacity;
@@ -75,13 +86,49 @@ export class PerfMonitor {
     /** @type {((r: { label: string, cancelled: string, elapsedS: number, incomplete: true }) => void)|null} */ this.onRunCancelled = null;
   }
 
+  /** @param {number[]} rates offered refresh rates */
+  setRates(rates) { if (rates.length) this.rates = rates.slice(); }
+
+  /** Initial guess; the measured rate replaces it within about a second. */
   /** @param {number} hz */
   setRate(hz) {
-    if (!(hz > 0)) return;
+    if (!(hz > 0) || Math.abs(hz - this.hz) < 0.5) return;
     this.hz = hz;
     this.periodMs = 1000 / hz;
     this.skipNext = true;
-    if (this.running) this.cancelRun('rate changed');
+    this.cancelRun('rate changed');
+  }
+
+  /** Offered rate matching a median interval within 6 %, else 0. */
+  /** @param {number} med */
+  _snap(med) {
+    for (let i = 0; i < this.rates.length; i++) {
+      const p = 1000 / this.rates[i];
+      if (Math.abs(med - p) < 0.06 * p) return this.rates[i];
+    }
+    return 0;
+  }
+
+  /** @param {number} interval */
+  _measure(interval) {
+    this.medBuf[this.medN++] = interval;
+    if (this.medN < this.medBuf.length) return;
+    this.medN = 0;
+    const a = this.medTmp;
+    a.set(this.medBuf);
+    for (let i = 1; i < a.length; i++) { const v = a[i]; let j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
+    const hz = this._snap(a[a.length >> 1]);
+    if (!hz) return;
+    if (Math.abs(hz - this.hz) < 0.5) { this.pendingHz = 0; this.pendingCount = 0; this.measured = true; return; }
+    if (hz === this.pendingHz) this.pendingCount++; else { this.pendingHz = hz; this.pendingCount = 1; }
+    // A new rate must hold for two windows (or one, before the first measurement).
+    if (this.pendingCount >= 2 || !this.measured) {
+      this.pendingHz = 0;
+      this.pendingCount = 0;
+      this.measured = true;
+      this.setRate(hz);
+      if (this.onRateChange) this.onRateChange(hz);
+    }
   }
 
   /** Register (once) and queue a named event marker for the next hitch entry. */
@@ -112,6 +159,7 @@ export class PerfMonitor {
     const cpu = this.now() - this.frameStart;
     if (this.pendingMarker) { this.lastMarker = this.pendingMarker; this.pendingMarker = 0; }
     if (this.skipNext || this.interval <= 0) { this.skipNext = false; return; }
+    this._measure(this.interval);
     const h = this.head;
     this.ringInterval[h] = this.interval;
     this.ringCpu[h] = cpu;

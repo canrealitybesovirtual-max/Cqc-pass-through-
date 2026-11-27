@@ -70,7 +70,7 @@ export class Probes {
     this.anchorFrames = 0;
 
     // Depth / light / body / bounds
-    this.depthDone = !rec.granted.depthUsage;
+    this.depthDone = !this.enabled.includes('depth-sensing'); // the depthUsage attribute exists even without the feature
     this.depthTries = 0;
     /** @type {any} */ this.lightProbe = null;
     this.lightDone = true;
@@ -82,11 +82,24 @@ export class Probes {
     // Controls
     this.gripHold = 0;
     this.rateBusy = false;
+    this.requestedHz = 0;
+    this.requestedAt = 0;
+    this.attr2s = false;
+    this.stampChanges = 0;
 
     rec.probes.hitTest = { granted: this.hitOk, buckets: this.hit };
     rec.probes.spaceSetup = { planes: 0, meshes: 0, firstPlanesAtMs: null, summary: null };
     rec.probes.anchor = { state: 'pending' };
     rec.probes.clear = { explicit: loop.explicitClear, toggles: [] };
+    rec.probes.frameRate = { attrAtStart: /** @type {any} */ (session).frameRate ?? null, attrAt2s: null, measuredHz: null, switches: [] };
+    perf.onRateChange = (hz) => {
+      const F = rec.probes.frameRate;
+      if (F.measuredHz === null) F.measuredHz = hz;
+      const sw = F.switches.at(-1);
+      if (sw && sw.measuredAfter === null) sw.measuredAfter = hz;
+      if (this.requestedHz && Math.abs(hz - this.requestedHz) < 0.5) this.requestedHz = 0;
+      this.event(`measured rate ${hz} Hz`);
+    };
   }
 
   /** Async setup that must not run inside the frame callback. */
@@ -151,13 +164,31 @@ export class Probes {
     const f = /** @type {any} */ (frame);
     const inp = this.input;
 
+    if (!this.attr2s && ms > 2000) {
+      this.attr2s = true;
+      this.rec.probes.frameRate.attrAt2s = /** @type {any} */ (this.session).frameRate ?? null;
+      if (this.rec.probes.frameRate.measuredHz === null && this.perf.measured) this.rec.probes.frameRate.measuredHz = this.perf.hz;
+    }
+
+    if (this.requestedHz && performance.now() - this.requestedAt > 3000) {
+      this.event(`rate still ${this.perf.measured ? this.perf.hz : '?'} Hz 3 s after requesting ${this.requestedHz}`);
+      this.requestedHz = 0;
+    }
+
     // ---- controls
     if (inp.right.aDown) this.toggleRun();
     if (inp.right.bDown) this.cycleRate();
     if (inp.left.aDown) this.toggleClear();
     if (inp.left.squeeze > 0.8 && inp.right.squeeze > 0.8) {
       this.gripHold += dt;
-      if (this.gripHold > 1 && !this.ended) { this.ended = true; this.event('exit by both grips'); this.session.end().catch(() => {}); }
+      if (this.gripHold > 1 && !this.ended) {
+        this.ended = true;
+        this.event('exit by both grips');
+        // Never end inside the frame callback: Quest ends synchronously and the XRFrame
+        // (still used by three.js after this callback) becomes invalid.
+        setTimeout(() => this.session.end().catch(() => {}), 0);
+        return;
+      }
     } else this.gripHold = 0;
 
     // ---- controller rays (aiming aid)
@@ -285,11 +316,11 @@ export class Probes {
     if (!planes) { if (ss.summary === null) { ss.summary = 'frame.detectedPlanes missing'; this.rev++; } return; }
     let stamp = 0;
     planes.forEach((/** @type {any} */ p) => { if (p.lastChangedTime > stamp) stamp = p.lastChangedTime; });
-    if (planes.size === this.planeCount && stamp === this.planeStamp) {
-      if (planes.size === 0 && ms > 3000 && ss.summary === null) { ss.summary = 'no Space Setup data after 3 s'; this.rev++; }
-      return;
-    }
+    if (planes.size === 0 && ms > 3000 && ss.summary === null) { ss.summary = 'no Space Setup data after 3 s'; this.rev++; }
+    if (planes.size === this.planeCount && stamp === this.planeStamp) return;
+    if (stamp !== this.planeStamp && this.planeStamp >= 0) { this.stampChanges++; ss.lastChangedTimeUpdates = this.stampChanges; }
     this.planeStamp = stamp;
+    if (planes.size === this.planeCount) return; // only poses/timestamps moved: no rebuild, no log
     this.planeCount = planes.size;
     if (planes.size && ss.firstPlanesAtMs === null) ss.firstPlanesAtMs = Math.round(ms);
     /** @type {Record<string, number>} */ const labels = {};
@@ -447,6 +478,7 @@ export class Probes {
 
   toggleRun() {
     if (this.perf.running) return;
+    if (this.requestedHz) { this.event(`wait: switching to ${this.requestedHz} Hz`); return; }
     this.perf.startRun(RUN_MS, `${Math.round(this.perf.hz)} Hz ${this.mode}`);
     this.perf.mark('run start');
     this.event(`run start ${Math.round(this.perf.hz)} Hz`);
@@ -455,14 +487,20 @@ export class Probes {
   cycleRate() {
     const s = /** @type {any} */ (this.session);
     const rates = frameRates(this.session);
-    const next = nextRate(rates, s.frameRate);
+    // The frameRate attribute reads 0 at start on Quest and lags a switch: use the measured rate.
+    const next = nextRate(rates, this.perf.hz);
     if (next === null || this.rateBusy || typeof s.updateTargetFrameRate !== 'function') { this.event('rate switch unavailable'); return; }
     this.rateBusy = true;
+    this.requestedHz = next;
+    this.requestedAt = performance.now();
     this.perf.mark('rate switch');
+    const sw = { requested: next, from: this.perf.hz, attrAfter: null, measuredAfter: null };
+    const F = this.rec.probes.frameRate;
+    if (F.switches.length < 30) F.switches.push(sw);
     s.updateTargetFrameRate(next).then(() => {
-      this.perf.setRate(s.frameRate || next);
-      this.event(`rate → ${s.frameRate || next} Hz`);
-    }).catch((/** @type {any} */ e) => this.event(`rate ${next} failed: ${errText(e)}`))
+      sw.attrAfter = s.frameRate ?? null;
+      this.event(`rate requested ${next} Hz`);
+    }).catch((/** @type {any} */ e) => { this.requestedHz = 0; this.event(`rate ${next} failed: ${errText(e)}`); })
       .finally(() => { this.rateBusy = false; });
   }
 
@@ -502,7 +540,7 @@ export class Probes {
     const short = { 'local-floor': 'floor', 'plane-detection': 'planes', 'mesh-detection': 'meshes', 'hand-tracking': 'hands', 'depth-sensing': 'depth', 'light-estimation': 'light', 'body-tracking': 'body', 'bounded-floor': 'bounded' };
     const nm = (/** @type {string} */ f) => /** @type {any} */ (short)[f] || f;
     const out = [`CQC Pass-Through ${r.version} · ${r.mode}`];
-    out.push(`Space ${g.referenceSpace} · blend ${g.environmentBlendMode} · ${s.frameRate ?? '?'} Hz [${(g.supportedFrameRates || []).join('/')}]`);
+    out.push(`Space ${g.referenceSpace} · blend ${g.environmentBlendMode} · ${this.perf.measured ? `${this.perf.hz} Hz` : 'measuring Hz'}${this.requestedHz ? ` → ${this.requestedHz}` : ''} [${(g.supportedFrameRates || []).join('/')}]`);
     out.push(`Granted: ${(g.enabledFeatures || []).filter((/** @type {string} */ f) => f !== 'viewer' && f !== 'local').map(nm).join(' ')}`);
     if (g.missing && g.missing.length) out.push(`! Not granted: ${g.missing.map(nm).join(' ')}`);
     const ss = P.spaceSetup;
@@ -511,7 +549,8 @@ export class Probes {
     out.push(`${A.state === 'ok' ? '✓' : A.state === 'pending' || A.state === 'created' ? '•' : '!'} Anchor in ${g.referenceSpace}: ${A.state}${A.framesToPose ? ` (pose after ${A.framesToPose} frames)` : ''}`);
     if (r.mode === 'probe') {
       const D = P.depth;
-      out.push(D ? `${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear} · clear ${this.loop.explicitClear ? 'ON' : 'OFF'} [X]` : D.state}` : `• Depth: ${g.depthUsage ? 'waiting…' : 'not granted'}`);
+      const dOn = (g.enabledFeatures || []).includes('depth-sensing');
+      out.push(D ? `${D.state === 'ok' ? '✓' : '!'} Depth: ${D.state === 'ok' ? `${D.width}×${D.height} near ${D.depthNear} · clear ${this.loop.explicitClear ? 'ON' : 'OFF'} [X]` : D.state}` : `• Depth: ${dOn ? 'waiting…' : 'not granted'}`);
       const L = P.light, B = P.body;
       out.push(`• Light: ${L ? (L.estimate ? (typeof L.estimate === 'string' ? L.estimate : 'estimate ✓') : L.probe) : '-'} · Body: ${B ? (B.firstBody ? `✓ ${B.firstBody.joints} joints` : B.granted ? 'waiting…' : 'not granted') : '-'}`);
     }

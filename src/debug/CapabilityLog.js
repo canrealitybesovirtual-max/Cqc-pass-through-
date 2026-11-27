@@ -54,9 +54,11 @@ export function collectSession(rec, session, renderer, gl, att) {
   g.visibilityState = s.visibilityState ?? null;
   g.supportedFrameRates = frameRates(session);
   g.frameRate = s.frameRate ?? null;
-  g.depthUsage = s.depthUsage ?? null;
-  g.depthDataFormat = s.depthDataFormat ?? null;
-  g.depthType = s.depthType ?? null;
+  const depthOn = att.enabled.includes('depth-sensing');
+  g.depthUsage = depthOn ? s.depthUsage ?? null : null;
+  g.depthDataFormat = depthOn ? s.depthDataFormat ?? null : null;
+  g.depthType = depthOn ? s.depthType ?? null : null;
+  g.depthAttributesWithoutFeature = !depthOn && s.depthUsage != null; // Quest exposes them regardless
   g.initiateRoomCapture = typeof s.initiateRoomCapture === 'function';
   g.persistentAnchors = 'persistentAnchors' in s;
   g.requestLightProbe = typeof s.requestLightProbe === 'function';

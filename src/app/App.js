@@ -2,7 +2,7 @@
 import { VERSION } from '../version.js';
 import { Game, S } from './Game.js';
 import { Loop } from './Loop.js';
-import { MODES, attachSession, errText, featuresFor, requestXR } from '../xr/XRSession.js';
+import { MODES, attachSession, errText, featuresFor, frameRates, requestXR } from '../xr/XRSession.js';
 import { Input } from '../xr/Input.js';
 import { Lifecycle } from '../xr/Lifecycle.js';
 import { PerfMonitor } from '../debug/PerfMonitor.js';
@@ -42,6 +42,7 @@ export class App {
     /** @type {PerfMonitor|null} */ this.perf = null;
     /** @type {Loop|null} */ this.loop = null;
     this.panelRev = -1;
+    this.panelAt = -1e9;
     this.lifecycle = new Lifecycle({
       onEnd: () => this.ended(),
       onVisibility: (st) => this.visibility(st),
@@ -105,7 +106,8 @@ export class App {
     collectSession(rec, session, r, this.gfx.gl, att);
     const space = r.xr.getReferenceSpace();
     this.lifecycle.attach(session, space);
-    perf.setRate(/** @type {any} */ (session).frameRate || 72);
+    perf.setRates(frameRates(session));
+    perf.setRate(/** @type {any} */ (session).frameRate || 72); // guess; PerfMonitor measures the real rate
 
     const probes = new Probes({ rec, mode, input: this.input, draw: this.draw, perf, loop, renderer: r, session, space });
     this.probes = probes;
@@ -117,12 +119,18 @@ export class App {
     this.panel.placed = false;
     this.panel.mesh.visible = true;
     this.panelRev = -1;
+    this.panelAt = -1e9;
     loop.add({ name: 'input', update: () => this.input.update(session) });
     loop.add({ name: 'probe', update: (dt, t, f) => { probes.update(dt, t, f); this.cube.update(cam, dt); } });
     loop.add({
       name: 'ui',
-      update: (dt) => {
-        if (probes.rev !== this.panelRev) { this.panelRev = probes.rev; this.panel.setLines(probes.lines()); }
+      update: (dt, t) => {
+        // At most 2 redraws/s, and one per 10 s during a timing run, so the panel never pollutes the measurement.
+        if (probes.rev !== this.panelRev && t - this.panelAt >= (perf.running ? 10000 : 500)) {
+          this.panelRev = probes.rev;
+          this.panelAt = t;
+          this.panel.setLines(probes.lines());
+        }
         this.panel.follow(cam, dt);
         this.panel.flush();
       },
