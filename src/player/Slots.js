@@ -12,8 +12,14 @@
  *   rises past 0.55, or rose in the last 150 ms when the hand arrives. The gun
  *   settles into the fitted grip in 0.15 s.
  * - Let go within 0.24 m of the slot: the gun travels in along a smooth arc
- *   (0.34 s, 5 cm sideways bow). Anywhere else: it falls for 0.3 s, shrinks
- *   away and grows back in its slot (scale only, never a transparency switch).
+ *   (0.34 s, 5 cm sideways bow). Anywhere else, with real-surface physics
+ *   (v0.4): it lies in the world where it lands and stays (CARRY_FREE) until
+ *   the hand takes it again (`grabFromWorld`, the same 0.15 s draw blend from
+ *   where it lies); only the lost-object net (10 s outside the house) sends it
+ *   back (`returnLost`: shrink where it lies, grow in the slot). Without
+ *   physics (off, failed, or not built yet) the v0.3 rule stays: it falls for
+ *   0.3 s, shrinks away and grows back in its slot (scale only, never a
+ *   transparency switch).
  * - Controller pose lost for more than 0.25 s: auto-holster.
  *
  * `Carry` is the per-weapon state machine; `GrabSense` the per-hand squeeze
@@ -47,7 +53,9 @@ export const CARRY_HOLSTER = 3;
 export const CARRY_DROP = 4;
 export const CARRY_SHRINK = 5;
 export const CARRY_GROW = 6;
-export const CARRY_NAMES = Object.freeze(['slot', 'draw', 'hand', 'holster', 'drop', 'shrink', 'grow']);
+/** Lying in the world (a physics item), until picked up again or lost. */
+export const CARRY_FREE = 7;
+export const CARRY_NAMES = Object.freeze(['slot', 'draw', 'hand', 'holster', 'drop', 'shrink', 'grow', 'free']);
 
 /** `Carry.update` results. */
 export const EV_NONE = 0;
@@ -75,12 +83,16 @@ export class Carry {
      */
     this.t = 0.5;
     this.t = 0;
+    /** The current draw started from where the gun lay in the world (not from its slot). */
+    this.fromWorld = false;
   }
 
   get inHand() { return this.state === CARRY_DRAW || this.state === CARRY_HAND; }
   get inSlot() { return this.state === CARRY_SLOT || this.state === CARRY_GROW; }
   /** Grabbable from its slot. */
   get grabbable() { return this.state === CARRY_SLOT || this.state === CARRY_GROW; }
+  /** Lying in the world (grabbable there with `grabFromWorld`). */
+  get inWorld() { return this.state === CARRY_FREE; }
 
   /**
    * Weight of the hand pose (draw) or of the slot pose (holster arc), 0..1, eased.
@@ -106,19 +118,32 @@ export class Carry {
   grab() {
     if (!this.grabbable) return false;
     this._go(CARRY_DRAW);
+    this.fromWorld = false;
+    return true;
+  }
+
+  /** @returns {boolean} the gun left the world for the hand (the draw blends from where it lay) */
+  grabFromWorld() {
+    if (this.state !== CARRY_FREE) return false;
+    this._go(CARRY_DRAW);
+    this.fromWorld = true;
     return true;
   }
 
   /**
    * The hand let go.
-   * @param {boolean} nearSlot within `slotReach` of the slot
+   * @param {boolean} nearSlot within `slotReach` of the slot (and the holster rule held)
+   * @param {boolean} [free] it becomes a physics item lying in the world (else the v0.3 timed return)
    * @returns {boolean} the gun was in the hand
    */
-  release(nearSlot) {
+  release(nearSlot, free = false) {
     if (!this.inHand) return false;
-    this._go(nearSlot ? CARRY_HOLSTER : CARRY_DROP);
+    this._go(nearSlot ? CARRY_HOLSTER : free ? CARRY_FREE : CARRY_DROP);
     return true;
   }
+
+  /** The lost-object net (or a physics failure): shrink where it lies, grow back in the slot. */
+  returnLost() { if (this.state === CARRY_FREE || this.state === CARRY_DROP) this._go(CARRY_SHRINK); }
 
   /** Controller tracking lost too long: back to the holster. */
   lost() { if (this.inHand) this._go(CARRY_HOLSTER); }

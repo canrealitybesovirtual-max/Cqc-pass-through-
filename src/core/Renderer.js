@@ -19,7 +19,10 @@ export const PLAY_NEAR = 0.02;
  * Fixed light set from the start (docs/PLAN.md §10): the light count is part of
  * every shader's program key, so lights are never added or removed later. The
  * same holds for `scene.environment` (v0.3: a PMREM room, made here before
- * the warm-up and never replaced).
+ * the warm-up and never replaced) and the tone mapping (v0.4: PBR Neutral, so
+ * highlights roll off instead of clipping and base colours stay true).
+ * RoomLight (src/fx/RoomLight.js) later changes only intensities, colours,
+ * the sun's position, the environment intensity and rotation (uniforms).
  *
  * @param {{ dev: boolean }} opts
  */
@@ -41,6 +44,12 @@ export function createRenderer({ dev }) {
   renderer.xr.enabled = true;
   renderer.setClearColor(0x000000, 0); // alpha 0 = passthrough shows through
   renderer.info.autoReset = false; // reset once per frame by the Loop
+  // Colour response (v0.4, research-look R2/§3): chosen HERE, before any program compiles; the
+  // tone-mapping operator is part of every lit program's key (the XR target included), so it is
+  // never changed later. Exposure is a plain uniform (a trim only).
+  const tone = toneFromParams();
+  renderer.toneMapping = tone.mapping;
+  renderer.toneMappingExposure = tone.exposure;
 
   const scene = new THREE.Scene();
   scene.background = null;
@@ -70,7 +79,33 @@ export function createRenderer({ dev }) {
   // Only used outside XR; inside XR three.js drives its own ArrayCamera.
   const camera = new THREE.PerspectiveCamera(70, 1, CAMERA_NEAR, 50);
 
-  return { renderer, scene, camera, gl, canvas, hemi, sun, flashLights, envTexture, lighting: { env: scene.environmentIntensity, hemi: hemi.intensity, sun: sun.intensity } };
+  return {
+    renderer, scene, camera, gl, canvas, hemi, sun, flashLights, envTexture,
+    lighting: { env: scene.environmentIntensity, hemi: hemi.intensity, sun: sun.intensity, toneMapping: tone.name, exposure: tone.exposure },
+  };
+}
+
+/** Tone-mapping operators by URL name (`?tm=`). Neutral (Khronos PBR Neutral) keeps base colours true up to ~0.76. */
+export const TONE = Object.freeze({ neutral: THREE.NeutralToneMapping, none: THREE.NoToneMapping, agx: THREE.AgXToneMapping, aces: THREE.ACESFilmicToneMapping });
+
+/** The default look: PBR Neutral at exposure 1 (a trim, not a grade). */
+export const LOOK = Object.freeze({ toneMapping: 'neutral', exposure: 1 });
+
+/**
+ * The tone mapping for this page: `?tm=neutral|none|agx|aces` and `?exposure=<0.25..4>`
+ * (dev A/B switches, read once at load, before the warm-up).
+ * @returns {{ name: string, mapping: THREE.ToneMapping, exposure: number }}
+ */
+export function toneFromParams() {
+  let name = LOOK.toneMapping, exposure = LOOK.exposure;
+  try {
+    const p = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+    const tm = (p.get('tm') || '').toLowerCase();
+    if (tm in TONE) name = tm;
+    const ex = p.has('exposure') ? Number(p.get('exposure')) : NaN;
+    if (Number.isFinite(ex)) exposure = Math.max(0.25, Math.min(4, ex));
+  } catch { /* no location */ }
+  return { name, mapping: /** @type {any} */ (TONE)[name], exposure };
 }
 
 /**

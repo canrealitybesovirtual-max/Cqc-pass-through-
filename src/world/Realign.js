@@ -145,12 +145,28 @@ export function transformSnapshot(snap, m, space) {
     for (let i = 0; i < 16; i++) out[i] = Math.round(tmp[i] * 1e6) / 1e6 + 0;
     return out;
   };
-  return {
+  /** @type {any} */ const out = {
     version: snap.version,
     space: space || snap.space,
     planes: snap.planes.map((p) => ({ label: p.label, orientation: p.orientation, pose: move(p.pose), polygon: p.polygon.map((q) => [q[0], q[1]]) })),
     meshes: snap.meshes.map((x) => ({ label: x.label, pose: move(x.pose), min: x.min.slice(), max: x.max.slice(), vertexCount: x.vertexCount })),
   };
+  // v2: the global mesh's description (its encoded blob is in the old space: left out) and the
+  // captured triangles (shared arrays, every pose moved)
+  const g = /** @type {any} */ (snap).globalMesh;
+  if (g && typeof g === 'object') {
+    out.globalMesh = { label: g.label, mesh: g.mesh, vertexCount: g.vertexCount, triangleCount: g.triangleCount, lastChangedTime: g.lastChangedTime,
+      ...(g.hash ? { movedFrom: g.hash } : {}) };
+  } else if (snap.version >= 2) out.globalMesh = null;
+  const raw = /** @type {any} */ (snap).raw;
+  if (raw && Array.isArray(raw.meshes)) {
+    const moved = {
+      token: raw.token, global: raw.global,
+      meshes: raw.meshes.map((/** @type {any} */ r) => ({ label: r.label, pose: mul4(m, r.pose, new Float64Array(16)), lastChangedTime: r.lastChangedTime, data: r.data })),
+    };
+    Object.defineProperty(out, 'raw', { value: moved, enumerable: false, writable: true, configurable: true });
+  }
+  return out;
 }
 
 /**

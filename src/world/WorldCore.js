@@ -32,6 +32,12 @@ import { SnapshotBuilder } from './SnapshotBuilder.js';
 import { SpawnFinder } from './Spawner.js';
 import { transformPointXZ, transformSnapshot } from './Realign.js';
 import { pointInPolygon } from '../util/geom2d.js';
+import { MeshBVH } from './MeshBVH.js';
+import { SURF_NAME, colliderPositions, occluderPositions, prepMesh } from './MeshPrep.js';
+import { buildStatics } from './WorldStatics.js';
+import { attachRaw, globalRawMesh, rawOf } from './Snapshot.js';
+import { scanFromSnapshot } from './ScanSynth.js';
+import { CopyJob, commitScalars, exportCore } from './WorldState.js';
 
 /** Enemy radius 0.25 m + 0.03 m (PLAN §9). */
 export const AGENT_CLEARANCE = 0.28;
@@ -58,15 +64,36 @@ const ROAM_FALLBACK_AFTER = 3;
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
+/** Async build phases (`world.buildPhase`). */
+export const BUILD = Object.freeze({ IDLE: 0, WORKING: 1, COPY: 2, COMMIT: 3, UPLOAD: 4 });
+/** The main thread's share of a frame for applying a worker build (ms): the copy slices stop here. */
+export const APPLY_BUDGET_MS = 0.5;
+/** A worker build that has not answered after this long is built here instead (behind the panel). */
+export const BUILD_TIMEOUT_MS = 8000;
+/**
+ * Global mesh triangles a synchronous build may process on the calling thread (about 60 ms on
+ * desktop for the fixture's 11k; a real 36k-triangle Quest scan would stall the XR frame loop for
+ * hundreds of ms): bigger meshes are skipped there (noted) and built by the worker (buildAsync).
+ */
+export const SYNC_MESH_MAX_TRIS = 20000;
+
 export class WorldCore {
   /**
    * @param {{ navCapacity?: number, maxShapes?: number, seed?: number, agentClearance?: number, roam?: boolean,
-   *   bakeBudgetMs?: number, spawnBudgetMs?: number, clock?: () => number }} [o]
+   *   bakeBudgetMs?: number, spawnBudgetMs?: number, clock?: () => number, mesh?: boolean, syncMeshMaxTris?: number }} [o]
+   *   mesh: use the snapshot's global mesh (default true); syncMeshMaxTris: see SYNC_MESH_MAX_TRIS
    *   roam: the default build mode (WorldCore: false, the stationary build; World: true);
    *   bakeBudgetMs: Roam bake per update() (ms); spawnBudgetMs: roam spawn search per spawnRoam() call (ms)
    */
   constructor({ navCapacity = NAV_CAPACITY, maxShapes = 512, seed = 0x2545f491, agentClearance = AGENT_CLEARANCE, roam = false,
-    bakeBudgetMs = ROAM.bakeBudgetMs, spawnBudgetMs = SPAWN_BUDGET_MS, clock = now } = {}) {
+    bakeBudgetMs = ROAM.bakeBudgetMs, spawnBudgetMs = SPAWN_BUDGET_MS, clock = now, mesh = true, syncMeshMaxTris = SYNC_MESH_MAX_TRIS } = {}) {
+    /** The constructor options a worker core needs to match this one (capacities, seed). */
+    this.config = { navCapacity, maxShapes, seed, agentClearance, roam, mesh };
+    /**
+     * A synchronous build() (this thread) processes a global mesh only up to this many triangles
+     * (the fixture, the warm-up); a real capture is the worker's job (buildAsync). opts.mesh === true forces it.
+     */
+    this.syncMeshMaxTris = syncMeshMaxTris;
     this.nav = new NavGrid(navCapacity);
     this.shapes = new ShapeSet(maxShapes);
     this.spawner = new SpawnFinder({ seed });
@@ -109,8 +136,42 @@ export class WorldCore {
       furniture: 0, shapes: 0, droppedShapes: 0,
       cells: 0, walkable: 0, regions: 0, spawnCandidates: 0, doorSpawnCandidates: 0, pocketSpawnCandidates: 0,
       rooms: 0, cell: 0.1, builds: 0, skippedBuilds: 0, realigns: 0,
+      meshTris: 0, meshMs: 0, bvhMs: 0, workerBuilds: 0, workerMs: 0, applyFrames: 0, applyMaxMs: 0,
+      /** Worst main-thread step per apply phase (ms). */
+      applyPhaseMs: { copy: 0, commit: 0, upload: 0 },
       /** @type {string[]} */ notes: [],
     };
+    // ── the global mesh (snapshot v2) ──
+    /** Use the snapshot's global mesh (BVH, mesh occluder, trimesh colliders) when it has one. */
+    this.useMesh = mesh;
+    /** Ray and segment queries over the processed global mesh (null: planes and boxes only). @type {MeshBVH|null} */
+    this.bvh = null;
+    /** MeshPrep stats of the last build's mesh (null: none). @type {any} */
+    this.meshStats = null;
+    /**
+     * The occluder's mesh tiles (World uploads them): tiles (TILE_STRIDE), tileBounds, tileCount, tileIdx (local),
+     * occPos (tile-local positions, 1 cm inward on hard surfaces). @type {any}
+     */
+    this.meshTiles = null;
+    /** Static collider geometry for physics (WorldStatics.js; see staticGeometry()). @type {import('./WorldStatics.js').StaticGeometry|null} */
+    this.statics = null;
+    /** Furniture boxes the mesh covers (their box is not used for rays, sight or the occluder). */
+    this.coveredFurniture = 0;
+    /** The last synchronous build's processed mesh (for encodeMeshRecord); a worker build encodes there. @type {any} */
+    this.lastPrepped = null;
+    // ── async (worker) builds ──
+    /** @type {any} */ this.builder = null;
+    /** @type {any} */ this.occAdopt = null;
+    /** @type {number} */ this.buildPhase = BUILD.IDLE;
+    this.applyBudgetMs = APPLY_BUDGET_MS;
+    this.buildTimeoutMs = BUILD_TIMEOUT_MS;
+    this._seq = 0;
+    /** @type {any} */ this._pending = null;
+    /** @type {any} */ this._incoming = null;
+    /** A request waiting for the one in flight. @type {any} */ this._next = null;
+    this._copy = new CopyJob();
+    /** Hit scratch for surfaceBelow. */
+    this._hit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, kind: '', surface: '', enemy: -1, part: '' };
   }
 
   /**
@@ -124,8 +185,9 @@ export class WorldCore {
    * the virtual patch around the player matters).
    * @param {import('./Layout.js').SpaceSnapshot|null} snapshot
    * @param {{ x: number, z: number, r?: number }} playerStart where the player stands (r = safe-zone radius, default 0.8; Roam: 0)
-   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null, roam?: boolean }} [opts] doors[id] === false closes that door
-   *   (not carved, wall solid); missing = open (every door open by default). roam: build mode (default this.roam)
+   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null, roam?: boolean, mesh?: boolean }} [opts] doors[id] === false closes that door
+   *   (not carved, wall solid); missing = open (every door open by default). roam: build mode (default this.roam);
+   *   mesh: false = planes and boxes only, true = the global mesh whatever its size (default: up to syncMeshMaxTris)
    * @returns {boolean} true when the world was (re)built
    */
   build(snapshot, playerStart, opts = {}) {
@@ -166,7 +228,9 @@ export class WorldCore {
     this.layout = L;
     this.virtual = L.virtual;
     this.partialVirtual = L.partialVirtual;
+    this.buildMesh(snap, L, sx, sz, notes, opts && opts.mesh === false ? 0 : opts && opts.mesh === true ? 2 : 1);
     this.shapes.setFromLayout(L, sx, sz);
+    this.shapes.setSkipCovered(this.bvh !== null);
     if (this.shapes.dropped) notes.push(`${this.shapes.dropped} far furniture boxes dropped (shape limit ${this.shapes.maxBoxes})`);
     const nf = Math.min(L.floors.length, this.floorYs.length);
     for (let k = 0; k < nf; k++) this.floorYs[k] = L.floors[k].y;
@@ -212,6 +276,56 @@ export class WorldCore {
     s.buildMs = now() - t0;
     this.built = true;
     return true;
+  }
+
+  /**
+   * The global mesh step of a build (snapshot v2): prep (orient, classify,
+   * crop, tiles), the BVH, the occluder tiles, the static colliders; the
+   * covered furniture boxes are marked on the layout. Without a mesh: planes
+   * and boxes only (statics from the layout). Allocates (build time).
+   * @param {any} snap normalized snapshot (its `raw` carries the triangles)
+   * @param {import('./Layout.js').Layout} L @param {number} sx @param {number} sz @param {string[]} notes
+   * @param {number} want 0 no mesh, 1 the mesh within syncMeshMaxTris, 2 the mesh whatever its size
+   */
+  buildMesh(snap, L, sx, sz, notes, want) {
+    this.bvh = null;
+    this.meshTiles = null;
+    this.meshStats = null;
+    this.lastPrepped = null;
+    this.coveredFurniture = 0;
+    let raw = want && this.useMesh && snap && !L.virtual ? globalRawMesh(snap) : null;
+    if (snap && snap.globalMesh && want && this.useMesh && !raw && !L.virtual) {
+      notes.push(rawOf(snap) ? 'global mesh lent to the worker: built without it' : 'global mesh not decoded (no triangles): planes and boxes only');
+    }
+    if (raw && want === 1 && raw.data.indices.length / 3 > this.syncMeshMaxTris) {
+      notes.push(`global mesh (${raw.data.indices.length / 3} triangles) left to the worker: a synchronous build here uses planes and boxes only`);
+      raw = null;
+    }
+    if (!raw) {
+      this.statics = buildStatics(L, null, null);
+      this.stats.meshTris = 0;
+      return;
+    }
+    const t0 = now();
+    const p = prepMesh({ vertices: raw.data.vertices, indices: raw.data.indices, pose: raw.pose }, L, { start: { x: sx, z: sz } });
+    const t1 = now();
+    for (let k = 0; k < L.furniture.length; k++) {
+      L.furniture[k].covered = p.covered[k] === 1;
+      if (p.covered[k]) this.coveredFurniture++;
+    }
+    if (p.indices.length >= 3) this.bvh = new MeshBVH().build(p.vertices, p.indices, p.surf, p.owner);
+    const t2 = now();
+    this.statics = buildStatics(L, p, colliderPositions(p));
+    // occIdx: tile-local + the tile's vertex start (the occluder's index buffer as is: uploads are memcpy)
+    const occIdx = this.statics.mesh ? this.statics.mesh.indices : p.tileIdx;
+    this.meshTiles = { tiles: p.tiles, tileBounds: p.tileBounds, tileCount: p.tileCount, tileIdx: p.tileIdx, occIdx, occPos: occluderPositions(p), verts: p.tileVerts.length };
+    this.meshStats = { ...p.stats, bvhMs: Math.round((t2 - t1) * 10) / 10, bvhNodes: this.bvh ? this.bvh.nodeCount : 0, bvhDepth: this.bvh ? this.bvh.depth : 0 };
+    this.lastPrepped = p;
+    this.stats.meshTris = p.indices.length / 3;
+    this.stats.meshMs = Math.round((t1 - t0) * 10) / 10;
+    this.stats.bvhMs = this.meshStats.bvhMs;
+    if (!p.stats.oneSided) notes.push(`global mesh orientation uncertain (${p.stats.upVotePct} % agree): two-sided colliders`);
+    if (p.stats.truncated) notes.push(`global mesh truncated: ${p.stats.truncated} triangles over the cap`);
   }
 
   /**
@@ -280,6 +394,289 @@ export class WorldCore {
     return true;
   }
 
+  // ── worker builds (async, time-sliced on the main thread) ───────────────
+
+  /**
+   * Build in the world worker from now on (WorldWorker.js `createWorldBuilder`);
+   * null: build here (synchronously) again.
+   * @param {any} builder `{ post(msg, transfer), onResult, failed }`
+   */
+  attachBuilder(builder) {
+    this.builder = builder || null;
+    if (builder) builder.onResult = (/** @type {any} */ r) => this.onBuildResult(r);
+  }
+
+  /** A worker build is in flight, being copied in or uploading (queries see the previous world until the commit). */
+  get busy() { return this.buildPhase !== BUILD.IDLE || this._next !== null && this._next !== undefined; }
+
+  /**
+   * `build` in the world worker: the layout, nav grid, Roam bake (all of it),
+   * spawn candidates, the mesh prep, BVH, occluder tiles and static colliders
+   * run there; `update()` then copies the result into this world's own arrays
+   * within `applyBudgetMs` a frame (0.5 ms), commits it in one step (the world
+   * switches over atomically: until then every query answers from the previous
+   * build), and World uploads the occluder tiles at most one range a frame.
+   * The promise resolves true when everything is in place (false: superseded or
+   * skipped). Without a worker (or after it failed) this is `build()`.
+   * The snapshot's mesh arrays are lent to the worker meanwhile (transferred
+   * there and back): a second request waits for them.
+   * @param {import('./Layout.js').SpaceSnapshot|null} snapshot
+   * @param {{ x: number, z: number, r?: number }} playerStart
+   * @param {{ doors?: ArrayLike<boolean|undefined|null>|null, roam?: boolean, mesh?: boolean, force?: boolean }} [opts]
+   *   force: never skip (a rebuild or realign)
+   * @returns {Promise<boolean>}
+   */
+  buildAsync(snapshot, playerStart, opts = {}) {
+    return new Promise((resolve) => {
+      const req = { snapshot, start: { x: playerStart ? +playerStart.x : 0, z: playerStart ? +playerStart.z : 0, r: playerStart && playerStart.r !== undefined ? +playerStart.r : undefined },
+        opts: { doors: opts.doors ? Array.from(opts.doors) : null, roam: typeof opts.roam === 'boolean' ? opts.roam : this.roam, mesh: opts.mesh !== false }, force: !!opts.force, resolve };
+      if (this.buildPhase !== BUILD.IDLE) {
+        if (this._next) this._next.resolve(false);
+        this._next = req;
+        return;
+      }
+      this.startRequest(req);
+    });
+  }
+
+  /** rebuild() in the worker (door flags changed). @returns {Promise<boolean>} */
+  rebuildAsync() {
+    return this.buildAsync(this.snapshot, this.start, { doors: this.doorOpen.slice(), roam: this.roamOn, force: true });
+  }
+
+  /**
+   * realign() in the worker (behind the held pause): the stored snapshot and
+   * start moved by m (old → new), or a fresh capture.
+   * @param {ArrayLike<number>|null} m @param {import('./Layout.js').SpaceSnapshot|null} [snapshot]
+   * @returns {Promise<boolean>}
+   */
+  realignAsync(m, snapshot = null) {
+    const st = { x: this.start.x, z: this.start.z, r: this.start.r };
+    if (m) transformPointXZ(m, st);
+    const snap = snapshot || (this.snapshot && m ? transformSnapshot(this.snapshot, m) : this.snapshot);
+    this.stats.realigns++;
+    return this.buildAsync(snap, st, { doors: snapshot ? null : this.doorOpen.slice(), roam: this.roamOn, force: true });
+  }
+
+  /** @param {any} req */
+  startRequest(req) {
+    const { snapshot, start, opts } = req;
+    if (!req.force && opts.roam && this.canSkip(snapshot, opts.doors, start.x, start.z)) {
+      req.resolve(this.build(snapshot, start, opts));
+      return;
+    }
+    const B = this.builder;
+    if (!B || B.failed) {
+      if (req.force) this.built = false; // never skipped
+      req.resolve(this.build(snapshot, start, opts));
+      return;
+    }
+    const seq = ++this._seq;
+    const raw = opts.mesh && this.useMesh ? globalRawMesh(snapshot) : null;
+    /** @type {ArrayBuffer[]} */ const transfer = [];
+    /** @type {any} */ let mesh = null;
+    if (raw) {
+      const d = raw.data;
+      // own buffers only (a view into a larger buffer would detach its neighbours)
+      if (d.vertices.byteOffset !== 0 || d.vertices.byteLength !== d.vertices.buffer.byteLength) d.vertices = d.vertices.slice();
+      if (d.indices.byteOffset !== 0 || d.indices.byteLength !== d.indices.buffer.byteLength) d.indices = d.indices.slice();
+      mesh = { label: raw.label, pose: Array.from(raw.pose), lastChangedTime: raw.lastChangedTime, vertices: d.vertices, indices: d.indices };
+      transfer.push(/** @type {ArrayBuffer} */ (d.vertices.buffer), /** @type {ArrayBuffer} */ (d.indices.buffer));
+    }
+    const gm = snapshot && /** @type {any} */ (snapshot).globalMesh;
+    let snapMsg = snapshot;
+    if (gm && raw && typeof gm.data === 'string') { const { data, ...meta } = gm; snapMsg = { ...snapshot, globalMesh: meta }; }
+    const msg = { type: 'build', seq, cfg: this.config, snapshot: snapMsg, mesh, start, opts, encode: !!(raw && gm && typeof gm.data !== 'string') };
+    this._pending = { ...req, seq, t0: this.clock(), lent: raw ? raw.data : null };
+    this._incoming = null;
+    this.buildPhase = BUILD.WORKING;
+    try {
+      B.post(msg, transfer);
+    } catch (e) {
+      this.restoreLent(this._pending, mesh);
+      this.buildFallback(`worker post failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  /**
+   * The worker's answer (outside the frame loop: a message event). Only
+   * stores it; `update()` applies it.
+   * @param {any} r
+   */
+  onBuildResult(r) {
+    const P = this._pending;
+    if (!P || !r || r.seq !== P.seq) return;
+    this.restoreLent(P, r.mesh);
+    this._incoming = r;
+  }
+
+  /**
+   * Give the lent mesh arrays back to the snapshot's holder.
+   * @param {any} P @param {any} mesh
+   */
+  restoreLent(P, mesh) {
+    if (!P || !P.lent || !mesh || !mesh.vertices || !mesh.indices) return;
+    P.lent.vertices = mesh.vertices;
+    P.lent.indices = mesh.indices;
+    P.lent = null;
+  }
+
+  /**
+   * One step of the async build (from update()): wait, copy (within the
+   * budget), commit, upload (World), done.
+   * @param {number} t
+   */
+  buildStep(t) {
+    const P = this._pending;
+    if (!P) { this.buildPhase = BUILD.IDLE; this.startNext(); return; }
+    const c0 = this.clock();
+    switch (this.buildPhase) {
+      case BUILD.WORKING: {
+        const r = this._incoming;
+        if (!r) {
+          if (c0 - P.t0 > this.buildTimeoutMs) {
+            if (this.builder) this.builder.failed = true;
+            this.buildFallback(`world worker did not answer in ${this.buildTimeoutMs} ms`);
+          }
+          return;
+        }
+        if (!r.ok) { this.buildFallback(`world worker failed: ${r.error || 'unknown'}`); return; }
+        if (this._next) { this.finishBuild(false); return; } // superseded: a newer request is waiting
+        const err = this._copy.begin(this, r.state.arrays);
+        if (err) { this.buildFallback(err); return; }
+        this.buildPhase = BUILD.COPY;
+        return;
+      }
+      case BUILD.COPY: {
+        if (this._copy.step(this.clock, c0 + this.applyBudgetMs)) this.buildPhase = BUILD.COMMIT;
+        this.noteApply(c0, 'copy');
+        return;
+      }
+      case BUILD.COMMIT: {
+        this.commitBuild(P, this._incoming);
+        this.buildPhase = this.afterCommit() ? BUILD.UPLOAD : BUILD.IDLE;
+        this.noteApply(c0, 'commit');
+        if (this.buildPhase === BUILD.IDLE) this.finishBuild(true);
+        return;
+      }
+      case BUILD.UPLOAD: {
+        const done = this.uploadStep();
+        this.noteApply(c0, 'upload');
+        if (done) { this.buildPhase = BUILD.IDLE; this.finishBuild(true); }
+        return;
+      }
+      default:
+    }
+  }
+
+  /** @param {number} c0 @param {'copy'|'commit'|'upload'} phase */
+  noteApply(c0, phase) {
+    const ms = this.clock() - c0;
+    const S = this.stats;
+    S.applyFrames++;
+    if (ms > S.applyMaxMs) S.applyMaxMs = Math.round(ms * 1000) / 1000;
+    if (ms > S.applyPhaseMs[phase]) S.applyPhaseMs[phase] = Math.round(ms * 1000) / 1000;
+  }
+
+  /** @param {boolean} ok */
+  finishBuild(ok) {
+    const P = this._pending;
+    this._pending = null;
+    this._incoming = null;
+    this.buildPhase = BUILD.IDLE;
+    if (P) P.resolve(ok);
+    this.startNext();
+  }
+
+  startNext() {
+    const n = this._next;
+    if (!n) return;
+    this._next = null;
+    this.startRequest(n);
+  }
+
+  /**
+   * The worker failed or timed out: build here instead (behind the same panel
+   * or pause the caller holds; a hitch, noted in the stats).
+   * @param {string} why
+   */
+  buildFallback(why) {
+    const P = this._pending;
+    this._pending = null;
+    this._incoming = null;
+    this.buildPhase = BUILD.IDLE;
+    if (!P) return;
+    this.built = false;
+    const ok = this.build(P.snapshot, P.start, P.opts);
+    this.stats.notes.push(why + ': built on the main thread');
+    P.resolve(ok);
+    this.startNext();
+  }
+
+  /**
+   * Switch to the copied build: scalars, layout, adopted buffers (BVH,
+   * occluder tiles, statics, door fields). One step, after the copy.
+   * @param {any} P the request @param {any} r the worker's result
+   */
+  commitBuild(P, r) {
+    const s0 = this.stats;
+    const keep = { builds: s0.builds, skippedBuilds: s0.skippedBuilds, realigns: s0.realigns, workerBuilds: s0.workerBuilds, applyFrames: s0.applyFrames,
+      applyMaxMs: s0.applyMaxMs, applyPhaseMs: s0.applyPhaseMs };
+    const st = r.state;
+    commitScalars(this, st.meta);
+    Object.assign(this.stats, keep);
+    this.stats.builds++;
+    this.stats.workerBuilds++;
+    this.stats.workerMs = r.ms;
+    this.stats.buildMs = r.buildMs;
+    const R = this.roamIndex;
+    if (st.adopt.fields && st.adopt.fields.length >= R.fields.length) R.fields = st.adopt.fields;
+    else if (st.adopt.fields) R.fields.set(st.adopt.fields);
+    R.pCell = -2; R.pRoomA = R.pRoomB = R.lastRoom = 0; R.pDoor = -1; R.pAnchor = -1; R.pDoorN = 0;
+    if (!this.roamOn) R.clear();
+    this.nav.version++;
+    this.nav.pathSource = this.roamOn ? R : null;
+    this.bvh = st.adopt.bvh ? MeshBVH.fromBuffers(st.adopt.bvh) : null;
+    this.meshTiles = st.adopt.tiles || null;
+    this.statics = st.adopt.statics || null;
+    /** The World's occluder buffers made in the worker (box occluder with / without covered furniture, overlay). */
+    this.occAdopt = st.adopt.occ || null;
+    this.lastPrepped = null;
+    this.snapshot = P.snapshot;
+    this.skipped = false;
+    this.roamFailStreak = 0;
+    this.built = true;
+    const gm = P.snapshot && P.snapshot.globalMesh;
+    if (r.record && gm && typeof gm === 'object') Object.assign(gm, r.record); // the session record's copy of the mesh
+  }
+
+  /** After a commit: the subclass's own buffers (World: occluders). @returns {boolean} an upload phase follows */
+  afterCommit() { return false; }
+
+  /** One upload step (World). @returns {boolean} done */
+  uploadStep() { return true; }
+
+  /**
+   * This world's state as transferable arrays + meta (the worker's export; allocates).
+   */
+  exportState() {
+    return exportCore(this);
+  }
+
+  /**
+   * The session record's copy of the last synchronous build's global mesh
+   * (async: gzip). A worker build fills `snapshot.globalMesh` by itself.
+   * @returns {Promise<any|null>}
+   */
+  async encodeMeshRecord() {
+    const p = this.lastPrepped, snap = this.snapshot;
+    if (!p) return null;
+    const { encodeMeshRecord } = await import('./MeshCodec.js');
+    const rec = { space: 'reference', ...(await encodeMeshRecord(p.raw)) };
+    if (snap && /** @type {any} */ (snap).globalMesh) Object.assign(/** @type {any} */ (snap).globalMesh, rec);
+    return rec;
+  }
+
   /**
    * Run every build path once on a small synthetic house, so the real build at
    * session start runs on optimised code (a cold build is ~10× slower than a
@@ -302,10 +699,17 @@ export class WorldCore {
     const [x, z] = b.toWorld(1.5, 2);
     const out = { x: 0, z: 0 }, hit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, kind: '', surface: '', enemy: -1, part: '' };
     const snap = b.build();
+    // the same house with a synthetic scan (the mesh paths: prep, BVH, statics, mesh rays)
+    const snapM = b.build();
+    const scan = scanFromSnapshot(snapM, { cell: 0.3, clutter: [{ cx: 2.5, cz: 3.2, hx: 0.25, hz: 0.25, h: 0.9 }] });
+    const ident = new Float64Array(16);
+    ident[0] = ident[5] = ident[10] = ident[15] = 1;
+    attachRaw(snapM, { token: 0, global: 0, meshes: [{ label: 'global mesh', pose: ident, lastChangedTime: 0, data: { vertices: scan.vertices, indices: scan.indices } }] });
+    const below = { y: 0, nx: 0, ny: 0, nz: 0, surface: '', dist: 0 };
     for (let k = 0; k < 4; k++) {
       const roam = k >= 2;
       this.built = false;
-      this.build(snap, { x, z }, { doors: k === 1 ? [true, false] : null, roam });
+      this.build(roam ? snapM : snap, { x, z }, { doors: k === 1 ? [true, false] : null, roam });
       if (roam) {
         this.finishBake();
         this.roamIndex.trackPlayer(x, z);
@@ -315,9 +719,30 @@ export class WorldCore {
         for (let i = 0; i < 4; i++) { pl.head.x = x - i * 0.3; this.spawnRoamFor(pl, out); this.update(0.014, i * 14, null, { player: pl }); }
       }
       this.findSpawn(x, z, 1, 0, 3, out);
-      for (let i = 0; i < 64; i++) this.raycast(x, 1.5, z, Math.cos(i), -0.1, Math.sin(i), 20, hit);
+      for (let i = 0; i < 64; i++) {
+        this.raycast(x, 1.5, z, Math.cos(i), -0.1 - (i & 3) * 0.2, Math.sin(i), 20, hit);
+        this.segmentClear(x, 1.5, z, x + Math.cos(i) * 4, 0.6, z + Math.sin(i) * 4);
+        this.surfaceBelow(x + Math.cos(i), 1.2, z + Math.sin(i), 2, below);
+      }
+      this.staticGeometry();
       this.report();
     }
+    // the worker path's main-thread half: export → sliced copy → commit → the subclass's uploads
+    // (into this same world), a few rounds so the first real one does not run cold
+    for (let round = 0; round < 4; round++) {
+      const ex = this.exportState();
+      const req = { snapshot: snapM, start: { x, z }, opts: {}, resolve: () => {}, seq: 0, lent: null };
+      if (this._copy.begin(this, ex.arrays)) break;
+      while (!this._copy.step(this.clock, this.clock() + 0.2));
+      this.commitBuild(req, { state: { meta: ex.meta, arrays: ex.arrays, adopt: ex.adopt }, ms: 0, buildMs: 0, record: null });
+      for (let i = 0; i < 16; i++) this.raycast(x, 1.0, z, Math.cos(i), -0.3, Math.sin(i), 20, hit);
+      this.afterCommit();
+      while (!this.uploadStep());
+    }
+    this.stats.applyFrames = 0;
+    this.stats.applyMaxMs = 0;
+    this.stats.applyPhaseMs = { copy: 0, commit: 0, upload: 0 };
+    this.stats.workerBuilds = 0;
     this.build(null, { x: 0, z: 0 }, { roam: false });
     this.built = false;
     this.layout = null;
@@ -424,16 +849,63 @@ export class WorldCore {
    * @param {any} out Hit
    */
   raycast(ox, oy, oz, dx, dy, dz, max, out) {
-    return this.shapes.raycast(ox, oy, oz, dx, dy, dz, max, out);
+    const hit = this.shapes.raycast(ox, oy, oz, dx, dy, dz, max, out);
+    const B = this.bvh;
+    if (B === null) return hit;
+    // the mesh (furniture the scan covers, unlabelled clutter) within the box hit's distance
+    if (B.raycast(ox, oy, oz, dx, dy, dz, hit ? out.dist : max, out)) {
+      out.surface = this.meshLabel(B.lastTri);
+      return true;
+    }
+    return hit;
   }
 
   /**
-   * Line of sight between two points (walls, lintels, furniture).
+   * Line of sight between two points (walls, lintels, furniture; the global mesh when present).
    * @param {number} ax @param {number} ay @param {number} az
    * @param {number} bx @param {number} by @param {number} bz
    */
   segmentClear(ax, ay, az, bx, by, bz) {
-    return this.shapes.segmentClear(ax, ay, az, bx, by, bz);
+    return this.shapes.segmentClear(ax, ay, az, bx, by, bz) && (this.bvh === null || this.bvh.segmentClear(ax, ay, az, bx, by, bz));
+  }
+
+  /**
+   * The hit label of a mesh triangle (BVH leaf order): its furniture's label
+   * ('bed', 'table', …), else its class ('other' for unlabelled clutter).
+   * @param {number} tri
+   */
+  meshLabel(tri) {
+    const B = this.bvh;
+    if (B === null || tri < 0) return 'other';
+    const f = B.owner[tri];
+    const L = this.layout;
+    if (f >= 0 && L !== null && f < L.furniture.length) return L.furniture[f].label;
+    return SURF_NAME[B.surf[tri]] || 'other';
+  }
+
+  /**
+   * The surface under a point: a ray straight down at most `maxDown` m (walls,
+   * furniture boxes, the floor, the mesh). Allocation-free; writes `out` only
+   * on a hit: y, the normal, the label and the drop (`dist`).
+   * @param {number} x @param {number} y @param {number} z @param {number} maxDown
+   * @param {{ y: number, nx: number, ny: number, nz: number, surface: string, dist: number }} out
+   */
+  surfaceBelow(x, y, z, maxDown, out) {
+    const h = this._hit;
+    if (!this.raycast(x, y, z, 0, -1, 0, maxDown, h)) return false;
+    out.y = h.y; out.nx = h.nx; out.ny = h.ny; out.nz = h.nz; out.surface = h.surface; out.dist = h.dist;
+    return true;
+  }
+
+  /**
+   * Static collider geometry for physics (see WorldStatics.js): wall slabs,
+   * furniture surfaces or backstops, a catch slab, floor / ceiling prisms and
+   * the oriented global mesh as trimesh tiles. Built with the world (worker or
+   * synchronous build); the same object until the next build. Null before a build.
+   * @returns {import('./WorldStatics.js').StaticGeometry|null}
+   */
+  staticGeometry() {
+    return this.built ? this.statics : null;
   }
 
   /**
@@ -489,7 +961,8 @@ export class WorldCore {
    */
   update(dt, t, frame, ctx) {
     this.time = t * 0.001;
-    if (!this.roamOn || !this.built) return;
+    if (this.buildPhase !== BUILD.IDLE) this.buildStep(t);
+    if (!this.roamOn || !this.built || this.buildPhase === BUILD.COPY) return;
     const R = this.roamIndex;
     if (R.baking) R.step(this.bakeBudgetMs);
     const p = ctx && ctx.player;
@@ -655,6 +1128,14 @@ export class WorldCore {
       },
       mode: this.roamOn ? 'roam' : 'spot',
       roam: this.roamOn ? { ...this.roamIndex.report(), centredWalls: L.walls.filter((w) => w.centred).length, skippedBuilds: s.skippedBuilds } : null,
+      mesh: this.meshStats ? {
+        tris: this.meshStats.rawTris, kept: this.meshStats.keptTris, cropped: { ...this.meshStats.cropped }, classes: this.meshStats.classes.slice(),
+        upVotePct: this.meshStats.upVotePct, flippedPct: this.meshStats.flippedPct, oneSided: this.meshStats.oneSided,
+        components: this.meshStats.components, covered: this.coveredFurniture, tiles: this.meshStats.tiles,
+        prepMs: this.meshStats.ms, bvhMs: this.meshStats.bvhMs, bvhNodes: this.meshStats.bvhNodes, bvhDepth: this.meshStats.bvhDepth,
+      } : null,
+      statics: this.statics ? { ...this.statics.stats } : null,
+      worker: { builds: s.workerBuilds, ms: Math.round(s.workerMs * 10) / 10, applyFrames: s.applyFrames, applyMaxMs: s.applyMaxMs, phaseMs: { ...s.applyPhaseMs } },
       notes: s.notes.slice(),
     };
   }
@@ -668,6 +1149,13 @@ export class WorldCore {
     const navB = n.flags.byteLength + n.clr.byteLength + n.region.byteLength + n.pathDist.byteLength + n.doors.byteLength
       + n.floorIdx.byteLength + n.room.byteLength + n.edge.byteLength + n._queue.byteLength + (n._tmp ? n._tmp.byteLength : 0)
       + n.heap.items.byteLength + n.heap.keys.byteLength + n.heap.pos.byteLength + n.reach.byteLength;
-    return { nav: navB, roam: this.roamIndex.bytes(), shapes: this.shapes.box.byteLength, total: navB + this.roamIndex.bytes() + this.shapes.box.byteLength };
+    const bvh = this.bvh ? this.bvh.bytes() : 0;
+    const T = this.meshTiles;
+    const tiles = T ? T.tiles.byteLength + T.tileBounds.byteLength + T.tileIdx.byteLength + T.occPos.byteLength : 0;
+    const G = this.statics;
+    const statics = G ? G.slabs.byteLength + G.prisms.byteLength + G.floorPts.byteLength
+      + (G.mesh ? G.mesh.vertices.byteLength + G.mesh.indices.byteLength + G.mesh.chunks.byteLength : 0) : 0;
+    const total = navB + this.roamIndex.bytes() + this.shapes.box.byteLength + bvh + tiles + statics;
+    return { nav: navB, roam: this.roamIndex.bytes(), shapes: this.shapes.box.byteLength, bvh, tiles, statics, total };
   }
 }

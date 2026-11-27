@@ -111,7 +111,9 @@ test('dev overlay: one LineSegments built at construction, hidden by default, fi
   assert.equal(o.frustumCulled, false);
   assert.ok(o.renderOrder > w.occluder.renderOrder, 'drawn after the occluder: lines behind real walls are hidden');
   assert.equal(o.geometry.drawRange.count, 2, 'a placeholder segment for the warm-up draw');
-  assert.deepEqual(w.warmMeshes(), [w.occluder, o]);
+  const wm = w.warmMeshes();
+  assert.equal(wm.length, 3);
+  assert.ok(wm[0] === w.occluder && wm[1] === w.meshOccluder && wm[2] === o, 'occluder, mesh occluder, overlay');
   const { geometry, material } = o;
   const pos = geometry.attributes.position, col = geometry.attributes.color;
   const v0 = pos.version;

@@ -1,7 +1,7 @@
 // @ts-check
 import { Events } from '../core/Events.js';
 import { warmXR } from '../core/Warmup.js';
-import { World, CaptureGate, captureSnapshot, DriftWatch, pickReferencePlanes, resetTransform } from '../world/World.js';
+import { World, CaptureGate, captureSnapshot, DriftWatch, pickReferencePlanes, resetTransform, createWorldBuilder } from '../world/World.js';
 import { mul4, transformPointXZ, yawOf } from '../world/Realign.js';
 import { Player } from '../game/Player.js';
 import { GameSession } from '../game/GameSession.js';
@@ -11,6 +11,7 @@ import { CONTROLS_CARD } from '../weapons/Controls.js';
 import { FIT_KEY, adjFromUrl } from '../weapons/GunFit.js';
 import { EnemyManager } from '../enemies/EnemyManager.js';
 import { Watch, installWatchSounds } from '../ui/Watch.js';
+import { Look } from '../fx/Look.js';
 import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
 
 /**
@@ -23,10 +24,13 @@ import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
  *      (0.5 s) or 3 s have passed, then `captureSnapshot` copies it (in
  *      ?emulate: the house fixture) and keeps the live planes for the drift
  *      watch; the snapshot goes into the session record (`rec.spaceSnapshot`);
- *   2. build: `world.build(snapshot, head, { roam: game.roam })` once
- *      (synchronous, behind App's opaque "Get ready" panel with the controls
- *      card); in Roam the bake then runs in slices inside world.update (4 ms a
- *      frame while the card is up, 1 ms in play);
+ *   2. build (v0.4): `world.buildAsync(snapshot, head, { roam: game.roam })` in
+ *      the world worker (layout, nav, the whole Roam bake, the global mesh's
+ *      prep, BVH, occluder tiles, static colliders), behind App's opaque "Get
+ *      ready" panel; world.update copies the result in within 0.5 ms a frame,
+ *      commits it in one step and streams the mesh occluder's tiles (one range a
+ *      frame). The physics system then builds the static colliders in 4 ms slices
+ *      (the card waits for them);
  *   3. warm: next frame, one draw of every pool into the XR framebuffer
  *      (`warmXR`, before that frame's own render), re-baselining the counts;
  *   4. start: the card stays up until a trigger pull is released (after 1 s) or
@@ -35,14 +39,15 @@ import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
  *      next frame, no ring, no rebuild. Spot mode: SafeSpot's ring until the
  *      player pulls the trigger in an open spot (GameSession's own panel);
  *   6. rebuild (spot mode only, when the spot is > 0.25 m from where the world
- *      was built): `world.build(snapshot, zone, { doors })` behind App's panel;
+ *      was built): `world.buildAsync(snapshot, zone, { doors, force })` behind App's panel;
  *   7. go: `game.start(zone)`; GameSession takes over (Roam: no text in the
  *      view during play; the watch shows the wave);
  *   8. realign (a reference-space reset during the round, or drift of the
  *      Space Setup planes found by the DriftWatch, research-roam §3): the game
- *      is paused and held (enemies back in the queue); the world is rebuilt
- *      moved by the reset's transform / the drift correction (or, without a
- *      transform, from a fresh capture), then
+ *      is paused and held (enemies back in the queue); the world is rebuilt in
+ *      the worker, moved by the reset's transform / the drift correction (or,
+ *      without a transform, from a fresh capture); lying guns and magazines move
+ *      with it at the commit (weapons.realignItems), the static colliders follow;
  *   9. rewarm: one warmXR draw (the occluder's rewritten buffers upload), and
  *      `game.realigned()` releases the hold (the normal resume protocol).
  *   A reset before the round (capture, warm, card, spot) goes back to capture
@@ -56,15 +61,25 @@ import { SETTINGS_KEY, parseSettings, serializeSettings } from './Settings.js';
  * localStorage[SETTINGS_KEY].
  *
  * Systems, in the contract order (PerfMonitor names = PLAY_SYSTEMS):
- * input → world → player → weapons → enemies → game → audio → ui → render.
+ * input → world → player → weapons → physics → enemies → game → look → audio → ui → render.
+ * `physics` (v0.4) is the Rapier step for dropped guns and magazines (WeaponSystem.physicsUpdate);
+ * `look` (v0.4) is the room light, contact shadows and impacts (src/fx/Look.js).
  * Allocation-free per frame once playing (the one-time capture and builds,
  * the 1/s drift check's browser poses and the watch's button actions aside).
  */
-export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons', 'enemies', 'game', 'audio', 'ui', 'render']);
+export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons', 'physics', 'enemies', 'game', 'look', 'audio', 'ui', 'render']);
 
-/** Session steps (numbers kept from v0.2; SPOT, REBUILD and GO came with the safe-spot step, REALIGN and REWARM with Roam). */
-export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4, SPOT: 5, REBUILD: 6, GO: 7, REALIGN: 8, REWARM: 9 });
-const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm'];
+/**
+ * Session steps (numbers kept from v0.2; SPOT, REBUILD and GO came with the safe-spot step, REALIGN and REWARM with
+ * Roam, BUILD with the worker build in v0.4: the capture's or the MODE row's build in flight).
+ */
+export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4, SPOT: 5, REBUILD: 6, GO: 7, REALIGN: 8, REWARM: 9, BUILD: 10 });
+const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm', 'build'];
+/**
+ * The card (or the round start, or the end of a realign) waits for the static colliders, at most this long (ms):
+ * a dropped gun must land on the new world. Past it the physics is used as soon as it is ready.
+ */
+export const PHYS_WAIT_MS = 8000;
 
 /**
  * The controls card on the "Get ready" panel: the weapon card
@@ -115,26 +130,37 @@ export class PlayKit {
   /**
    * At load, after `assets.load()` and the audio decode, BEFORE the warm-up.
    * @param {{ gfx: { renderer: any, scene: import('three').Scene, camera: import('three').Camera, flashLights: import('three').PointLight[],
-   *     envTexture?: any, lighting?: any },
+   *     envTexture?: any, lighting?: any, hemi?: any, sun?: any },
    *   assets: any, audio: any, input: import('../xr/Input.js').Input, fixture?: SpaceSnapshot|null,
    *   grip?: { pitchDeg: number, y: number, z: number, source?: string } | null,
    *   gloves?: boolean, watchFit?: { back?: number, out?: number, tiltDeg?: number, scale?: number } | null, bracelet?: boolean,
-   *   difficultyFromUrl?: boolean, storage?: Storage | null }} o
+   *   difficultyFromUrl?: boolean, storage?: Storage | null, atlas?: { width: number, height: number, data: Uint8Array } | null,
+   *   worldWorker?: boolean }} o
    *   fixture: a snapshot to use instead of the live capture (?emulate: IWER has no scene data);
    *   grip: the URL grip fit override (gripFitFromParams; applied over the saved fit, never saved);
    *   gloves (default true): the gloved hands on held guns (?gloves=0 turns them off);
    *   watchFit / bracelet: the watch on the wrist (URL knobs); difficultyFromUrl: ?difficulty= was given (it wins over the saved one);
-   *   storage: localStorage (read here, at load; written only from a setTimeout)
+   *   storage: localStorage (read here, at load; written only from a setTimeout);
+   *   atlas: the decal atlas (Look's loadDecalAtlas, drawn in a worker); worldWorker (default true): build the world
+   *   in the world worker (`?worker=0`: on this thread, the v0.3 path, for A/B)
    */
   constructor({ gfx, assets, audio, input, fixture = null, grip = null, gloves = true, watchFit = null, bracelet = true,
-    difficultyFromUrl = false, storage = null }) {
+    difficultyFromUrl = false, storage = null, atlas = null, worldWorker = true }) {
     const renderer = gfx.renderer, scene = gfx.scene;
     /** The scene camera the Loop renders with (three substitutes the XR camera). */
     this.sceneCamera = gfx.camera;
     this.events = new Events();
     this.world = new World();
-    this.world.warmUp(); // the session's real build then runs on optimised code
-    /** The world's meshes (the depth-only occluder and the dev overlay): in the scene and in every warm-up draw. */
+    this.world.warmUp(); // the session's real build then runs on optimised code (and the fallback path stays warm)
+    /**
+     * The world worker (v0.4): every session build runs there; world.update applies the result in slices.
+     * @type {any}
+     */
+    this.builder = null;
+    if (worldWorker) {
+      try { this.builder = createWorldBuilder(this.world.config); this.world.attachBuilder(this.builder); } catch { this.builder = null; }
+    }
+    /** The world's meshes (the depth-only box occluder, the mesh occluder and the dev overlay): in the scene and in every warm-up draw. */
     this.worldMeshes = this.world.warmMeshes();
     for (const m of this.worldMeshes) scene.add(m);
     this.planner = this.world.createPlanner({ maxRequests: 16 });
@@ -175,6 +201,10 @@ export class PlayKit {
       return got;
     };
     this.weapons = new WeaponSystem(ctx);
+    /** The physics step is its own system (PLAY_SYSTEMS 'physics', after weapons): timed apart, before the enemies. */
+    this.weapons.physExternal = true;
+    /** The physics load step's result (initPhysics, at load): the session records carry it. @type {any} */
+    this.physicsLoad = null;
     /** One seated decision for everyone (BodyEstimator's): GameSession reads ctx.body.seated, Player gets seatedOverride. */
     ctx.body = this.weapons.body;
     // Gun fit: saved (per weapon) → the URL override on top (never saved) → the watch's fit page starts from these.
@@ -204,7 +234,31 @@ export class PlayKit {
     this.watchSounds = this.audio ? installWatchSounds(this.audio) : false;
     if (this.audio && typeof this.audio.bind === 'function') this.audio.bind(this.events);
 
+    // ── the look (v0.4): room light, contact shadows, impacts per real material, the passthrough colour match.
+    // Its pools exist from here; the material hook goes on every opaque lit material BEFORE the warm-up compiles them.
+    /** @type {Look|null} */
+    this.look = gfx.hemi && gfx.sun ? new Look({ scene, hemi: gfx.hemi, sun: gfx.sun, storage, atlas }) : null;
+    ctx.look = this.look; // WeaponSystem's world hits go to look.impact
+    /** @type {any} */ this.lookPrep = null;
+    if (this.look) {
+      const m = assets && assets.models ? assets.models : {};
+      /** @type {any[]} */ const roots = [scene];
+      for (const k of ['glock', 'akm', 'soldier']) if (m[k] && m[k].scene) roots.push(m[k].scene);
+      this.lookPrep = this.look.prepareMaterials(roots);
+      this.look.attach({ world, physics: this.weapons.phys, enemies: this.enemies, weapons: this.weapons, audio: this.audio });
+      this.look.warmUp(); // the JIT warm-up of its frame and shot code (tens of ms, at load)
+    }
+
     this.gate = new CaptureGate();
+    /**
+     * The world build in flight (worker): its kind, whether its promise resolved, and the main thread's cost while it ran
+     * (the world step's longest frame and the longest frame of all systems but render, from the PerfMonitor).
+     */
+    this._bq = { active: false, done: false, ok: false, seq: 0, kind: '', t0: 0, frames: 0, worldMaxMs: 0, sysMaxMs: 0, waitMs: 0 };
+    this._buildSeq = 0;
+    /** The last finished build's main-thread record (rec.play.world.async). @type {any} */ this.lastBuild = null;
+    /** Since when the card / round start / realign has waited for the static colliders (ms, -1: not waiting). */
+    this._physSince = -1;
     /** @type {readonly string[]} the panel after the build (made once per build) */
     this.builtLines = CAPTURE_LINES;
     /** @type {number} STEP */ this.step = STEP.IDLE;
@@ -242,6 +296,14 @@ export class PlayKit {
     this.realignAt = 0;
     this.realignBuildMs = 0;
     this.realignPlanes = 0;
+    /**
+     * The realign build in flight: its transform (applied to the lying items at its commit), and whether another
+     * reset / drift came in meanwhile (`again`: a second build follows from the world this one makes).
+     */
+    this._rq = { active: false, again: false, hasM: false, m: new Float64Array(16), builds: 0, itemsPending: false, fresh: false, started: false };
+    /** Everything this realign moved the world by (all its builds), for the record and the spot zone. */
+    this._totM = new Float64Array(16);
+    this._totHasM = true;
     /** @type {{ x: number, z: number }} */ this._zoneTmp = { x: 0, z: 0 };
     /** Session-record arrays (event-time pushes only). @type {any[]} */ this.resets = [];
     /** @type {any[]} */ this.realigns = [];
@@ -263,6 +325,7 @@ export class PlayKit {
     this._saveSettingsNow = () => this.writeSettings();
 
     this.events.on('waveStart', (/** @type {{ wave: number }} */ p) => {
+      if (p.wave === 1 && this.look) this.look.reset(); // a fresh round (start or restart): old decals and puffs go
       if (p.wave === 1 && !this.runStarted && this.perf && !this.perf.running) {
         this.runStarted = true;
         this.perf.startRun(RUN_MS, 'play wave 1');
@@ -278,7 +341,21 @@ export class PlayKit {
 
   /** Everything the warm-up must draw (all already in the scene). */
   warmObjects() {
-    return [...this.worldMeshes, ...this.weapons.warmMeshes(), ...this.enemies.warmMeshes(), ...this.game.warmMeshes(), ...this.watch.warmMeshes()];
+    return [...this.worldMeshes, ...this.weapons.warmMeshes(), ...this.enemies.warmMeshes(), ...this.game.warmMeshes(), ...this.watch.warmMeshes(),
+      ...(this.look ? this.look.warmMeshes() : [])];
+  }
+
+  /**
+   * The physics load step (Preload, after this kit is built and BEFORE the GPU warm-up): Rapier's import and init,
+   * the item kinds from the GLB vertices, the contact warm-up. With `off` (`?physics=off`) or on any failure the
+   * v0.3 rules stay (a released gun returns to its slot).
+   * @param {{ off?: boolean }} [o]
+   */
+  async initPhysics(o = {}) {
+    const r = await this.weapons.initPhysics(o);
+    this.physicsLoad = r;
+    if (this.look) this.look.attach({ physics: this.weapons.phys }); // contact shadows under lying items
+    return r;
   }
 
   /**
@@ -290,6 +367,7 @@ export class PlayKit {
     this.enemies.setWarm(on);
     this.game.setWarm(on);
     this.watch.setWarm(on);
+    if (this.look) this.look.setWarm(on);
   }
 
   /**
@@ -324,6 +402,13 @@ export class PlayKit {
     this.resets = [];
     this.realigns = [];
     this.realignHasM = false;
+    this._rq.active = false;
+    this._rq.again = false;
+    this._rq.itemsPending = false;
+    this._bq.active = false;
+    this._buildSeq++; // a build still in flight from the last session resolves into nothing
+    this.lastBuild = null;
+    this._physSince = -1;
     this.refIdx = [];
     this.refPlanes = [];
     this.drift.setReference(null, []);
@@ -335,6 +420,7 @@ export class PlayKit {
     this.watch.enabled = true;
     this.weapons.triggerBlocked = false;
     rec.play = { step: 'capture', mode: roam ? 'roam' : 'spot', grip: this.gripReport };
+    rec.physicsLoad = this.physicsLoad;
   }
 
   /**
@@ -344,9 +430,11 @@ export class PlayKit {
    */
   worldUpdate(dt, t, frame, ctx) {
     if (this.t0 < 0) this.t0 = t;
-    if (this.modeWanted >= 0) this.switchMode(t);
+    // the MODE row waits while a realign holds the round (its build must land first)
+    if (this.modeWanted >= 0 && this.step !== STEP.REALIGN && this.step !== STEP.REWARM) this.switchMode(t);
     switch (this.step) {
       case STEP.CAPTURE: this.capture(t, frame); break;
+      case STEP.BUILD: this.buildWait(t); break;
       case STEP.WARM: this.warmInXR(); this.step = STEP.START; break;
       case STEP.START: this.waitCard(t); break;
       case STEP.REBUILD: this.rebuildForSpot(t); break;
@@ -356,7 +444,78 @@ export class PlayKit {
       case STEP.REWARM: this.rewarm(t); break;
       default: break;
     }
-    this.world.update(dt, t, frame, ctx);
+    const W = this.world, B = this._bq;
+    if (B.active) {
+      // the main thread's share of a worker build: the world step's own time, and last frame's systems but render
+      const c0 = performance.now();
+      W.update(dt, t, frame, ctx);
+      const ms = performance.now() - c0;
+      B.frames++;
+      if (ms > B.worldMaxMs) B.worldMaxMs = ms;
+      const sys = prevFrameSysMs(this.perf);
+      if (sys > B.sysMaxMs) B.sysMaxMs = sys;
+    } else W.update(dt, t, frame, ctx);
+    // a realign's build just committed: the lying guns and magazines move with the house (the statics follow next)
+    const R = this._rq;
+    if (R.itemsPending && W.stats.builds !== R.builds) {
+      R.itemsPending = false;
+      this.weapons.realignItems(R.m);
+    }
+  }
+
+  // ── worker builds ───────────────────────────────────────────────────────
+
+  /**
+   * Track a world build (buildAsync / realignAsync): its promise only flips flags (it resolves after the
+   * frame callback); the steps poll `buildReady()`.
+   * @param {string} kind 'capture' | 'mode' | 'spot' | 'realign' @param {() => Promise<boolean>} start
+   */
+  startBuild(kind, start) {
+    const B = this._bq, seq = ++this._buildSeq;
+    B.active = true; B.done = false; B.ok = false; B.seq = seq; B.kind = kind; B.t0 = performance.now();
+    B.frames = 0; B.worldMaxMs = 0; B.sysMaxMs = 0; B.waitMs = 0;
+    /** @type {Promise<boolean>} */ let p;
+    try { p = start(); } catch (e) { p = Promise.reject(e); }
+    p.then((ok) => { if (B.seq === seq) { B.done = true; B.ok = !!ok; } },
+      (e) => { if (B.seq === seq) { B.done = true; B.ok = false; this.note(`${kind} build failed: ${e instanceof Error ? e.message : e}`); } });
+  }
+
+  /** The tracked build is in place: resolved, committed, its occluder tiles uploaded. */
+  buildReady() { return this._bq.active && this._bq.done && !this.world.busy; }
+
+  /** Close the tracked build and keep its main-thread record (rec.play.world.async). */
+  finishBuild() {
+    const B = this._bq, W = this.world;
+    B.active = false;
+    B.waitMs = performance.now() - B.t0;
+    this.lastBuild = { kind: B.kind, ok: B.ok, builder: this.builder ? this.builder.kind : 'none', builderFailed: this.builder ? !!this.builder.failed : null,
+      builderError: this.builder && this.builder.error ? String(this.builder.error).slice(0, 200) : undefined, builderWarmMs: this.builder ? Math.round(this.builder.warmMs) : null,
+      workerBuilds: W.stats.workerBuilds, workerMs: Math.round(W.stats.workerMs * 10) / 10, waitMs: Math.round(B.waitMs), frames: B.frames,
+      worldMaxMs: Math.round(B.worldMaxMs * 100) / 100, sysMaxMs: Math.round(B.sysMaxMs * 100) / 100,
+      applyFrames: W.stats.applyFrames, applyMaxMs: W.stats.applyMaxMs, phaseMs: { ...W.stats.applyPhaseMs } };
+    return B;
+  }
+
+  /**
+   * The static colliders are built for the current world (or the physics is off / failed), or this has waited
+   * PHYS_WAIT_MS: a gun dropped from here lands on the new world.
+   * @param {number} t
+   */
+  physWait(t) {
+    const P = this.weapons.phys;
+    if (!P || P.failed || P.ready) { this._physSince = -1; return true; }
+    if (this._physSince < 0) this._physSince = t;
+    if (t - this._physSince <= PHYS_WAIT_MS) return false;
+    this._physSince = -1;
+    this.note('physics: static colliders not ready after 8 s; going on');
+    return true;
+  }
+
+  /** A build is in place: the look follows the house (rooms, windows, presets); lights jump, behind the panel. @param {boolean} moved */
+  worldBuilt(moved) {
+    if (!this.look) return;
+    this.look.onWorldBuilt(this.world, this.world.snapshot, { moved });
+    this.look.snap();
   }
 
   /** @param {number} t @param {XRFrame} frame */
@@ -373,24 +532,37 @@ export class PlayKit {
     this.snapshot = snap;
     this.setDriftReference(snap, !this.fixture);
     const p = this.player;
-    const tb = performance.now();
-    this.world.build(snap, { x: p.head.x, z: p.head.z, r: this.game.rules.zoneR }, { roam: this.game.roam });
-    const buildMs = performance.now() - tb;
-    this.world.bakeBudgetMs = BAKE_CARD_MS; // the opaque card is up: bake faster
+    this.world.bakeBudgetMs = BAKE_CARD_MS; // the opaque card is up: bake faster (a worker build bakes there)
     this.buildX = p.head.x;
     this.buildZ = p.head.z;
     this.buildAtMs = Math.round(t - this.t0);
     if (this.perf) this.perf.mark('world build');
-    this.makeCard();
+    const start = { x: p.head.x, z: p.head.z, r: this.game.rules.zoneR }, roam = this.game.roam;
+    this.startBuild('capture', () => this.world.buildAsync(snap, start, { roam }));
     if (this.rec) {
-      // the user's real house, replayable on desktop (?emulate&snapshot=…)
+      // the user's real house, replayable on desktop (?emulate&snapshot=…); a worker build adds the encoded global mesh
       this.rec.spaceSnapshot = snap;
       this.rec.play = {
-        step: 'warm', source, mode: this.game.roam ? 'roam' : 'spot', grip: this.gripReport,
-        capture: { ...S, atMs: this.buildAtMs, planesInSnapshot: snap ? snap.planes.length : 0, meshesInSnapshot: snap ? snap.meshes.length : 0, refPlanes: this.refIdx.length },
-        world: this.worldRecord(buildMs),
+        step: 'build', source, mode: roam ? 'roam' : 'spot', grip: this.gripReport,
+        capture: { ...S, atMs: this.buildAtMs, planesInSnapshot: snap ? snap.planes.length : 0, meshesInSnapshot: snap ? snap.meshes.length : 0, refPlanes: this.refIdx.length,
+          globalMesh: snap && snap.globalMesh ? { tris: snap.globalMesh.triangleCount, verts: snap.globalMesh.vertexCount, label: snap.globalMesh.label } : null },
       };
     }
+    this.step = STEP.BUILD;
+  }
+
+  /**
+   * The capture's (or the MODE row's) worker build in flight, behind the panel: once it is in place, the card.
+   * @param {number} _t
+   */
+  buildWait(_t) {
+    if (!this.buildReady()) return;
+    this.finishBuild();
+    this.world.bakeBudgetMs = BAKE_CARD_MS;
+    this.makeCard();
+    this.worldBuilt(false);
+    if (this.perf) this.perf.mark('world built');
+    if (this.rec && this.rec.play) { this.rec.play.step = 'warm'; this.rec.play.world = this.worldRecord(); }
     this.step = STEP.WARM;
   }
 
@@ -448,14 +620,15 @@ export class PlayKit {
 
   /**
    * The session record's view of the world just built (allocates: build time only).
+   * `buildMs` is the build itself (in the worker for a worker build); `async` is what the main thread paid while it
+   * ran (the world step's longest frame, the longest frame of every system but render, the apply slices).
    * `report` is the world's own JSON-safe report; session end refreshes it with the spawn tiers used.
-   * @param {number} buildMs
    */
-  worldRecord(buildMs) {
+  worldRecord() {
     const W = this.world;
-    return { describe: W.describe(), buildMs: Math.round(buildMs * 10) / 10, mode: W.roamOn ? 'roam' : 'spot', virtual: W.virtual, partialVirtual: W.partialVirtual,
-      zone: { ...W.zone }, occluderBoxes: W.occluderBoxes, stats: { ...W.stats, notes: W.stats.notes.slice(0, 20) },
-      report: worldReport(W) };
+    return { describe: W.describe(), buildMs: Math.round(W.stats.buildMs * 10) / 10, mode: W.roamOn ? 'roam' : 'spot', virtual: W.virtual, partialVirtual: W.partialVirtual,
+      zone: { ...W.zone }, occluderBoxes: W.occluderBoxes, stats: { ...W.stats, applyPhaseMs: { ...W.stats.applyPhaseMs }, notes: W.stats.notes.slice(0, 20) },
+      async: this.lastBuild, report: worldReport(W) };
   }
 
   /**
@@ -475,6 +648,7 @@ export class PlayKit {
     const released = !W.capture && !W.menuOpen && !!I && ((I.left && I.left.triggerUp) || (I.right && I.right.triggerUp));
     const held = !!I && ((I.left && I.left.triggerHeld) || (I.right && I.right.triggerHeld));
     if (!((up >= CARD_MAX_MS && !held && !W.menuOpen) || (released && up >= CARD_MIN_MS))) return;
+    if (!this.physWait(t)) return; // the static colliders are still being built (4 ms slices behind the card)
     this.game.pickSpot(this._onSpot);
     this.step = STEP.SPOT;
     if (this.rec && this.rec.play) { this.rec.play.step = 'spot'; this.rec.play.cardMs = Math.round(up); this.rec.play.cardSkipped = up < CARD_MAX_MS; }
@@ -494,38 +668,38 @@ export class PlayKit {
   }
 
   /**
-   * The spot moved (spot mode): build the world again around it (App's panel is
-   * up this frame and the next, which draws, and so uploads, the occluder's new buffers).
+   * The spot moved (spot mode): build the world again around it, in the worker, behind App's panel (which
+   * stays up through GO, while the occluder's last range uploads and the static colliders are rebuilt).
    * @param {number} t
    */
   rebuildForSpot(t) {
-    const z = this.spotZone, W = this.world;
-    if (z) {
-      const tb = performance.now();
-      let built = false;
-      try {
-        built = W.build(W.snapshot, z, { doors: W.doorOpen.slice(), roam: this.game.roam });
-      } catch (e) {
-        this.note(`rebuild for the spot failed: ${e instanceof Error ? e.message : e}`);
-      }
-      const buildMs = performance.now() - tb;
-      this.buildX = z.x;
-      this.buildZ = z.z;
-      this.rebuilt = built;
-      const d = W.describe();
-      if (d !== this.builtLines[1]) this.makeCard();
+    const z = this.spotZone, W = this.world, B = this._bq;
+    if (!z) { this.step = STEP.GO; return; }
+    if (!B.active || B.kind !== 'spot') {
+      const doors = W.doorOpen.slice(), roam = this.game.roam;
+      this.startBuild('spot', () => W.buildAsync(W.snapshot, z, { doors, roam, force: true }));
       if (this.perf) this.perf.mark('world rebuild');
-      if (this.rec && this.rec.play) {
-        const first = this.rec.play.world;
-        this.rec.play.world = { ...this.worldRecord(buildMs), firstBuildMs: first ? first.buildMs : null,
-          rebuild: { movedM: Math.round(this.spotMoved * 100) / 100, buildMs: Math.round(buildMs * 10) / 10, atMs: Math.round(t - this.t0), built } };
-      }
+      return;
+    }
+    if (!this.buildReady()) return;
+    this.finishBuild();
+    this.buildX = z.x;
+    this.buildZ = z.z;
+    this.rebuilt = B.ok;
+    if (W.describe() !== this.builtLines[1]) this.makeCard();
+    this.worldBuilt(false);
+    if (this.rec && this.rec.play) {
+      const first = this.rec.play.world;
+      this.rec.play.world = { ...this.worldRecord(), firstBuildMs: first ? first.buildMs : null,
+        rebuild: { movedM: Math.round(this.spotMoved * 100) / 100, buildMs: Math.round(W.stats.buildMs * 10) / 10, waitMs: Math.round(B.waitMs),
+          atMs: Math.round(t - this.t0), built: B.ok } };
     }
     this.step = STEP.GO;
   }
 
   /** @param {number} t */
   startRound(t) {
+    if (!this.physWait(t)) return; // after a spot rebuild: the static colliders first (the panel is still up)
     const z = this.spotZone;
     this.world.bakeBudgetMs = BAKE_PLAY_MS;
     this.game.start(z || this.world.zone);
@@ -558,9 +732,12 @@ export class PlayKit {
     }
     switch (this.step) {
       case STEP.IDLE: return;
-      case STEP.CAPTURE: case STEP.WARM: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
-        // before the round: read the room again in the new space (the card goes back up)
+      case STEP.CAPTURE: case STEP.BUILD: case STEP.WARM: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
+        // before the round: read the room again in the new space (the card goes back up; a build in flight is
+        // superseded by the next one and its result ignored)
         if (this.game.spotting || this.game.phase !== PHASE.IDLE) this.game.stop();
+        this._bq.active = false;
+        this._buildSeq++;
         this.gate.reset();
         this.snapshot = null;
         this.cardAt = -1;
@@ -582,8 +759,22 @@ export class PlayKit {
    * @param {'reset'|'drift'} cause @param {ArrayLike<number>|null} m old → new
    */
   queueRealign(cause, m) {
-    const pending = this.step === STEP.REALIGN;
-    if (m && pending && this.realignHasM) {
+    const pending = this.step === STEP.REALIGN, R = this._rq;
+    if (!pending) {
+      // a new realign: nothing moved yet
+      identity4(this._totM);
+      this._totHasM = true;
+      R.started = false;
+      R.again = false;
+    }
+    if (pending && R.active) {
+      // a realign build is in flight: this one follows it, from the world it makes (composed with any other follow-up)
+      if (m && (!R.again || this.realignHasM)) {
+        if (R.again) { mul4(m, this.realignM, this._mTmp); this.realignM.set(this._mTmp); } else this.realignM.set(m);
+        this.realignHasM = true;
+      } else this.realignHasM = false;
+      R.again = true;
+    } else if (m && pending && this.realignHasM) {
       mul4(m, this.realignM, this._mTmp);
       this.realignM.set(this._mTmp);
     } else if (m && !pending) {
@@ -613,34 +804,48 @@ export class PlayKit {
   }
 
   /**
-   * Behind the held pause: rebuild the world in the new coordinates (allocates;
-   * the build may take longer than 2 ms: it runs while paused, like the spot rebuild).
+   * Behind the held pause: rebuild the world in the new coordinates, in the worker (realignAsync). At the
+   * commit the lying items move with it (worldUpdate); the round waits for the build, its occluder tiles and
+   * the static colliders, then REWARM. A reset or drift arriving meanwhile queues one more build after it.
    * @param {number} t @param {XRFrame} frame
    */
   realignStep(t, frame) {
-    /** @type {SpaceSnapshot|null} */ let fresh = null;
-    if (!this.realignHasM) {
-      const ready = this.fixture ? true : this.gate.update(frame, t) || this.gate.done;
-      if (!ready) return;
-      fresh = this.takeSnapshot(frame);
-      if (!fresh && !this.fixture) { this.note('realign: no snapshot; the world keeps its old coordinates'); }
+    const R = this._rq, W = this.world;
+    if (!R.active) {
+      /** @type {SpaceSnapshot|null} */ let fresh = null;
+      if (!this.realignHasM) {
+        const ready = this.fixture ? true : this.gate.update(frame, t) || this.gate.done;
+        if (!ready) return;
+        fresh = this.takeSnapshot(frame);
+        if (!fresh && !this.fixture) this.note('realign: no snapshot; the world keeps its old coordinates');
+      }
+      if (!R.started) { R.started = true; this.realignPlanes = W.snapshot ? W.snapshot.planes.length : 0; }
+      R.active = true;
+      R.again = false;
+      R.hasM = this.realignHasM;
+      R.m.set(this.realignM);
+      R.fresh = !!fresh;
+      R.builds = W.stats.builds;
+      R.itemsPending = R.hasM;
+      this.realignHasM = false;
+      if (R.hasM) { mul4(R.m, this._totM, this._mTmp); this._totM.set(this._mTmp); } else this._totHasM = false;
+      const m = R.hasM ? R.m : null;
+      if (m || fresh) this.startBuild('realign', () => W.realignAsync(m, fresh));
+      else { R.active = false; this.step = STEP.REWARM; } // nothing to rebuild from: the world keeps its coordinates
+      return;
     }
-    const W = this.world;
-    const before = W.snapshot ? W.snapshot.planes.length : 0;
-    const tb = performance.now();
-    try {
-      if (this.realignHasM) W.realign(this.realignM);
-      else if (fresh) W.realign(null, fresh);
-    } catch (e) {
-      this.note(`realign failed: ${e instanceof Error ? e.message : e}`);
-    }
-    this.realignBuildMs = performance.now() - tb;
+    if (!this.buildReady() || !this.physWait(t)) return;
+    const B = this.finishBuild();
+    this.realignBuildMs = B.waitMs;
+    R.active = false;
+    R.itemsPending = false;
     // the drift watch's reference follows the world
-    if (this.realignCause === 'drift' && this.realignHasM) this.drift.rebase();
-    else if (this.realignHasM) { if (this.refIdx.length) this.drift.setReference(W.snapshot, this.refIdx); }
-    else if (fresh) this.setDriftReference(fresh, !this.fixture);
+    if (this.realignCause === 'drift' && R.hasM) this.drift.rebase();
+    else if (R.hasM) { if (this.refIdx.length) this.drift.setReference(W.snapshot, this.refIdx); }
+    else if (R.fresh) this.setDriftReference(W.snapshot, !this.fixture);
     if (W.snapshot) this.snapshot = W.snapshot;
-    this.realignPlanes = before;
+    if (R.again) return; // another reset / drift came in meanwhile: one more build from this world (next frame)
+    this.worldBuilt(true); // the decals are cleared (they would float), the lights jump
     this.step = STEP.REWARM;
   }
 
@@ -649,21 +854,24 @@ export class PlayKit {
     this.warmInXR();
     const g = this.game;
     /** @type {{ x: number, z: number }|undefined} */ let zone;
-    if (!g.roam && this.realignHasM) {
+    const has = this._totHasM && this._rq.started;
+    if (!g.roam && has) {
       const z = this._zoneTmp;
       z.x = g.zone.x; z.z = g.zone.z;
-      zone = transformPointXZ(this.realignM, z);
+      zone = transformPointXZ(this._totM, z);
     }
     g.realigned(zone);
     if (this.realigns.length < 20) {
-      const M = this.realignM;
-      this.realigns.push({ t: this.t0 >= 0 ? Math.round(t - this.t0) : 0, cause: this.realignCause, transform: this.realignHasM,
-        dx: this.realignHasM ? r3(M[12]) : null, dz: this.realignHasM ? r3(M[14]) : null,
-        dyawDeg: this.realignHasM ? Math.round((yawOf(M) * 1800) / Math.PI) / 10 : null,
+      const M = this._totM, A = this.lastBuild;
+      this.realigns.push({ t: this.t0 >= 0 ? Math.round(t - this.t0) : 0, cause: this.realignCause, transform: has,
+        dx: has ? r3(M[12]) : null, dz: has ? r3(M[14]) : null,
+        dyawDeg: has ? Math.round((yawOf(M) * 1800) / Math.PI) / 10 : null,
         planesBefore: this.realignPlanes, planesAfter: this.world.snapshot ? this.world.snapshot.planes.length : 0,
-        buildMs: Math.round(this.realignBuildMs * 10) / 10, waitMs: Math.round(performance.now() - this.realignAt) });
+        buildMs: Math.round(this.world.stats.buildMs * 10) / 10, buildWaitMs: Math.round(this.realignBuildMs),
+        worldMaxMs: A ? A.worldMaxMs : null, worker: A ? A.workerBuilds > 0 : false, waitMs: Math.round(performance.now() - this.realignAt) });
     }
     this.realignHasM = false;
+    this._rq.started = false;
     if (this.perf) this.perf.mark('realigned');
     this.step = STEP.PLAY;
   }
@@ -759,7 +967,7 @@ export class PlayKit {
     this.modeWanted = -1;
     const g = this.game;
     if (roam === g.roam) return;
-    const pre = this.step === STEP.IDLE || this.step === STEP.CAPTURE;
+    const pre = this.step === STEP.IDLE || this.step === STEP.CAPTURE; // (a capture build in flight is rebuilt below)
     if (this.watch.menuOpen) this.watch.closeMenu('mode');
     if (!pre) {
       if (g.spotting || g.phase !== PHASE.IDLE) g.stop();
@@ -770,23 +978,19 @@ export class PlayKit {
     if (this.modeSwitches.length < 10) this.modeSwitches.push({ to: roam ? 'roam' : 'spot', fromStep: this.stepName, atMs: this.t0 >= 0 ? Math.round(t - this.t0) : 0 });
     if (pre) return; // the capture builds in the new mode
     const W = this.world, p = this.player;
-    const tb = performance.now();
-    try {
-      W.build(W.snapshot, { x: p.head.x, z: p.head.z, r: g.rules.zoneR }, { doors: W.doorOpen.slice(), roam });
-    } catch (e) {
-      this.note(`mode rebuild failed: ${e instanceof Error ? e.message : e}`);
-    }
-    const buildMs = performance.now() - tb;
+    // the captured snapshot (a capture build may still be in flight: W.snapshot is then the previous world's)
+    const snap = this.snapshot || W.snapshot, start = { x: p.head.x, z: p.head.z, r: g.rules.zoneR };
+    const doors = this.step === STEP.BUILD ? null : W.doorOpen.slice();
     W.bakeBudgetMs = BAKE_CARD_MS;
     this.buildX = p.head.x;
     this.buildZ = p.head.z;
-    this.makeCard();
     this.cardAt = -1;
     this.spotZone = null;
     this.spotMoved = 0;
     this.rebuilt = false;
-    if (this.rec && this.rec.play) { this.rec.play.mode = roam ? 'roam' : 'spot'; this.rec.play.step = 'warm'; this.rec.play.world = this.worldRecord(buildMs); }
-    this.step = STEP.WARM;
+    this.startBuild('mode', () => W.buildAsync(snap, start, { doors, roam, force: true }));
+    if (this.rec && this.rec.play) { this.rec.play.mode = roam ? 'roam' : 'spot'; this.rec.play.step = 'build'; }
+    this.step = STEP.BUILD; // behind the panel ("Reading your room…"), then the card again
   }
 
   /**
@@ -795,7 +999,7 @@ export class PlayKit {
    * before weapons and enemies run; frozen enemies are stepped with dt = 0.
    */
   systems() {
-    const c = this.ctx, game = /** @type {any} */ (this.game), W = this.weapons, watch = this.watch, P = this.player;
+    const c = this.ctx, game = /** @type {any} */ (this.game), W = this.weapons, watch = this.watch, P = this.player, look = this.look;
     const pre = typeof game.preUpdate === 'function';
     return [
       { name: 'world', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.worldUpdate(dt, t, f, c) },
@@ -809,8 +1013,12 @@ export class PlayKit {
         W.triggerBlocked = watch.capture || watch.menuOpen;
         W.update(dt, t, f, c);
       } },
+      // dropped guns and magazines: static colliders (slices), the fixed 1/90 s step (skipped when all sleep), lying items
+      { name: 'physics', update: (/** @type {number} */ dt) => W.physicsUpdate(dt, c) },
       { name: 'enemies', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.enemies.update(game.freezeEnemies ? 0 : dt, t, f, c) },
       { name: 'game', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => this.game.update(dt, t, f, c) },
+      // room light, contact shadows, impacts (after the enemies' poses, before render; also during the card: a hot JIT)
+      { name: 'look', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => { if (look) look.update(dt, t, f, c); } },
       { name: 'audio', update: (/** @type {number} */ dt, /** @type {number} */ t, /** @type {XRFrame} */ f) => { if (this.audio) this.audio.update(dt, t, f, c); } },
     ];
   }
@@ -848,7 +1056,14 @@ export class PlayKit {
         settings: { ...this.settings, gloves: this.gloves }, storageErrors: this.storageErrors.length ? this.storageErrors.slice() : undefined,
         lighting: this.lighting ? { ...this.lighting, envMap: !!this.envTexture } : null,
       };
+      try { rec.play.look = this.look ? { ...this.look.report(), prep: this.lookPrep } : null; } catch (err) { rec.play.look = { error: String(err) }; }
+      try { rec.physics = this.weapons.physicsReport(); } catch (err) { rec.physics = { error: String(err) }; }
     }
+    if (this.look) this.look.reset();
+    this._bq.active = false;
+    this._buildSeq++;
+    this._rq.active = false;
+    this._rq.itemsPending = false;
     this.game.stop();
     this.enemies.reset();
     this.weapons.reset();
@@ -879,7 +1094,7 @@ export class PlayKit {
   panelLines() {
     if (this.game.spotting) return null;
     switch (this.step) {
-      case STEP.CAPTURE: return CAPTURE_LINES;
+      case STEP.CAPTURE: case STEP.BUILD: return CAPTURE_LINES;
       case STEP.WARM: case STEP.START: case STEP.REBUILD: return this.builtLines;
       case STEP.GO: return this.rebuilt ? this.builtLines : null;
       default: return null; // IDLE, SPOT (game.spotting), PLAY, REALIGN, REWARM
@@ -888,6 +1103,24 @@ export class PlayKit {
 
   /** True once the round runs (GameSession shows its own messages). */
   get playing() { return (this.step === STEP.PLAY || this.step === STEP.REALIGN || this.step === STEP.REWARM) && this.game.phase !== PHASE.IDLE; }
+}
+
+/** @param {Float64Array} m set to the identity (column-major 4×4) */
+function identity4(m) {
+  m.fill(0);
+  m[0] = m[5] = m[10] = m[15] = 1;
+}
+
+/**
+ * The last recorded frame's time in every system but render (ms; 0 before any frame). Allocation-free.
+ * @param {any} perf PerfMonitor
+ */
+function prevFrameSysMs(perf) {
+  if (!perf || !perf.count) return 0;
+  const n = perf.nSys, h = ((perf.head - 1 + perf.capacity) % perf.capacity) * n, ri = perf.systems.indexOf('render');
+  let s = 0;
+  for (let i = 0; i < n; i++) if (i !== ri) s += perf.ringSys[h + i];
+  return s;
 }
 
 /**

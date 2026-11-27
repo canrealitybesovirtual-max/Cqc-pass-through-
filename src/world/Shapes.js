@@ -9,7 +9,10 @@
  * Box record (8 floats): cx, cz, c, s, hx, hz, y0, y1 — see geom.js for the frame.
  * `flags[i]` (Uint8) per box: SHAPE_JAMB (a wall piece beside a door opening),
  * SHAPE_WALL, SHAPE_INFERRED (an inferred wall: no wall plane there),
- * SHAPE_LINTEL (above a door). The safety code uses them for walking cues.
+ * SHAPE_LINTEL (above a door), SHAPE_COVERED (furniture the processed global
+ * mesh covers: with `skipCovered` set, raycasts and sight lines use the mesh
+ * there instead, so a shot under a real table passes). The safety code uses
+ * them for walking cues (covered boxes stay obstacles).
  */
 
 import { pointInPolygon } from '../util/geom2d.js';
@@ -21,6 +24,7 @@ export const SHAPE_JAMB = 1;
 export const SHAPE_WALL = 2;
 export const SHAPE_INFERRED = 4;
 export const SHAPE_LINTEL = 8;
+export const SHAPE_COVERED = 16;
 
 /** @typedef {{ pts: Float64Array, n: number, y: number, x0: number, x1: number, z0: number, z1: number }} FlatPoly */
 
@@ -121,6 +125,21 @@ export class ShapeSet {
     this.floorY0 = 0;
     this.ceilingY = NaN;
     this.dropped = 0;
+    /** Raycasts and segmentClear skip SHAPE_COVERED boxes (the world has a mesh BVH for them). */
+    this.skipCovered = false;
+    /** Covered boxes are stored last: rays and sight lines test the first `rayCount` boxes. */
+    this.coveredCount = 0;
+    this.rayCount = 0;
+  }
+
+  /**
+   * Let rays and sight lines skip the furniture the global mesh covers (true
+   * when the world has its BVH), or test every box (false).
+   * @param {boolean} on
+   */
+  setSkipCovered(on) {
+    this.skipCovered = !!on;
+    this.rayCount = this.skipCovered ? this.count - this.coveredCount : this.count;
   }
 
   /**
@@ -138,6 +157,11 @@ export class ShapeSet {
       boxes = walls.concat(furn).slice(0, this.maxBoxes);
       this.dropped = layout.boxes.length - boxes.length;
     }
+    // covered furniture last (rays and sight lines may stop before it: rayCount)
+    let covered = 0;
+    for (const b of boxes) if (b.covered) covered++;
+    if (covered) boxes = boxes.filter((b) => !b.covered).concat(boxes.filter((b) => b.covered));
+    this.coveredCount = covered;
     const B = this.box;
     for (let i = 0; i < boxes.length; i++) {
       const b = boxes[i], o = i * BOX_STRIDE;
@@ -145,9 +169,10 @@ export class ShapeSet {
       B[o + 4] = b.hx; B[o + 5] = b.hz; B[o + 6] = b.y0; B[o + 7] = b.y1;
       this.label[i] = b.label;
       this.flags[i] = (b.kind === 'wall' ? SHAPE_WALL : 0) | (b.jamb0 || b.jamb1 ? SHAPE_JAMB : 0)
-        | (b.source === 'inferred' ? SHAPE_INFERRED : 0) | (b.lintel ? SHAPE_LINTEL : 0);
+        | (b.source === 'inferred' ? SHAPE_INFERRED : 0) | (b.lintel ? SHAPE_LINTEL : 0) | (b.covered ? SHAPE_COVERED : 0);
     }
     this.count = boxes.length;
+    this.setSkipCovered(this.skipCovered);
     this.floors = layout.floors.map((f) => ({ pts: f.pts, n: f.n, y: f.y, x0: f.x0, x1: f.x1, z0: f.z0, z1: f.z1 }));
     this.ceilings = layout.ceilings.slice();
     this.floorY0 = layout.floorY0;
@@ -170,7 +195,7 @@ export class ShapeSet {
     dx /= len; dy /= len; dz /= len;
     let best = max, bi = -1, axis = 0, sign = 0;
     const B = this.box;
-    for (let i = 0, o = 0; i < this.count; i++, o += BOX_STRIDE) {
+    for (let i = 0, o = 0; i < this.rayCount; i++, o += BOX_STRIDE) {
       if (boxEntry(B, o, ox, oy, oz, dx, dy, dz, best) === 1 && ENTRY[0] < best) { best = ENTRY[0]; bi = i; axis = hitAxis; sign = hitSign; }
     }
     /** -1 box, 1 floor, 2 ceiling */
@@ -212,7 +237,7 @@ export class ShapeSet {
   segmentClear(ax, ay, az, bx, by, bz) {
     const dx = bx - ax, dy = by - ay, dz = bz - az;
     const B = this.box;
-    for (let i = 0, o = 0; i < this.count; i++, o += BOX_STRIDE) {
+    for (let i = 0, o = 0; i < this.rayCount; i++, o += BOX_STRIDE) {
       if (boxEntry(B, o, ax, ay, az, dx, dy, dz, 1) !== -1) return false;
     }
     return true;

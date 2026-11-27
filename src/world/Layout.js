@@ -52,7 +52,7 @@
 import { pointInPolygon } from '../util/geom2d.js';
 import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFromPoints, signedArea } from './geom.js';
 
-/** @typedef {{ version: number, space: string, planes: SnapPlane[], meshes: SnapMesh[] }} SpaceSnapshot */
+/** @typedef {{ version: number, space: string, planes: SnapPlane[], meshes: SnapMesh[], globalMesh?: any }} SpaceSnapshot */
 /** @typedef {{ label: string|null, orientation: 'horizontal'|'vertical', pose: number[], polygon: number[][] }} SnapPlane */
 /** @typedef {{ label: string|null, pose: number[], min: number[], max: number[], vertexCount: number }} SnapMesh */
 
@@ -84,11 +84,13 @@ import { cleanPolygon, convexOverlapArea, distSqToPolygon, rectCorners, rectFrom
 /**
  * @typedef {{ cx: number, cz: number, c: number, s: number, hx: number, hz: number, y0: number, y1: number,
  *   label: string, kind: 'wall'|'furniture', face: number, jamb0: boolean, jamb1: boolean,
- *   lintel: boolean, sill: boolean, navBlock: boolean, source: string, wall: number }} Box
+ *   lintel: boolean, sill: boolean, navBlock: boolean, source: string, wall: number, covered?: boolean }} Box
  *   face: for wall pieces, the local-z side (−1/+1) of the real wall face; 0 for furniture.
  *   jamb0/jamb1: the −x / +x end of a wall piece borders a door opening.
  *   source: 'wall' | 'inferred' for wall pieces; 'mesh' | 'plane' | 'mesh+plane' for furniture.
  *   wall: the wall id of a wall piece (-1 for furniture).
+ *   covered: furniture the processed global mesh covers (MeshPrep): bullets, sight lines and the occluder use the
+ *   mesh there, not the box (the nav grid and the safety cues keep the box).
  */
 /**
  * @typedef {{ floors: Floor[], ceilings: Ceiling[], walls: Wall[], doors: Door[], boxes: Box[], furniture: Box[],

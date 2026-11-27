@@ -16,6 +16,15 @@ import * as THREE from 'three';
  *   the landing sound only on the first landing (CQC), then lie on their side.
  * - Dropped magazines: one instanced pool per weapon (the magazine geometry
  *   and the gun material), ballistic, bounce once or twice and lie flat.
+ *   With real-surface physics (v0.4) magazines are physics items instead,
+ *   drawn by a second instanced pool per weapon (`loose`, the same geometry
+ *   and material, so the same program; LooseItems.js writes it); the
+ *   ballistic pool stays the fallback while physics is off or not built.
+ * - Brass with a world BVH (v0.4 hook): when the world exposes `bvh` (the
+ *   processed Space Setup mesh), each airborne case casts one segment per
+ *   frame along its motion through `world.raycast` and bounces off what it
+ *   hits (soft beds and couches: no tink, a quiet thud). Without it, the
+ *   v0.3 floor bounce stays.
  * - Bullet holes: ONE instanced pool of decals, 3 mm off the hit surface,
  *   depthWrite off with polygon offset (PLAN §5). Per-instance colour carries
  *   the shape parameters (seed, hole size, surface kind), primed with
@@ -33,6 +42,8 @@ export const FX = Object.freeze({
   lightAhead: 0.06,
   brassMax: 48,
   magMax: 6,
+  looseMax: 10,                            // loose physics magazines per weapon (research: pools of 10)
+  brassSoftBounce: 0.08, brassSoftGrip: 0.2, brassSlope: 0.85,   // BVH bounce (research BRASS)
   decalMax: 96,
   decalLift: 0.003,
   brassBounce: 0.35, magBounce: 0.2,       // restitution (design)
@@ -199,6 +210,10 @@ class BodyPool {
     this.next = 0;
     this.count = 0;
     this.dirty = false;
+    /** @type {any} the world, when it has a BVH (brass segment bounce) */
+    this.bvhWorld = null;
+    /** Reused hit record for the segment test. */
+    this.hit = { dist: 0, x: 0, y: 0, z: 0, nx: 0, ny: 1, nz: 0, kind: 'none', surface: '', enemy: -1, part: '' };
   }
 
   /** @returns {number} index of the slot to use (oldest when full) */
@@ -273,6 +288,7 @@ class BodyPool {
         continue;
       }
       V[o + 1] -= FX.gravity * dt;
+      if (this.bvhWorld && this._segment(i, dt, audio)) { this.write(i); continue; }
       P[o] += V[o] * dt; P[o + 1] += V[o + 1] * dt; P[o + 2] += V[o + 2] * dt;
       // q += ½ (0, ω) q dt
       const wx = W[o], wy = W[o + 1], wz = W[o + 2];
@@ -304,6 +320,48 @@ class BodyPool {
       this.write(i);
     }
     if (this.dirty) { this.mesh.instanceMatrix.needsUpdate = true; this.dirty = false; }
+  }
+
+  /**
+   * Brass against the world's BVH: one segment along this frame's motion (plus the case radius);
+   * on a hit it bounces off the surface (soft: no tink) or settles on a flat one. Returns true when
+   * it hit (the position is already moved), false to fly on as usual.
+   * @param {number} i @param {number} dt
+   * @param {{ play?: (key: string, x: number, y: number, z: number, gain?: number, rate?: number) => number } | null} audio
+   */
+  _segment(i, dt, audio) {
+    const P = this.pos, V = this.vel, o = i * 3, W = this.bvhWorld, H = this.hit;
+    const vx = V[o], vy = V[o + 1], vz = V[o + 2], sp = Math.sqrt(vx * vx + vy * vy + vz * vz);
+    if (!(sp > 1e-6)) return false;
+    const r = this.rh[i], len = sp * dt + r;
+    if (!W.raycast(P[o], P[o + 1], P[o + 2], vx / sp, vy / sp, vz / sp, len, H)) return false;
+    const soft = H.surface === 'bed' || H.surface === 'couch' || H.surface === 'sofa';
+    let nx = H.nx, ny = H.ny, nz = H.nz;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+    P[o] = H.x + nx * r; P[o + 1] = H.y + ny * r; P[o + 2] = H.z + nz * r;
+    const vn = vx * nx + vy * ny + vz * nz;
+    if (vn < 0) {
+      const e = soft ? FX.brassSoftBounce : FX.brassBounce, g = soft ? FX.brassSoftGrip : FX.floorGrip;
+      const tx = vx - vn * nx, ty = vy - vn * ny, tz = vz - vn * nz;
+      V[o] = tx * g - e * vn * nx; V[o + 1] = ty * g - e * vn * ny; V[o + 2] = tz * g - e * vn * nz;
+      if (!this.sounded[i]) {
+        this.sounded[i] = 1;
+        if (audio && audio.play) {
+          if (soft) audio.play('cloth', P[o], P[o + 1], P[o + 2], 0.15, 1.3);
+          else if (this.sound[i]) audio.play(this.sound[i], P[o], P[o + 1], P[o + 2], this.gain[i], 0.92 + 0.16 * ((i * 0.618034) % 1));
+        }
+      }
+      const W3 = this.ang;
+      W3[o] *= FX.spinKeep; W3[o + 1] *= FX.spinKeep; W3[o + 2] *= FX.spinKeep;
+      this.bounces[i]++;
+    }
+    const v2 = V[o] * V[o] + V[o + 1] * V[o + 1] + V[o + 2] * V[o + 2];
+    if (ny >= FX.brassSlope && (v2 < FX.restSpeed * FX.restSpeed || this.bounces[i] >= FX.maxBounces || soft)) {
+      this.floor[i] = H.y;   // rests on this surface (settle lerps to floor + rh)
+      this._settle(i);
+    }
+    return true;
   }
 
   /**
@@ -404,6 +462,20 @@ export class WeaponFX {
       worldRoot.add(mm);
     }
 
+    // --- loose magazines as physics items (v0.4): a second pool per weapon, same geometry and material
+    /** @type {Record<string, THREE.InstancedMesh>} */
+    this.loose = {};
+    /** @type {THREE.InstancedMesh[]} */
+    this.looseMeshes = [];
+    for (const id of Object.keys(views)) {
+      const v = views[id];
+      const lm = /** @type {THREE.InstancedMesh} */ (prime(new THREE.InstancedMesh(v.mag.geometry, /** @type {THREE.Material} */ (v.mag.material), FX.looseMax)));
+      lm.name = `w2-${id}-loose`;
+      this.loose[id] = lm;
+      this.looseMeshes.push(lm);
+      worldRoot.add(lm);
+    }
+
     // --- bullet holes
     this.decalMat = new THREE.ShaderMaterial({
       name: 'w2-decal', vertexShader: DECAL_VERT, fragmentShader: DECAL_FRAG,
@@ -419,6 +491,8 @@ export class WeaponFX {
 
     this._warm = false;
     this._warmCounts = new Array(1 + this.magPools.length).fill(0);
+    this._looseWarm = new Array(this.looseMeshes.length).fill(0);
+    this._looseVis = new Array(this.looseMeshes.length).fill(false);
     /** @type {{ floorY?: (x: number, z: number) => number } | null} the world (set by the system each frame) */
     this.world = null;
   }
@@ -566,6 +640,8 @@ export class WeaponFX {
     }
     if (step > 0) {
       const audio = ctx.audio || null;
+      const W = ctx.world || this.world;
+      this.brass.bvhWorld = W && W.bvh && typeof W.raycast === 'function' ? W : null;
       this.brass.update(step, audio, FX.brassBounce);
       for (let i = 0; i < this.magPools.length; i++) this.magPools[i].update(step, audio, FX.magBounce);
     }
@@ -576,6 +652,7 @@ export class WeaponFX {
     /** @type {THREE.Object3D[]} */
     const out = [this.flashMesh, this.brass.mesh, this.decals];
     for (const B of this.magPools) out.push(B.mesh);
+    for (const m of this.looseMeshes) out.push(m);
     return out;
   }
 
@@ -591,7 +668,9 @@ export class WeaponFX {
       this.decals.count = Math.max(1, this.decalCount);
       this.decals.visible = true;
       this.flashMesh.visible = true;
+      this.looseMeshes.forEach((m, i) => { this._looseWarm[i] = m.count; this._looseVis[i] = m.visible; m.count = Math.max(1, m.count); m.visible = true; });
     } else if (!on && this._warm) {
+      this.looseMeshes.forEach((m, i) => { m.count = this._looseWarm[i]; m.visible = this._looseVis[i]; });
       this._warm = false;
       pools.forEach((B, i) => { B.mesh.count = this._warmCounts[i]; B.mesh.visible = B.count > 0; });
       this.decals.count = this.decalCount;

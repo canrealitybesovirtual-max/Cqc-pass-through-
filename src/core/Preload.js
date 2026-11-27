@@ -11,7 +11,11 @@ import { warmUp } from './Warmup.js';
  *      until `audio.unlock()` inside the Enter click);
  *   3. `buildPools(assets, audio)`: the integration layer builds every pool,
  *      view and panel here and returns the objects to warm;
- *   4. warmUp: compile, texture uploads and one default-framebuffer draw of the
+ *   4. `physics()` (v0.4): Rapier's import and init, the item kinds and the
+ *      contact warm-up (a scratch world runs every collider pair, CCD and query
+ *      once, so the first drop in play does not pay for it). Its result is in
+ *      `physics`; a failure only means the v0.3 rules (it never fails the load);
+ *   5. warmUp: compile, texture uploads and one default-framebuffer draw of the
  *      loaded meshes plus those objects; the baseline counts are recorded.
  *
  * The result lives in the exported `preloaded` record (also `window.__app.preload`),
@@ -23,7 +27,7 @@ import { warmUp } from './Warmup.js';
  */
 
 /** Shares of the progress bar (downloads dominate on the headset's Wi-Fi). */
-export const SHARES = Object.freeze({ assets: 0.75, audio: 0.1, warm: 0.15 });
+export const SHARES = Object.freeze({ assets: 0.7, audio: 0.1, physics: 0.05, warm: 0.15 });
 
 /**
  * @typedef {Object} Preloaded
@@ -36,7 +40,8 @@ export const SHARES = Object.freeze({ assets: 0.75, audio: 0.1, warm: 0.15 });
  * @property {import('three').Object3D[]} warmed  everything the warm-up drew (asset scenes + pools)
  * @property {string} error
  * @property {string[]} warnings
- * @property {{ assetsMs: number, audioMs: number, poolsMs: number, warmMs: number, totalMs: number }} times
+ * @property {any} physics  the physics load step's result ({ ok, off?, load: { version, importMs, initMs }, warm, error? }), null when not run
+ * @property {{ assetsMs: number, audioMs: number, poolsMs: number, physicsMs: number, warmMs: number, totalMs: number }} times
  * @property {{ pct: number, label: string, ms: number }[]} history  one entry per whole percent
  * @property {Promise<Preloaded>|null} done
  */
@@ -52,7 +57,8 @@ export const preloaded = {
   warmed: [],
   error: '',
   warnings: [],
-  times: { assetsMs: 0, audioMs: 0, poolsMs: 0, warmMs: 0, totalMs: 0 },
+  physics: null,
+  times: { assetsMs: 0, audioMs: 0, poolsMs: 0, physicsMs: 0, warmMs: 0, totalMs: 0 },
   history: [],
   done: null,
 };
@@ -77,8 +83,10 @@ export function assetWarmObjects(assets) {
  *   scenes?: import('three').Scene[],
  *   onProgress?: (fraction: number, label: string) => void,
  *   buildPools?: (assets: Assets, audio: AudioEngine) => (import('three').Object3D[] | Promise<import('three').Object3D[]>),
+ *   physics?: () => (any | Promise<any>),
  *   assets?: Assets, audio?: AudioEngine }} o
- *   scenes: extra scenes to compile (e.g. fpScene); assets/audio: injectable instances.
+ *   scenes: extra scenes to compile (e.g. fpScene); physics: the physics load step (after buildPools, before the
+ *   warm-up); assets/audio: injectable instances.
  * @returns {Promise<Preloaded>}
  */
 export function preload(o) {
@@ -136,9 +144,25 @@ async function run(o) {
     P.times.poolsMs = Math.round(clock() - t);
     const objects = [...assetWarmObjects(assets), ...(pools || [])];
 
+    if (o.physics) {
+      stage = 'physics';
+      const pb = SHARES.assets + SHARES.audio;
+      report(pb, 'physics');
+      await yieldFrame(); // the bar shows "physics" before the (synchronous) contact warm-up runs
+      t = clock();
+      try {
+        P.physics = await o.physics();
+      } catch (e) {
+        P.physics = { ok: false, error: msg(e) };
+      }
+      if (P.physics && !P.physics.ok && !P.physics.off) P.warnings.push(`physics: ${P.physics.error || 'unavailable'} (dropped guns return to their slots)`);
+      P.times.physicsMs = Math.round(clock() - t);
+      report(pb + SHARES.physics, 'physics ready');
+    }
+
     stage = 'warm-up';
     t = clock();
-    const base = SHARES.assets + SHARES.audio;
+    const base = SHARES.assets + SHARES.audio + SHARES.physics;
     const scenes = [o.scene, ...(o.scenes || [])];
     P.warm = await warmUp(o.renderer, scenes, objects, (f, label) => report(base + f * SHARES.warm, `warm-up: ${label}`), { camera: o.camera });
     P.times.warmMs = Math.round(clock() - t);
@@ -168,12 +192,23 @@ export function preloadSummary(P = preloaded) {
     error: P.error || undefined,
     warnings: P.warnings.length ? P.warnings.slice(0, 20) : undefined,
     times: { ...P.times },
+    physics: P.physics || undefined,
     warm: w ? {
       programs: w.programs, textures: w.textures, geometries: w.geometries, before: w.before,
       drawables: w.drawables, lods: w.lods, primed: w.primed, textureCount: w.textureCount, skippedTextures: w.skippedTextures, calls: w.calls,
       compileMs: Math.round(w.compileMs), textureMs: Math.round(w.textureMs), drawMs: Math.round(w.drawMs),
     } : undefined,
   };
+}
+
+/** One animation frame (or 50 ms when rAF is paused), so the page can paint. @returns {Promise<void>} */
+function yieldFrame() {
+  return new Promise((resolve) => {
+    let done = false;
+    const go = () => { if (!done) { done = true; resolve(); } };
+    setTimeout(go, 50);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(go);
+  });
 }
 
 /** @param {unknown} e */

@@ -33,6 +33,25 @@ export class HomePage {
      * @type {((mode: string) => void)|null}
      */
     this.onEnter = null;
+    /**
+     * Called after the Copy button copied (v0.4: the automatic upload sends the same last session).
+     * @type {(() => void)|null}
+     */
+    this.onCopy = null;
+    /** The automatic upload's status line (v0.4). */
+    this.uploadEl = document.getElementById('upload');
+  }
+
+  /**
+   * The automatic diagnostics upload's state: "Sent ✓", "Will retry", "Sending…" (with what), or off.
+   * @param {{ state: string, text: string, detail: string }} s
+   */
+  uploadStatus(s) {
+    const el = this.uploadEl;
+    if (!el) return;
+    el.textContent = s.text ? `Diagnostics upload: ${s.text}${s.detail ? ` (${s.detail})` : ''}` : '';
+    el.className = s.state === 'sent' ? 'ok' : s.state === 'retry' ? 'bad' : 'quiet';
+    el.dataset.state = s.state;
   }
 
   /**
@@ -112,7 +131,10 @@ export class HomePage {
       });
     }
     this.setButtons(true);
-    $('bCopy').addEventListener('click', async () => this.note(await diag.copy()));
+    $('bCopy').addEventListener('click', async () => {
+      if (this.onCopy) this.onCopy(); // the upload starts first (the clipboard may wait for a permission)
+      this.note(await diag.copy());
+    });
     $('bDownload').addEventListener('click', () => this.note(diag.download()));
     $('bShare').addEventListener('click', async () => this.note(await diag.share()));
     $('bClear').addEventListener('click', () => { diag.clear(); this.renderSummary(); this.note('Diagnostics cleared.'); });

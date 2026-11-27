@@ -162,3 +162,39 @@ export function writeOverlayEdges(layout, pos, col, maxBoxes, maxVerts) {
   }
   return v;
 }
+
+/**
+ * The box occluder's buffers for a layout, made off the main thread (the world
+ * worker): positions, Uint16 indices and the bounds of what was written.
+ * @param {import('./Layout.js').Layout|null} layout
+ * @param {number} maxBoxes
+ * @param {boolean} dropCovered leave out the furniture the global mesh covers
+ * @returns {{ pos: Float32Array, idx: Uint16Array, n: number, bounds: Float32Array, total: number }}
+ */
+export function boxOccluderBuffers(layout, maxBoxes, dropCovered) {
+  const all = layout ? layout.boxes : [];
+  const boxes = dropCovered ? all.filter((b) => !b.covered) : all;
+  const cap = Math.min(boxes.length, maxBoxes);
+  const pos = new Float32Array(cap * OCC_VERTS_PER_BOX * 3), idx = new Uint16Array(cap * OCC_INDICES_PER_BOX);
+  const n = writeOccluderBoxes(boxes, pos, idx, maxBoxes);
+  const bounds = new Float32Array([Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity]);
+  for (let i = 0; i < n * OCC_VERTS_PER_BOX; i++) {
+    for (let j = 0; j < 3; j++) {
+      const v = pos[i * 3 + j];
+      if (v < bounds[j]) bounds[j] = v;
+      if (v > bounds[3 + j]) bounds[3 + j] = v;
+    }
+  }
+  return { pos: pos.subarray(0, n * OCC_VERTS_PER_BOX * 3), idx: idx.subarray(0, n * OCC_INDICES_PER_BOX), n, bounds, total: boxes.length };
+}
+
+/**
+ * The dev overlay's buffers for a layout (the world worker).
+ * @param {import('./Layout.js').Layout|null} layout @param {number} maxBoxes @param {number} maxVerts
+ * @returns {{ pos: Float32Array, col: Float32Array, n: number }}
+ */
+export function overlayBuffers(layout, maxBoxes, maxVerts) {
+  const pos = new Float32Array(maxVerts * 3), col = new Float32Array(maxVerts * 3);
+  const n = writeOverlayEdges(layout, pos, col, maxBoxes, maxVerts);
+  return { pos: pos.slice(0, n * 3), col: col.slice(0, n * 3), n };
+}

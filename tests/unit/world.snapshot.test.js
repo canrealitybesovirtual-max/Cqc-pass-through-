@@ -66,7 +66,7 @@ test('captureSnapshot copies planes and meshes into plain JSON data', () => {
   const f = fakeFrameFrom(src, { nullPoseFor: 3 });
   const stats = { planes: 0, meshes: 0, skippedPlanes: 0, skippedMeshes: 0 };
   const snap = captureSnapshot(f, f.refSpace, { stats });
-  assert.equal(snap.version, 1);
+  assert.equal(snap.version, 2, 'v2: planes, mesh boxes and (not enumerable) the triangles');
   assert.equal(snap.space, 'local-floor');
   assert.equal(snap.planes.length, src.planes.length - 1);
   assert.equal(stats.skippedPlanes, 1, 'the plane without a pose this frame is skipped');
@@ -140,7 +140,7 @@ test('a capture of the fixture house builds the same world as the fixture itself
 
 test('normalizeSnapshot validates and drops malformed entries', () => {
   assert.throws(() => normalizeSnapshot(null));
-  assert.throws(() => normalizeSnapshot({ version: 2, planes: [] }));
+  assert.throws(() => normalizeSnapshot({ version: 3, planes: [] }));
   const s = normalizeSnapshot({
     version: 1,
     planes: [

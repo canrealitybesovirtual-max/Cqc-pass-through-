@@ -5,7 +5,7 @@
  * session record and replayed on desktop. Pure: no three.js, no DOM.
  *
  * ```
- * SpaceSnapshot = { version: 1, space: string,
+ * SpaceSnapshot (v2) = { version: 2, space: string,
  *   planes: [{ label: string|null, orientation: 'horizontal'|'vertical',
  *              pose: number[16],          // column-major, plane space → reference space
  *              polygon: [[x, z], …] }],   // plane space: y is the plane normal
@@ -13,20 +13,43 @@
  *              pose: number[16],          // column-major; this capture writes a
  *                                         //  gravity-aligned box frame (y up)
  *              min: [x,y,z], max: [x,y,z], // box in that frame
- *              vertexCount: number }] }
+ *              vertexCount: number }],
+ *   globalMesh: null | { label, mesh: number (index in meshes, −1 from a record), vertexCount, triangleCount,
+ *              lastChangedTime,
+ *              // after the world build (the worker) encodes it for the session record:
+ *              space: 'reference', encoding: 'cqc-mesh-1', compression, quantum, origin, hash, bytes, data } }
  * ```
+ * v2 adds `globalMesh` and, NOT enumerable (never in JSON, never cloned by
+ * postMessage, so the record and Copy stay small), `snap.raw`: the captured
+ * triangles of every XRMesh:
+ * ```
+ * raw = { token: number, global: number,       // index into raw.meshes (−1: none)
+ *   meshes: [{ label, pose: Float64Array(16),  // mesh space → reference space
+ *              lastChangedTime, data: { vertices: Float32Array, indices: Uint32Array } }] }
+ * ```
+ * `data` is a shared holder: a transformed snapshot (Realign) shares it, and
+ * the world worker borrows its arrays (transferred there and back).
+ * The session record keeps the global mesh as `globalMesh.data` (2 mm,
+ * varint deltas, gzip, base64: MeshCodec.js); `snapshotForCopy` drops it for
+ * Copy; `hydrateSnapshot` decodes it back into `raw` (desktop replay).
+ * v1 snapshots (no mesh) are still accepted everywhere.
  *
  * WebXR facts used (plane-detection / mesh-detection modules): `frame.detectedPlanes`
  * and `frame.detectedMeshes` are set-likes; `XRPlane.polygon` is an array of
  * DOMPointReadOnly in plane space; `XRMesh.vertices` is a Float32Array of
- * x,y,z triplets in mesh space. On Quest 3 `lastChangedTime` ticks about 3×/s
- * with no real change (docs/DEVICE_LOG.md), so capture once (see CaptureGate)
- * and never rebuild during play.
+ * x,y,z triplets in mesh space and `XRMesh.indices` a Uint32Array. On Quest 3
+ * `lastChangedTime` ticks about 3×/s with no real change (docs/DEVICE_LOG.md),
+ * so capture once (see CaptureGate) and never rebuild during play.
  */
 
 import { convexHull, minAreaRect, rect } from './geom.js';
+import { decodeMeshRecord } from './MeshCodec.js';
 
-export const SNAPSHOT_VERSION = 1;
+export const SNAPSHOT_VERSION = 2;
+/** Versions normalizeSnapshot accepts. */
+export const SNAPSHOT_VERSIONS = Object.freeze([1, 2]);
+
+let rawToken = 0;
 
 /** Meshes with more vertices than this (the global room mesh) get a world-axis box instead of a hull. */
 const HULL_MAX_VERTICES = 6000;
@@ -37,20 +60,35 @@ const r4 = (v) => Math.round(v * 1e4) / 1e4 + 0;
 const r6 = (v) => Math.round(v * 1e6) / 1e6 + 0;
 
 /**
+ * @typedef {{ vertices: Float32Array, indices: Uint32Array }} MeshData
+ * @typedef {{ label: string|null, pose: Float64Array, lastChangedTime: number, data: MeshData }} RawMesh
+ * @typedef {{ token: number, global: number, meshes: RawMesh[] }} RawSet
+ */
+
+/**
  * Copy the current Space Setup planes and meshes. Call inside an XR frame
  * callback (an XRFrame is dead after any await). Planes or meshes whose pose is
  * not available this frame are skipped and counted in `opts.stats`.
  *
+ * v2: each XRMesh's vertices and indices are copied too (one memcpy each; the
+ * Quest's 36k-triangle global mesh is about 0.6 MB) into the non-enumerable
+ * `snap.raw`, and `snap.globalMesh` describes the global mesh (label 'global
+ * mesh', else the largest mesh over 5,000 triangles). `opts.raw === false`
+ * skips the copies (v1 behaviour, with version 2).
+ *
  * @param {any} frame XRFrame (or any object with detectedPlanes / detectedMeshes / getPose)
  * @param {any} space XRReferenceSpace the poses are expressed in
- * @param {{ spaceName?: string, stats?: { planes: number, meshes: number, skippedPlanes: number, skippedMeshes: number },
- *   keep?: any[] }} [opts] keep: filled with the XRPlane objects in `planes` order (for the drift watch:
+ * @param {{ spaceName?: string, stats?: { planes: number, meshes: number, skippedPlanes: number, skippedMeshes: number, meshTris?: number, meshBytes?: number },
+ *   keep?: any[], raw?: boolean }} [opts] keep: filled with the XRPlane objects in `planes` order (for the drift watch:
  *   `keep[i]` is the live plane of `snap.planes[i]`; references only, nothing is copied)
  * @returns {import('./Layout.js').SpaceSnapshot}
  */
 export function captureSnapshot(frame, space, opts = {}) {
   /** @type {import('./Layout.js').SpaceSnapshot} */
-  const snap = { version: SNAPSHOT_VERSION, space: opts.spaceName || 'local-floor', planes: [], meshes: [] };
+  const snap = { version: SNAPSHOT_VERSION, space: opts.spaceName || 'local-floor', planes: [], meshes: [], globalMesh: null };
+  /** @type {RawSet} */ const raw = { token: ++rawToken, global: -1, meshes: [] };
+  /** @type {number[]} */ const rawOfMesh = [];
+  let meshTris = 0, meshBytes = 0;
   let skippedPlanes = 0, skippedMeshes = 0;
   const keep = Array.isArray(opts.keep) ? opts.keep : null;
   if (keep) keep.length = 0;
@@ -76,14 +114,119 @@ export function captureSnapshot(frame, space, opts = {}) {
       const pose = mesh && mesh.meshSpace ? frame.getPose(mesh.meshSpace, space) : null;
       const v = mesh && mesh.vertices;
       if (!pose || !v || v.length < 3) { skippedMeshes++; continue; }
-      snap.meshes.push(meshBox(labelOf(mesh.semanticLabel), pose.transform.matrix, v));
+      const label = labelOf(mesh.semanticLabel);
+      snap.meshes.push(meshBox(label, pose.transform.matrix, v));
+      const ix = mesh.indices;
+      if (opts.raw !== false && ix && ix.length >= 3) {
+        const data = { vertices: new Float32Array(v), indices: new Uint32Array(ix) };
+        meshTris += Math.floor(ix.length / 3);
+        meshBytes += data.vertices.byteLength + data.indices.byteLength;
+        rawOfMesh.push(raw.meshes.length);
+        raw.meshes.push({ label, pose: Float64Array.from(pose.transform.matrix), lastChangedTime: Number(mesh.lastChangedTime) || 0, data });
+      } else rawOfMesh.push(-1);
     }
+  }
+  if (raw.meshes.length) {
+    const g = pickGlobal(raw.meshes);
+    raw.global = g;
+    if (g >= 0) {
+      const r = raw.meshes[g];
+      snap.globalMesh = { label: r.label, mesh: rawOfMesh.indexOf(g), vertexCount: Math.floor(r.data.vertices.length / 3),
+        triangleCount: Math.floor(r.data.indices.length / 3), lastChangedTime: r.lastChangedTime };
+    }
+    attachRaw(snap, raw);
   }
   if (opts.stats) {
     opts.stats.planes = snap.planes.length;
     opts.stats.meshes = snap.meshes.length;
     opts.stats.skippedPlanes = skippedPlanes;
     opts.stats.skippedMeshes = skippedMeshes;
+    opts.stats.meshTris = meshTris;
+    opts.stats.meshBytes = meshBytes;
+  }
+  return snap;
+}
+
+/**
+ * The global mesh among raw meshes: label 'global mesh', else the largest
+ * over 5,000 triangles (−1 none). Same rule as MeshPrep.pickGlobalMesh.
+ * @param {RawMesh[]} meshes
+ */
+function pickGlobal(meshes) {
+  let best = -1, bestTris = 5000;
+  for (let i = 0; i < meshes.length; i++) {
+    const m = meshes[i];
+    const l = typeof m.label === 'string' ? m.label.toLowerCase().trim().replace(/[_-]+/g, ' ') : '';
+    const tris = Math.floor(m.data.indices.length / 3);
+    if (l === 'global mesh' && tris > 0) return i;
+    if (tris > bestTris) { bestTris = tris; best = i; }
+  }
+  return best;
+}
+
+/**
+ * Attach the captured triangles to a snapshot (not enumerable: never in
+ * JSON, never structured-cloned).
+ * @param {object} snap @param {RawSet|null} raw
+ */
+export function attachRaw(snap, raw) {
+  Object.defineProperty(snap, 'raw', { value: raw, enumerable: false, writable: true, configurable: true });
+  return snap;
+}
+
+/**
+ * The snapshot's captured triangles, or null.
+ * @param {any} snap
+ * @returns {RawSet|null}
+ */
+export function rawOf(snap) {
+  const r = snap && snap.raw;
+  return r && Array.isArray(r.meshes) ? r : null;
+}
+
+/**
+ * The global mesh to build from (pose + arrays), or null when the snapshot has
+ * none or its arrays are lent to the worker right now.
+ * @param {any} snap
+ * @returns {RawMesh|null}
+ */
+export function globalRawMesh(snap) {
+  const r = rawOf(snap);
+  if (!r || r.global < 0 || r.global >= r.meshes.length) return null;
+  const m = r.meshes[r.global];
+  const d = m && m.data;
+  if (!d || !d.vertices || !d.indices || d.vertices.length < 9 || d.indices.length < 3) return null;
+  return m;
+}
+
+/**
+ * The snapshot for Copy: the same JSON without the encoded mesh blob
+ * (`globalMesh.data`; the counts and the hash stay). Allocates.
+ * @param {any} snap
+ */
+export function snapshotForCopy(snap) {
+  if (!snap || typeof snap !== 'object' || !snap.globalMesh) return snap;
+  const { data, ...meta } = snap.globalMesh;
+  return { ...snap, globalMesh: { ...meta, dataOmitted: typeof data === 'string' } };
+}
+
+/**
+ * Decode `globalMesh.data` (a session record or the fixture) into `snap.raw`
+ * when the snapshot has no captured triangles (async: gzip). Returns the
+ * snapshot; a bad blob is noted in `globalMesh.error` and left undecoded.
+ * @param {any} snap
+ */
+export async function hydrateSnapshot(snap) {
+  if (!snap || rawOf(snap) || !snap.globalMesh || typeof snap.globalMesh.data !== 'string') return snap;
+  try {
+    const d = await decodeMeshRecord(snap.globalMesh);
+    const pose = new Float64Array(16);
+    pose[0] = pose[5] = pose[10] = pose[15] = 1;
+    attachRaw(snap, { token: ++rawToken, global: 0,
+      meshes: [{ label: snap.globalMesh.label || 'global mesh', pose, lastChangedTime: Number(snap.globalMesh.lastChangedTime) || 0,
+        data: { vertices: d.vertices, indices: d.indices } }] });
+  } catch (e) {
+    snap.globalMesh.error = (e instanceof Error ? e.message || e.name : String(e)) || 'mesh decode failed';
   }
   return snap;
 }
@@ -151,7 +294,7 @@ export function meshBox(label, m, v) {
 export async function loadFixture(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`loadFixture ${url}: HTTP ${res.status}`);
-  return normalizeSnapshot(await res.json());
+  return hydrateSnapshot(normalizeSnapshot(await res.json()));
 }
 
 /** @param {unknown} a @param {number} n */
@@ -169,9 +312,9 @@ function finiteArray(a, n) {
  */
 export function normalizeSnapshot(obj) {
   if (!obj || typeof obj !== 'object') throw new Error('snapshot: not an object');
-  if (obj.version !== SNAPSHOT_VERSION) throw new Error(`snapshot: unsupported version ${obj.version}`);
+  if (!SNAPSHOT_VERSIONS.includes(obj.version)) throw new Error(`snapshot: unsupported version ${obj.version}`);
   /** @type {import('./Layout.js').SpaceSnapshot} */
-  const out = { version: SNAPSHOT_VERSION, space: typeof obj.space === 'string' ? obj.space : 'local-floor', planes: [], meshes: [] };
+  const out = { version: SNAPSHOT_VERSION, space: typeof obj.space === 'string' ? obj.space : 'local-floor', planes: [], meshes: [], globalMesh: null };
   for (const p of Array.isArray(obj.planes) ? obj.planes : []) {
     if (!p || !finiteArray(p.pose, 16) || !Array.isArray(p.polygon) || p.polygon.length < 3) continue;
     if (!p.polygon.every((/** @type {unknown} */ q) => finiteArray(q, 2))) continue;
@@ -195,6 +338,27 @@ export function normalizeSnapshot(obj) {
       vertexCount: Number.isFinite(m.vertexCount) ? m.vertexCount : 0,
     });
   }
+  const g = obj.globalMesh;
+  if (g && typeof g === 'object') {
+    /** @type {any} */ const gm = {
+      label: labelOf(g.label) || 'global mesh', mesh: Number.isInteger(g.mesh) ? g.mesh : -1,
+      vertexCount: Number.isFinite(g.vertexCount) ? g.vertexCount : 0, triangleCount: Number.isFinite(g.triangleCount) ? g.triangleCount : 0,
+      lastChangedTime: Number.isFinite(g.lastChangedTime) ? g.lastChangedTime : 0,
+    };
+    if (typeof g.data === 'string' && typeof g.encoding === 'string') {
+      gm.space = typeof g.space === 'string' ? g.space : 'reference';
+      gm.encoding = g.encoding;
+      gm.compression = g.compression === 'gzip' ? 'gzip' : 'none';
+      gm.quantum = Number(g.quantum) || 0;
+      gm.origin = finiteArray(g.origin, 3) ? g.origin.slice() : [0, 0, 0];
+      gm.hash = typeof g.hash === 'string' ? g.hash : '';
+      gm.bytes = Number(g.bytes) || 0;
+      gm.data = g.data;
+    }
+    out.globalMesh = gm;
+  }
+  const raw = rawOf(obj);
+  if (raw) attachRaw(out, raw); // a live capture keeps its triangles through normalisation
   return out;
 }
 

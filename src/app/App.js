@@ -43,13 +43,16 @@ const GESTURE_EVENTS = ['selectstart', 'select', 'squeeze'];
 export class App {
   /**
    * @param {{ gfx: NonNullable<ReturnType<typeof import('../core/Renderer.js').createRenderer>>,
-   *   diag: import('../debug/Diagnostics.js').Diagnostics, page: import('../ui/HomePage.js').HomePage, dev?: boolean }} o
+   *   diag: import('../debug/Diagnostics.js').Diagnostics, page: import('../ui/HomePage.js').HomePage, dev?: boolean,
+   *   upload?: import('../debug/Upload.js').Uploader|null }} o
+   *   upload: the automatic diagnostics upload (v0.4): every saved session record is sent after it is saved
    */
-  constructor({ gfx, diag, page, dev = false }) {
+  constructor({ gfx, diag, page, dev = false, upload = null }) {
     this.gfx = gfx;
     this.diag = diag;
     this.page = page;
     this.dev = dev;
+    this.upload = upload;
     this.game = new Game();
     this.input = new Input();
     this.draw = new DebugDraw(gfx.scene);
@@ -298,6 +301,7 @@ export class App {
     rec.errors.push(why);
     rec.endedAt = new Date().toISOString();
     this.diag.addSession(rec);
+    this.sendUpload(rec);
     this.session = null;
     this.rec = null;
     this.perf = null;
@@ -319,6 +323,7 @@ export class App {
     rec.errors.push(`requestSession: ${errText(e)}`);
     rec.endedAt = rec.startedAt;
     this.diag.addSession(rec);
+    this.sendUpload(rec);
     this.game.send('failed');
     // The gesture is spent: a retry needs a fresh tap, with fewer features.
     this.page.failed(mode, e, MODES[mode].sessionMode === 'immersive-ar' && mode !== 'reduced');
@@ -345,7 +350,7 @@ export class App {
       this.perf.cancelRun('session ended');
     }
     if (wasPlay && kit) kit.end(); // writes rec.play before the record is saved
-    if (rec && this.perf) this.diag.addSession(rec);
+    if (rec && this.perf) { this.diag.addSession(rec); this.sendUpload(rec); }
     this.liveDepth.detach();
     this.draw.hideAll();
     this.panel.mesh.visible = false;
@@ -358,6 +363,20 @@ export class App {
     this.loop = null;
     this.game.send('ended');
     this.page.ended(rec);
+  }
+
+  /**
+   * The automatic diagnostics upload of a record just saved: after this task (the session has ended; never
+   * from the frame loop). The payload is the compact last session with the encoded global mesh.
+   * @param {any} rec
+   */
+  sendUpload(rec) {
+    const up = this.upload;
+    if (!up || !up.enabled || !rec) return;
+    setTimeout(() => {
+      /** @type {any} */ (this.diag.data).upload = up.report();
+      up.send('session', String(rec.mode || ''), this.diag.lastPayload()).catch(() => { /* never throws */ });
+    }, 0);
   }
 
   /** @param {string} st */

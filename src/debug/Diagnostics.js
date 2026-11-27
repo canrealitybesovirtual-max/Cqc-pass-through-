@@ -2,9 +2,12 @@
 /**
  * Everything the headset measured, kept across reloads in localStorage and
  * exported as JSON: Copy takes only the last session (small enough to paste
- * into a chat), Download and Share take everything. Writes happen only at
- * session end or when the page is hidden, never from the frame loop.
+ * into a chat; without the encoded global mesh), Download and Share take
+ * everything, and the automatic upload (src/debug/Upload.js, v0.4) takes the
+ * last session with the mesh (`lastPayload`). Writes happen only at session
+ * end or when the page is hidden, never from the frame loop.
  */
+import { snapshotForCopy } from '../world/Snapshot.js';
 
 const KEY = 'cqcpt.diag.v1';
 const MAX_SESSIONS = 12;
@@ -57,10 +60,26 @@ export class Diagnostics {
    * Compact (no indentation) so it stays small.
    */
   lastJson() {
+    const p = this.lastPayload();
+    // the encoded global mesh (40–90 KB of base64 for a real scan) stays out of the chat paste; the upload and Download keep it
+    const sessions = p.sessions.map((/** @type {any} */ s) => (s && s.spaceSnapshot ? { ...s, spaceSnapshot: snapshotForCopy(s.spaceSnapshot) } : s));
+    return JSON.stringify({ ...p, sessions, copied: 'last session only, without the encoded mesh (Download or Share has every kept session)' });
+  }
+
+  /**
+   * The last session (with the encoded global mesh) plus everything that is not a session: the automatic upload's payload.
+   * Allocates (session end, Copy).
+   */
+  lastPayload() {
     const { sessions, ...rest } = this.data;
     const last = sessions.length ? [sessions[sessions.length - 1]] : [];
-    return JSON.stringify({ ...rest, sessions: last, sessionsKept: sessions.length,
-      copied: 'last session only (Download or Share has every kept session)', exportedAt: new Date().toISOString() });
+    return { ...rest, sessions: last, sessionsKept: sessions.length, exportedAt: new Date().toISOString() };
+  }
+
+  /** The last session's mode ('' before any). */
+  lastMode() {
+    const s = this.data.sessions;
+    return s.length && s[s.length - 1] ? String(s[s.length - 1].mode || '') : '';
   }
 
   /** Sizes of both exports, for the page: { copy: '42 KB', all: '310 KB', sessions: 6 }. Allocates (page only). */

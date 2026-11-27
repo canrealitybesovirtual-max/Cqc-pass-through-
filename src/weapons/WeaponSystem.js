@@ -8,8 +8,15 @@ import { WeaponFX, Rng } from './WeaponFX.js';
 import { BodyEstimator } from '../player/BodyEstimator.js';
 import {
   Carry, GrabSense, SLOTS, arcPoint, pointDist, segmentDist,
-  CARRY_SLOT, CARRY_DRAW, CARRY_HAND, CARRY_HOLSTER, CARRY_DROP, CARRY_SHRINK, CARRY_GROW, EV_STOWED,
+  CARRY_SLOT, CARRY_DRAW, CARRY_HAND, CARRY_HOLSTER, CARRY_DROP, CARRY_SHRINK, CARRY_GROW, CARRY_FREE, EV_STOWED,
 } from '../player/Slots.js';
+import { PoseHistory } from '../physics/PoseHistory.js';
+import { PhysicsWorld, ReleaseInfo, ST_LOST, ST_FREE as PST_FREE } from '../physics/PhysicsWorld.js';
+import { loadRapier } from '../physics/Rapier.js';
+import { ITEMS, releaseKind, REL_HOLSTER, landingClass, landingGain, LAND_NONE } from '../physics/ItemRules.js';
+import { itemKinds, K_GLOCK, K_GLOCK_NOMAG, K_AKM, K_AKM_NOMAG, K_MAG9, K_MAG762 } from '../physics/ItemShapes.js';
+import { staticFromWorld, SURF } from '../physics/StaticGeometry.js';
+import { LooseMags, LOOSE } from './LooseItems.js';
 import { HANDLING, MagWell, MAG_FREE, MAG_GUIDED, TriggerGate, HapticGate, rackFraction, boreAtThighs } from '../player/Handling.js';
 import { computeFit, parseFits, serializeFits, clampAdj, zeroAdj, FIT_KEY } from './GunFit.js';
 import { makeHolsterShell } from './Holster.js';
@@ -42,6 +49,20 @@ import { makeHolsterShell } from './Holster.js';
  * - Guns are held in GRIP space (GunFit; the player's nudges via setFit).
  *   A held gun whose bore would pass through a world shape (grip → muzzle
  *   ray) slides back along the bore, with a haptic tick.
+ * - Real-surface physics (v0.4, `attachPhysics`): let go anywhere and the gun
+ *   falls, lands and stays where a real one would (the bed, the couch, a
+ *   table, the floor); a nearly still hand sets it down with no velocity, a
+ *   moving one drops or throws it (PoseHistory: recency-weighted, ω × r).
+ *   Let go near the holster / over the shoulder holsters or slings it; the
+ *   holster only when no real surface is within 3 cm below (laid on the bed
+ *   beside the hip) and the muzzle is within 60° of its axis. The right grip
+ *   within 0.13 m of a lying gun's grip (or 0.05 m of its box) picks it up
+ *   (the same 0.15 s draw blend from where it lies). Magazines (dropped with A
+ *   / X or let go from the left hand) are physics items carrying their
+ *   rounds; the left grip within 0.10 m picks one up; a magazine let go at the
+ *   pouch goes back into it. Only the lost-object net (10 s outside the
+ *   house) returns an item. With physics off, failed, or not built yet, the
+ *   v0.3 rules stay (timed return to the slot, ballistic magazines).
  *
  * Integration:
  *   const weapons = new WeaponSystem(ctx, { fpScene });   // at load, after assets; adds its own objects
@@ -52,6 +73,10 @@ import { makeHolsterShell } from './Holster.js';
  *   (allocation-free); fitsJSON() to save (outside the frame loop); fitReport() for the record.
  *   Game / watch: busyLeft, busyRight, onGunLeft (face buttons belong to the gun then); body.seated;
  *   triggerBlocked (the watch has the trigger: no shot); fitHold(id | null) for the watch's GUN FIT page.
+ *   Physics (v0.4): weapons.attachPhysics(physics) at load, before physics.warmUp() (it defines the item
+ *   kinds from the GLB vertices); the static colliders follow the world's builds by themselves (a new
+ *   world.layout → beginStatic, then buildSlice within SYSTEM.physSliceMs a frame); the step runs inside
+ *   update(). weapons.realignItems(m) next to world.realign(m); weapons.physicsReport() at session end.
  * It listens to `pause` (no firing while paused; the guns still follow the
  * hands) and emits `shot` and `enemyHit` (reused payloads). Pass
  * `{ enemies }` to also call enemies.applyHit for each enemy hit.
@@ -97,10 +122,12 @@ export const SYSTEM = Object.freeze({
   assistShow: 0.15,         // s: the assisted reload's magazine slides in over the last of it
   assistDepth: 0.08,        // m
   dropRest: 0.04,           // m a dropped gun's root rests above the floor while it waits to return
+  physSliceMs: 4,           // ms a frame for the static collider build (behind the panel or a pause)
+  magTumble: 1.5,           // rad/s a magazine dropped from the well tumbles (design)
 });
 
 const LEFT = 0, RIGHT = 1;
-const L_NONE = 0, L_RACK = 1, L_SUPPORT = 2, L_MAG = 3, L_STRIP = 4;
+const L_NONE = 0, L_RACK = 1, L_SUPPORT = 2, L_MAG = 3, L_STRIP = 4, L_PICK = 5;
 /** GrabSense bit of the left hand's rack zone (hover tick). */
 const RACK_BIT = 4;
 
@@ -197,6 +224,12 @@ class Weapon {
     /** m the held gun is slid back from a wall, and whether it is touching (tick once). */
     this.wallPush = 0;
     this.wallTouch = false;
+    /** Physics item id while it lies in the world (CARRY_FREE), else -1. */
+    this.physId = -1;
+    /** Recent poses in the hand (the throw estimate and the penetration-safe placement). */
+    this.hist = new PoseHistory();
+    /** Time of its last landing sound (s). */
+    this.lastSoundT = -1;
   }
 }
 
@@ -204,7 +237,8 @@ export class WeaponSystem {
   /**
    * @param {{ scene: THREE.Object3D, assets: { models: any }, audio?: any, events?: any,
    *   gfx?: { flashLights?: THREE.PointLight[] }, world?: any }} ctx
-   * @param {{ fpScene?: THREE.Object3D | null, enemies?: { applyHit?: (enemy: number, part: string, damage: number, dx: number, dy: number, dz: number) => void } | null, seed?: number }} [opts]
+   * @param {{ fpScene?: THREE.Object3D | null, enemies?: { applyHit?: (enemy: number, part: string, damage: number, dx: number, dy: number, dz: number) => void } | null, seed?: number,
+   *   physics?: import('../physics/PhysicsWorld.js').PhysicsWorld | null }} [opts] physics: attach at once (else attachPhysics / initPhysics)
    */
   constructor(ctx, opts = {}) {
     /** Left glove on the AKM handguard: off until it is re-posed to wrap the handguard (v0.3). */
@@ -292,7 +326,310 @@ export class WeaponSystem {
     /** The fit mode drew it (it goes back to its slot when the mode ends). */
     this._fitDrew = false;
 
+    // ── real-surface physics (v0.4; null = the v0.3 rules)
+    /** @type {import('../physics/PhysicsWorld.js').PhysicsWorld|null} */
+    this.phys = null;
+    /**
+     * The physics step runs in its own `physics` system (PlayKit, v0.4: after `weapons`, before
+     * `enemies`, timed by the PerfMonitor) through physicsUpdate(); false: inside update() as before.
+     */
+    this.physExternal = false;
+    /** @type {any} the world layout the static colliders were built from */
+    this._physLayout = null;
+    /** The physics failed this session (items were returned to their slots once). */
+    this._physDown = false;
+    /** @type {Record<string, LooseMags>|null} loose magazines per weapon */
+    this.looseMags = null;
+    /** @type {LooseMags[]} */
+    this._loose = [];
+    this._p7 = new Float64Array(7);
+    this._rel = new ReleaseInfo();
+    /** Recent poses of the magazine in the left hand. */
+    this._magHist = new PoseHistory();
+    this.physStats = { released: 0, setDown: 0, thrown: 0, holstered: 0, pickedUp: 0, lostReturns: 0, magsDropped: 0, magsPicked: 0, magsPouched: 0, fallbacks: 0 };
+
     if (ctx.events && ctx.events.on) ctx.events.on('pause', (/** @type {any} */ p) => { this.paused = !!(p && p.paused); });
+    if (opts.physics) this.attachPhysics(opts.physics);
+  }
+
+  // ======================================================================= physics (v0.4)
+
+  /**
+   * The whole physics load step (Preload, before Enter and before the GPU warm-up): import and
+   * init Rapier, a PhysicsWorld with the item kinds (attachPhysics), and its contact warm-up. With
+   * `off` (`?physics=off`, the device A/B switch) or on any failure the v0.3 rules stay.
+   * @param {{ off?: boolean }} [o]
+   * @returns {Promise<{ ok: boolean, off?: boolean, load?: any, warm?: any, error?: string }>} for the record
+   */
+  async initPhysics(o = {}) {
+    if (o.off) { this.attachPhysics(null); return { ok: false, off: true }; }
+    try {
+      const { R, info } = await loadRapier();
+      const P = new PhysicsWorld(R);
+      P.load = info;
+      if (!this.attachPhysics(P)) { this.attachPhysics(null); return { ok: false, load: info, error: P.guard.error || 'item kinds refused' }; }
+      const warm = P.warmUp();
+      if (!warm.ok || P.failed) { this.attachPhysics(null); return { ok: false, load: info, warm, error: P.guard.error || 'warm-up failed' }; }
+      return { ok: true, load: info, warm };
+    } catch (e) {
+      this.attachPhysics(null);
+      return { ok: false, error: String(e && /** @type {any} */ (e).message || e).slice(0, 200) };
+    }
+  }
+
+  /**
+   * Use real-surface physics for dropped guns and magazines. At load, before `physics.warmUp()`:
+   * defines the item kinds (hulls from the gun and magazine GLB vertices) and the loose-magazine pools.
+   * @param {import('../physics/PhysicsWorld.js').PhysicsWorld|null} physics
+   * @returns {boolean} attached
+   */
+  attachPhysics(physics) {
+    this.phys = physics || null;
+    this.looseMags = null;
+    this._loose = [];
+    if (!physics) return false;
+    /** @type {any} */ const src = {};
+    for (const w of this.weapons) {
+      const v = w.view;
+      src[w.id] = { gun: positionsOf(v.gun), mag: positionsOf(v.mag), magSeat: [v.magSeat.x, v.magSeat.y, v.magSeat.z], grip: [v.gripCentre.x, v.gripCentre.y, v.gripCentre.z] };
+    }
+    let ok = true;
+    for (const { kind, def } of itemKinds(src)) if (!physics.defineKind(kind, def)) ok = false;
+    const n = Math.min(LOOSE.perWeapon, this.fx.loose.glock.instanceMatrix.count);
+    this.looseMags = {
+      glock: new LooseMags(this.fx.loose.glock, n, K_MAG9),
+      akm: new LooseMags(this.fx.loose.akm, n, K_MAG762),
+    };
+    this._loose = [this.looseMags.glock, this.looseMags.akm];
+    if (!ok) this.phys = null;
+    return ok;
+  }
+
+  /** Physics is attached, working and its static colliders are built. */
+  get physOn() { return !!this.phys && !this.phys.failed && this.phys.ready; }
+
+  /** @param {Weapon} w the gun's physics kind (with or without its magazine) */
+  _gunKind(w) { return w.id === 'glock' ? (w.inst.magSeated ? K_GLOCK : K_GLOCK_NOMAG) : (w.inst.magSeated ? K_AKM : K_AKM_NOMAG); }
+
+  /**
+   * Per frame: the static colliders follow the world's builds, the step, and the items lying in
+   * the world (lost-object net, landing sounds). Allocation-free when everything rests.
+   * @param {number} dt @param {any} ctx
+   */
+  _physFrame(dt, ctx) {
+    const P = this.phys;
+    if (!P) return;
+    if (P.failed) { if (!this._physDown) this._physFailed(); return; }
+    // a new world build (its static geometry, or its layout) → new static colliders
+    const W = ctx.world;
+    const g = W && typeof W.staticGeometry === 'function' ? W.staticGeometry() : null;
+    const key = g || (W && W.built !== false ? W.layout : null);
+    if (key && key !== this._physLayout) {
+      this._physLayout = key;
+      P.beginStatic(staticFromWorld(W));   // allocates: only when the world was rebuilt (behind the panel / a pause)
+    }
+    if (!P.ready && P.geo) P.buildSlice(SYSTEM.physSliceMs);
+    P.step(dt);
+    if (P.failed) { this._physFailed(); return; }
+    for (let i = 0; i < this.weapons.length; i++) {
+      const w = this.weapons[i];
+      if (w.carry.state !== CARRY_FREE || w.physId < 0) continue;
+      const s = P.state(w.physId);
+      if (s === ST_LOST || s === PST_FREE) { this._returnLost(w); continue; }
+      const dv = P.landing(w.physId);
+      if (landingClass(dv) !== LAND_NONE && this.now - w.lastSoundT >= ITEMS.soundGapS) {
+        w.lastSoundT = this.now;
+        const g = landingGain(dv);
+        // no gun-drop recording exists: the magazine clatter pitched down stands in; soft: the cloth thud
+        if (P.landSurf(w.physId) === SURF.SOFT) this._sound('cloth', w.view.root.position, 0.55 * g, 0.85);
+        else this._sound('magDrop', w.view.root.position, g, w.id === 'akm' ? 0.7 : 0.82);
+      }
+    }
+    const audio = this.ctx && this.ctx.audio ? this.ctx.audio : null;
+    for (let i = 0; i < this._loose.length; i++) this._loose[i].sync(P, this.now, audio);
+  }
+
+  /**
+   * The `physics` system (v0.4; with `physExternal`): the static colliders, the fixed step and the
+   * lying items, then the lying guns' display poses from this step (no frame of lag). Allocation-free
+   * when everything rests.
+   * @param {number} dt @param {any} ctx
+   */
+  physicsUpdate(dt, ctx) {
+    if (!this.physExternal) return;
+    if (!(dt >= 0)) dt = 0;
+    this._physFrame(dt, ctx);
+    const P = this.phys;
+    if (!P || P.failed) return;
+    const p7 = this._p7;
+    for (let i = 0; i < this.weapons.length; i++) {
+      const w = this.weapons[i];
+      if (w.carry.state !== CARRY_FREE || w.physId < 0 || !P.readPose(w.physId, p7, 0)) continue;
+      w.relP.set(p7[0], p7[1], p7[2]);
+      w.relQ.set(p7[3], p7[4], p7[5], p7[6]);
+      w.bp.copy(w.relP);
+      w.bq.copy(w.relQ);
+      this._display(w);
+    }
+  }
+
+  /** The physics failed: lying guns go back to their slots (shrink, grow), loose magazines vanish. */
+  _physFailed() {
+    this._physDown = true;
+    for (const w of this.weapons) {
+      if (w.carry.state === CARRY_FREE) { w.physId = -1; w.carry.returnLost(); this.physStats.fallbacks++; }
+    }
+    for (const lm of this._loose) lm.clear(null);
+  }
+
+  /**
+   * The lost-object net returned a gun: it shrinks where it lay and grows back in its slot.
+   * @param {Weapon} w
+   */
+  _returnLost(w) {
+    if (this.phys && w.physId >= 0) this.phys.remove(w.physId);
+    w.physId = -1;
+    w.carry.returnLost();
+    this.physStats.lostReturns++;
+  }
+
+  /**
+   * Remove a gun from the world (if it lies there) and put it in its slot now.
+   * @param {Weapon} w
+   */
+  _stow(w) {
+    if (w.physId >= 0 && this.phys) this.phys.remove(w.physId);
+    w.physId = -1;
+    w.carry.stow();
+  }
+
+  /**
+   * Right grip to a lying gun (in units of reach, ≤ 1 = in reach): its grip centre within
+   * 0.13 m, or its box within 0.05 m.
+   * @param {Weapon} w @param {THREE.Vector3} p
+   */
+  _worldGrabDist(w, p) {
+    const P = this.phys;
+    const K = P ? P.kinds[this._gunKind(w)] : null;
+    if (!K) return Infinity;
+    const v = w.view;
+    v.toLocal(p, w.relP, w.relQ, _v3);
+    const dGrip = _v3.distanceTo(v.gripCentre);
+    const c = K.centre, h = K.half;
+    const ex = Math.max(0, Math.abs(_v3.x - c[0]) - h[0]), ey = Math.max(0, Math.abs(_v3.y - c[1]) - h[1]), ez = Math.max(0, Math.abs(_v3.z - c[2]) - h[2]);
+    const a = dGrip / ITEMS.pickReach, b = Math.sqrt(ex * ex + ey * ey + ez * ez) / ITEMS.pickHull;
+    return a < b ? a : b;
+  }
+
+  /**
+   * Pick a lying gun up: the draw blends from where it lies into the fitted grip.
+   * @param {Weapon} w
+   */
+  _pickUp(w) {
+    if (!w.carry.grabFromWorld()) return;
+    if (this.phys && w.physId >= 0) this.phys.remove(w.physId);
+    w.physId = -1;
+    this.held = w;
+    this.lastHeld = w;
+    this.R.sense.consume();
+    this.R.sense.inside = 0;
+    w.gate.arm();
+    w.recoil.reset();
+    w.hist.reset();
+    this.stats.draws++;
+    this.physStats.pickedUp++;
+    this._pulse(RIGHT, SLOTS.draw);
+  }
+
+  /**
+   * The physics release of a gun (not holstered): returns true when it is now a physics item.
+   * @param {Weapon} w
+   */
+  _releaseToWorld(w) {
+    const P = this.phys;
+    if (!P) return false;
+    const root = w.view.root, p7 = this._p7;
+    p7[0] = root.position.x; p7[1] = root.position.y; p7[2] = root.position.z;
+    p7[3] = root.quaternion.x; p7[4] = root.quaternion.y; p7[5] = root.quaternion.z; p7[6] = root.quaternion.w;
+    const id = P.release(this._gunKind(w), p7, w.hist, this._rel, -1);
+    if (id < 0) return false;
+    w.physId = id;
+    w.lastSoundT = this.now;   // no landing sound from the release itself
+    P.pose(id, p7, 0);
+    w.relP.set(p7[0], p7[1], p7[2]);
+    w.relQ.set(p7[3], p7[4], p7[5], p7[6]);
+    this.physStats.released++;
+    if (this._rel.setDown) this.physStats.setDown++; else this.physStats.thrown++;
+    return true;
+  }
+
+  /**
+   * A magazine becomes a loose physics item (from the well or the left hand).
+   * @param {Weapon} w whose magazine @param {THREE.Vector3} pos its origin (top) @param {THREE.Quaternion} q
+   * @param {number} rounds
+   * @param {PoseHistory|null} hist hand history (null: spawned with `vel` and a tumble)
+   * @param {THREE.Vector3|null} vel
+   * @returns {boolean}
+   */
+  _looseMag(w, pos, q, rounds, hist, vel) {
+    const P = this.phys, lm = this.looseMags ? this.looseMags[w.id] : null;
+    if (!P || !lm) return false;
+    const pl = this.ctx && this.ctx.player, head = pl ? pl.head || pl.eye || null : null, fwd = pl && pl.forward ? pl.forward : null;
+    const slot = lm.room(P, head, fwd, this.ctx ? this.ctx.world : null);
+    const p7 = this._p7, kind = w.id === 'glock' ? K_MAG9 : K_MAG762;
+    p7[0] = pos.x; p7[1] = pos.y; p7[2] = pos.z; p7[3] = q.x; p7[4] = q.y; p7[5] = q.z; p7[6] = q.w;
+    let id = -1;
+    if (hist) id = P.release(kind, p7, hist, this._rel, rounds);
+    else {
+      P.placeAt(kind, p7);
+      const r = this.rng.fill(4), sp = SYSTEM.magTumble * (0.5 + r[3]);
+      _v3.set(r[0] - 0.5, r[1] - 0.5, r[2] - 0.5);
+      if (_v3.lengthSq() < 1e-6) _v3.set(1, 0, 0);
+      _v3.normalize().multiplyScalar(sp);
+      id = P.spawn(kind, p7, vel ? vel.x : 0, vel ? vel.y : 0, vel ? vel.z : 0, _v3.x, _v3.y, _v3.z, rounds);
+    }
+    if (id < 0) return false;
+    lm.add(P, slot, id, rounds);
+    this.physStats.magsDropped++;
+    return true;
+  }
+
+  /**
+   * The left hand takes a loose magazine (with its rounds); it blends from where it lay into the hand.
+   * @param {LooseMags} lm @param {number} slot
+   */
+  _pickMag(lm, slot) {
+    const P = this.phys;
+    if (!P) return;
+    const w = lm === (this.looseMags && this.looseMags.akm) ? this.akm : this.glock;
+    const p7 = this._p7, rounds = lm.take(P, slot, p7);
+    if (rounds < 0) return;
+    this.lRole = L_MAG;
+    this.handMag = w;
+    this.handMagRounds = rounds;
+    w.well.reset();
+    w.view.handMag.visible = true;
+    this._stripP.set(p7[0], p7[1], p7[2]);
+    this._stripQ.set(p7[3], p7[4], p7[5], p7[6]);
+    this._stripT = SYSTEM.stripBlendS;
+    this._magHist.reset();
+    this.physStats.magsPicked++;
+    this._pulse(LEFT, HAPTIC.pouch);
+  }
+
+  /**
+   * A reference-space realign moved the world (old → new, column-major): move the lying items with it
+   * (call next to world.realign(m); the static colliders rebuild by themselves after it).
+   * @param {ArrayLike<number>} m
+   */
+  realignItems(m) {
+    if (this.phys) this.phys.transformAll(m);
+  }
+
+  /** `rec.physics` (allocates; session end): the PhysicsWorld record plus the release counts. */
+  physicsReport() {
+    if (!this.phys) return { attached: false };
+    return { attached: true, ...this.phys.report(), weapons: { ...this.physStats }, looseMags: this._loose.map((lm) => ({ live: lm.count, recycled: lm.recycled, lost: lm.lost })) };
   }
 
   // ======================================================================= frame
@@ -321,6 +658,7 @@ export class WeaponSystem {
       const w = this.weapons[i];
       if (w.carry.update(dt) === EV_STOWED) this._sound(w.id === 'glock' ? 'holsterIn' : 'cloth', w.slotP, 0.8);
     }
+    if (!this.physExternal) this._physFrame(dt, ctx);
     this._right(dt, I);
     for (let i = 0; i < this.weapons.length; i++) this._base(this.weapons[i], dt);
     this._left(dt, I);
@@ -330,6 +668,7 @@ export class WeaponSystem {
     }
     if (held && held.carry.inHand) this._wallStep(held, dt);
     else if (held) held.wallPush = 0;
+    if (held && held.carry.inHand) held.hist.pushPQ(this.now, held.bp.x, held.bp.y, held.bp.z, held.bq.x, held.bq.y, held.bq.z, held.bq.w);
     // the bore at the trigger break = base + the recoil so far
     for (let i = 0; i < this.weapons.length; i++) this._display(this.weapons[i]);
     if (held && held.carry.inHand) this._operate(held, dt, I);
@@ -412,17 +751,19 @@ export class WeaponSystem {
     R.sense.update(dt, !!(s && s.squeezeDown), !!(s && s.squeezeHeld));
     const w = this.held;
     if (!w) {
-      if (!R.ok || !this.body.valid) { R.sense.inside = 0; return; }
+      if (!R.ok) { R.sense.inside = 0; return; }
       /** @type {Weapon|null} */
-      let best = null, bestD = Infinity, entered = false;
+      let best = null, bestD = Infinity, entered = false, fromWorld = false;
       for (let i = 0; i < this.weapons.length; i++) {
         const x = this.weapons[i];
-        const d = x.carry.grabbable ? this._grabDist(x, R.pos) : Infinity;
+        let d = Infinity, inWorld = false;
+        if (x.carry.grabbable && this.body.valid) d = this._grabDist(x, R.pos);
+        else if (x.carry.inWorld && x.physId >= 0 && this.phys) { d = this._worldGrabDist(x, R.pos); inWorld = true; }
         const near = d <= 1;
         if (R.sense.enter(x.bit, near)) entered = true;
-        if (near && d < bestD) { best = x; bestD = d; }
+        if (near && d < bestD) { best = x; bestD = d; fromWorld = inWorld; }
       }
-      if (best && R.sense.wantsGrab) this._draw(best);   // the draw's own pulse, not the entry tick
+      if (best && R.sense.wantsGrab) { if (fromWorld) this._pickUp(best); else this._draw(best); }   // the draw's own pulse, not the entry tick
       else if (entered) this._pulse(RIGHT, SLOTS.tick);
       return;
     }
@@ -451,10 +792,34 @@ export class WeaponSystem {
   _letGo(w, lost) {
     const v = w.view;
     v.toWorld(v.gripCentre, _v);
-    const near = !lost && _v.distanceTo(w.slotP) <= SLOTS.slotReach;
-    if (lost) w.carry.lost(); else w.carry.release(near);
-    w.relP.copy(v.root.position);
-    w.relQ.copy(v.root.quaternion);
+    const dist = _v.distanceTo(w.slotP);
+    let near = !lost && dist <= SLOTS.slotReach;
+    let free = false;
+    const P = this.physOn ? this.phys : null;
+    if (!lost && P) {
+      if (near) {
+        // the holster rule (research §7): muzzle within 60° of the holster's axis, and no real surface
+        // within 3 cm below (a gun laid on the bed beside the hip or thigh is set down, not holstered).
+        // The sling over the shoulder takes the rifle whatever its angle and whatever is below (a couch
+        // backrest behind a seated player is not a place to lay it).
+        let dot = 1, gap = Infinity;
+        if (w.id === 'glock') {
+          _v2.copy(_ZN).applyQuaternion(v.root.quaternion); _v3.copy(_ZN).applyQuaternion(w.slotQ); dot = _v2.dot(_v3);
+          const p7 = this._p7, r = v.root;
+          p7[0] = r.position.x; p7[1] = r.position.y; p7[2] = r.position.z;
+          p7[3] = r.quaternion.x; p7[4] = r.quaternion.y; p7[5] = r.quaternion.z; p7[6] = r.quaternion.w;
+          gap = P.gapBelow(this._gunKind(w), p7);
+        }
+        near = releaseKind(dist, dot, gap, 0, 0) === REL_HOLSTER;
+        if (near) this.physStats.holstered++;
+      }
+      if (!near) free = this._releaseToWorld(w);
+    }
+    if (lost) w.carry.lost(); else w.carry.release(near, free);
+    if (!free) {
+      w.relP.copy(v.root.position);
+      w.relQ.copy(v.root.quaternion);
+    }
     w.dropV.copy(this.R.vel);
     w.dropFloor = this._floorY(w.relP.x, w.relP.z) + SYSTEM.dropRest;
     this._endLeftOn(w);
@@ -479,8 +844,18 @@ export class WeaponSystem {
     switch (c.state) {
       case CARRY_DRAW: {
         const k = c.blend;
-        w.bp.lerpVectors(w.sp, w.hp, k);
-        w.bq.slerpQuaternions(w.sq, w.hq, k);
+        if (c.fromWorld) { w.bp.lerpVectors(w.relP, w.hp, k); w.bq.slerpQuaternions(w.relQ, w.hq, k); }
+        else { w.bp.lerpVectors(w.sp, w.hp, k); w.bq.slerpQuaternions(w.sq, w.hq, k); }
+        break;
+      }
+      case CARRY_FREE: {
+        const p7 = this._p7;
+        if (this.phys && w.physId >= 0 && this.phys.readPose(w.physId, p7, 0)) {
+          w.relP.set(p7[0], p7[1], p7[2]);
+          w.relQ.set(p7[3], p7[4], p7[5], p7[6]);
+        }
+        w.bp.copy(w.relP);
+        w.bq.copy(w.relQ);
         break;
       }
       case CARRY_HAND:
@@ -603,7 +978,7 @@ export class WeaponSystem {
     }
     this._fitHold = w;
     this._fitDrew = false;
-    if (w.carry.state !== CARRY_SLOT) w.carry.stow();
+    if (w.carry.state !== CARRY_SLOT) this._stow(w);
     this._draw(w);
     this._fitDrew = this.held === w;
   }
@@ -691,6 +1066,18 @@ export class WeaponSystem {
       const dp = pointDist(L.pos.x, L.pos.y, L.pos.z, this.body.pouch.p) / SLOTS.pouchReach;
       if (dp < best) { best = dp; role = L_MAG; }
     }
+    /** @type {LooseMags|null} */
+    let pickLm = null;
+    let pickSlot = -1;
+    if (!this.handMag && this.physOn) {
+      const P = /** @type {import('../physics/PhysicsWorld.js').PhysicsWorld} */ (this.phys);
+      for (let i = 0; i < this._loose.length; i++) {
+        const lm = this._loose[i], sl = lm.nearest(P, L.pos.x, L.pos.y, L.pos.z, ITEMS.magReach);
+        if (sl < 0) continue;
+        const d = lm.lastD / ITEMS.magReach;
+        if (d < best) { best = d; role = L_PICK; pickLm = lm; pickSlot = sl; }
+      }
+    }
     if (role === L_RACK && held) {
       const v = held.view;
       v.toLocal(L.pos, held.bp, held.bq, _v);
@@ -703,6 +1090,8 @@ export class WeaponSystem {
       this._pulse(LEFT, HAPTIC.support);
     } else if (role === L_STRIP && held) {
       this._strip(held);
+    } else if (role === L_PICK && pickLm) {
+      this._pickMag(pickLm, pickSlot);
     } else if (role === L_MAG) {
       const w = held || this.lastHeld;
       this.lRole = L_MAG;
@@ -710,6 +1099,7 @@ export class WeaponSystem {
       this.handMagRounds = w.def.capacity;
       w.well.reset();
       w.view.handMag.visible = true;
+      this._magHist.reset();
       this._pulse(LEFT, HAPTIC.pouch);
       this._sound('cloth', L.pos, 0.6);
     }
@@ -762,8 +1152,13 @@ export class WeaponSystem {
   _endLeft() {
     if (this.lRole === L_RACK && this.lWeapon) this.lWeapon.inst.rackRelease();
     if (this.lRole === L_MAG && this.handMag) {
-      const w = this.handMag, v = w.view;
-      this.fx.dropMag(w.id, v.handMag.position, v.handMag.quaternion, this.L.vel, 3);
+      const w = this.handMag, v = w.view, m = v.handMag;
+      if (this.physOn) {
+        // physics: back into the pouch when let go there, else a loose magazine with its rounds
+        const atPouch = this.body.valid && this.L.ok && pointDist(this.L.pos.x, this.L.pos.y, this.L.pos.z, this.body.pouch.p) <= ITEMS.pouchReach;
+        if (atPouch) { this.physStats.magsPouched++; this._sound('cloth', this.L.pos, 0.4); }
+        else if (!this._looseMag(w, m.position, m.quaternion, this.handMagRounds, this._magHist, null)) this.fx.dropMag(w.id, m.position, m.quaternion, this.L.vel, 3);
+      } else this.fx.dropMag(w.id, m.position, m.quaternion, this.L.vel, 3);
       v.handMag.visible = false;
       w.well.reset();
       this.handMag = null;
@@ -890,6 +1285,7 @@ export class WeaponSystem {
         m.position.lerp(this._stripP, k);
         m.quaternion.slerp(this._stripQ, k);
       }
+      if (this.phys) this._magHist.pushPQ(this.now, m.position.x, m.position.y, m.position.z, m.quaternion.x, m.quaternion.y, m.quaternion.z, m.quaternion.w);
     }
     m.visible = true;
   }
@@ -903,7 +1299,7 @@ export class WeaponSystem {
     I.onDry = () => { this._soundAt(w, S.dry, 1); this._pulse(RIGHT, HAPTIC.dry); };
     I.onReset = () => { this._soundAt(w, S.reset, 0.5); };
     I.onEject = (_i, live) => this._eject(w, live);
-    I.onMagOut = () => this._magOut(w);
+    I.onMagOut = (_i, rounds) => this._magOut(w, rounds);
     I.onMagIn = () => { this._soundAt(w, S.magIn, 1); };
     I.onChamber = (_i, cycled) => { if (cycled && w.inst.mode !== 'auto') this._pulse(RIGHT, HAPTIC.battery); };
     I.onRack = () => { this._soundAt(w, S.rackBack, 1); this._pulse(LEFT, HAPTIC.rack); this._pulse(RIGHT, HAPTIC.rackPrimary); };
@@ -953,6 +1349,8 @@ export class WeaponSystem {
       this.stats.enemyHits++;
       if (this.enemies && this.enemies.applyHit) this.enemies.applyHit(H.enemy, H.part, dmg, _v2.x, _v2.y, _v2.z);
       if (ctx.events && ctx.events.emit) ctx.events.emit('enemyHit', p);
+    } else if (ctx.look && ctx.look.impactsOn) {
+      ctx.look.impact(H, _v2.x, _v2.y, _v2.z, w.id); // v0.4: decal, puff and sound per real material (src/fx/Look.js)
     } else {
       this.fx.decal(H, fit.decal, fit.hole);
       _v3.set(H.x, H.y, H.z);
@@ -972,16 +1370,17 @@ export class WeaponSystem {
   }
 
   /**
-   * The magazine catch let the magazine go: it falls out of the well.
-   * @param {Weapon} w
+   * The magazine catch let the magazine go: it falls out of the well (with physics: a loose
+   * magazine carrying its rounds).
+   * @param {Weapon} w @param {number} [rounds]
    */
-  _magOut(w) {
+  _magOut(w, rounds = 0) {
     const v = w.view;
     if (this._stripping) { v.magOut = 0; this._soundAt(w, w.def.sounds.magOut, 1); return; }   // into the hand, not the floor
     _v3.copy(v.magSeat).addScaledVector(v.magAxis, -v.magOut);
     v.toWorld(_v3, _v);
     v.dirWorld(v.magAxis, _v2).multiplyScalar(-SYSTEM.magPush).add(w.vel);
-    this.fx.dropMag(w.id, _v, v.root.quaternion, _v2, 1.5);
+    if (!(this.physOn && this._looseMag(w, _v, v.root.quaternion, rounds > 0 ? rounds : 0, null, _v2))) this.fx.dropMag(w.id, _v, v.root.quaternion, _v2, 1.5);
     v.magOut = 0;
     this._soundAt(w, w.def.sounds.magOut, 1);
   }
@@ -1003,11 +1402,11 @@ export class WeaponSystem {
   }
 
   /**
-   * @param {string} key @param {THREE.Vector3} p @param {number} gain
+   * @param {string} key @param {THREE.Vector3} p @param {number} gain @param {number} [rate]
    */
-  _sound(key, p, gain) {
+  _sound(key, p, gain, rate = 1) {
     const a = this.ctx && this.ctx.audio;
-    if (a && typeof a.play === 'function' && key) a.play(key, p.x, p.y, p.z, gain, 1);
+    if (a && typeof a.play === 'function' && key) a.play(key, p.x, p.y, p.z, gain, rate);
   }
 
   /** @param {Weapon} w @param {string} key @param {number} gain */
@@ -1046,10 +1445,11 @@ export class WeaponSystem {
       w.assistT = -1;
       w.aNoMag = false;
       w.view.magOut = 0;
-      if (w !== this.held) w.carry.stow();
+      if (w !== this.held) this._stow(w);
     }
     this._stripT = 0;
     this.fx.reset();
+    for (const lm of this._loose) lm.clear(this.phys);
   }
 
   // ----------------------------------------------------------------------- fit
@@ -1198,4 +1598,16 @@ export class WeaponSystem {
     this.holster.frustumCulled = !on;
     this.fx.setWarm(on);
   }
+}
+
+/**
+ * A mesh's vertex positions in its own geometry space (load time, for the physics hulls).
+ * @param {THREE.Mesh} mesh
+ * @returns {Float32Array}
+ */
+function positionsOf(mesh) {
+  const a = /** @type {THREE.BufferAttribute} */ (mesh.geometry.attributes.position);
+  const out = new Float32Array(a.count * 3);
+  for (let i = 0; i < a.count; i++) { out[i * 3] = a.getX(i); out[i * 3 + 1] = a.getY(i); out[i * 3 + 2] = a.getZ(i); }
+  return out;
 }
