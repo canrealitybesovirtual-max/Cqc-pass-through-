@@ -240,3 +240,40 @@ test('v0.5: the session counters and the hitch details allocate nothing per fram
   }
   assert.ok(grew < 2_000_000, `heap grew ${grew} bytes`);
 });
+
+test('v0.6: a refresh-rate switch settles: missed intervals in the window are gaps, not hitches', () => {
+  const { pm, clock } = make();
+  drive(pm, clock, [13.9, 13.9, 13.9]);
+  pm.mark('rate 72');
+  pm.settle(400);
+  // the v0.5 device record: 90, 40, 48, 30, 22 ms right after the switch
+  drive(pm, clock, [90, 40, 48, 30, 22, 13.9, 13.9]);
+  const h = pm.exportHitches();
+  assert.equal(h.total, 0, JSON.stringify(h.entries));
+  assert.equal(h.gaps.total, 5);
+  assert.ok(h.gaps.entries.every((g) => g.marker === 'rate 72'));
+  // after the window a miss is a hitch again
+  drive(pm, clock, [...new Array(12).fill(13.9), 30, 13.9]);
+  assert.equal(pm.exportHitches().total, 1);
+});
+
+test('v0.6: hitch entries carry draw calls, the phase, enemies alive and a cause class; misses by phase', () => {
+  const { pm, clock } = make();
+  pm.tag = 2; pm.alive = 3;
+  drive(pm, clock, [13.9, 13.9, 30, 13.9], 2);
+  pm.tag = 3; pm.alive = 0;
+  drive(pm, clock, [13.9, 30, 13.9], 12);
+  const e = pm.exportHitches().entries;
+  assert.equal(e.length, 2);
+  assert.equal(e[0].phase, 'fight');
+  assert.equal(e[0].alive, 3);
+  assert.equal(e[0].calls, 10);
+  assert.equal(e[0].cls, 'outside', 'a miss at 2 ms of CPU is outside our callback');
+  assert.equal(e[1].phase, 'break');
+  assert.equal(e[1].cls, 'cpu', '12 ms of CPU is ours');
+  const by = pm.sessionReport().byPhase;
+  assert.equal(by.fight.missed, 1);
+  assert.equal(by.fight.missedCpu, 0);
+  assert.equal(by.break.missedCpu, 1);
+  assert.ok(by.fight.frames >= 3);
+});

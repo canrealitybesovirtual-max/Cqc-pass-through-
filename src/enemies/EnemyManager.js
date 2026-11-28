@@ -44,7 +44,7 @@
  */
 
 import { Animator, ANIM } from './Animator.js';
-import { AI, Brain, DIFFICULTY, ST, difficultyFromSearch, resolveDifficulty } from './Brain.js';
+import { AI, Brain, DIFFICULTY, ST, PATH_H_WEIGHT, difficultyFromSearch, resolveDifficulty } from './Brain.js';
 import { EnemyPool } from './EnemyPool.js';
 import { FALL, FALL_FULL, chooseFall } from './Fall.js';
 import { HitPuff } from './HitPuff.js';
@@ -161,6 +161,10 @@ export class EnemyManager {
       heightMin: 0, heightMax: 0,
     };
     // Path planner timing for the session record (read when the stats are copied).
+    // v0.6: the brain's cover, peeks, bounding waits and staggers
+    for (const k of ['coverGoals', 'peeks', 'deferred', 'staggers']) Object.defineProperty(this.stats, k, { enumerable: true, get: () => /** @type {any} */ (this.brain.stats)[k] | 0 });
+    Object.defineProperty(this.stats, 'coverPoints', { enumerable: true, get: () => this.brain.cover.count });
+    Object.defineProperty(this.stats, 'pathSearches', { enumerable: true, get: () => (this.planner && this.planner.stats ? this.planner.stats.searches | 0 : 0) });
     Object.defineProperty(this.stats, 'pathTimeouts', { enumerable: true, get: () => (this.planner && this.planner.stats ? this.planner.stats.timeouts | 0 : 0) });
     Object.defineProperty(this.stats, 'pathMaxStepMs', {
       enumerable: true, get: () => (this.planner && this.planner.stats ? Math.round((this.planner.stats.maxStepMs || 0) * 1000) / 1000 : 0),
@@ -192,7 +196,7 @@ export class EnemyManager {
    */
   attachWorld(world, planner) {
     this.world = world;
-    this.planner = planner || this.planner || (world && typeof world.createPlanner === 'function' ? world.createPlanner({ maxRequests: Math.max(16, this.max) }) : null);
+    this.planner = planner || this.planner || (world && typeof world.createPlanner === 'function' ? world.createPlanner({ maxRequests: Math.max(16, this.max), hWeight: PATH_H_WEIGHT }) : null);
     this.brain.attach(world, this.planner);
   }
 
@@ -428,13 +432,29 @@ export class EnemyManager {
       return;
     }
     an.hit(dirX, dirY, dirZ, hx, hy, hz, part, k);
-    this.brain.hit(enemy, k);
+    this.brain.hit(enemy, k, dirX, dirZ);
     if (this.legHit[enemy]) a.speedK = 0.6;
     if (this.gruntT[enemy] <= this.brain.time) { this.sound('grunt', enemy, 0.85, 1.5); this.gruntT[enemy] = this.brain.time + 0.8; }
   }
 
   /** Living enemies (bodies on the floor do not count). */
   alive() { return this.brain.living(); }
+
+  /**
+   * v0.6 room clearing: enemy i waits hidden at his cover point in nav room `room` until he sees or hears you.
+   * @param {number} i @param {number} room @param {number} coverI
+   */
+  setAmbush(i, room, coverI) { if (i >= 0) this.brain.setAmbush(i, room, coverI); }
+
+  /** Living enemies holding nav room `r` (room clearing). @param {number} r */
+  aliveInRoom(r) {
+    let n = 0;
+    for (let i = 0; i < this.max; i++) { const a = this.brain.agents[i]; if (a.alive && a.home === r) n++; }
+    return n;
+  }
+
+  /** The brain's cover index (built from the world on its first update after a build). */
+  get cover() { return this.brain.cover; }
 
   /** Everyone back to the pool (restart). */
   reset() {

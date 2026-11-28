@@ -130,6 +130,15 @@ export class HomePage {
         if (this.onEnter) this.onEnter(mode);
       });
     }
+    // v0.6: the two new game modes (the whole house, like Enter MR)
+    for (const [id, gm] of [['bClear', 'clear'], ['bDefend', 'defend']]) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener('click', () => {
+        app.gameMode = gm;
+        app.enter('play');
+        if (this.onEnter) this.onEnter('play');
+      });
+    }
     // v0.5: the walkthrough scan, then play (the house is learned and kept on this device)
     const scan = document.getElementById('bScan');
     if (scan) scan.addEventListener('click', () => {
@@ -189,7 +198,7 @@ export class HomePage {
     const sup = this.sup || {};
     const ready = this.load === 'ready', idle = this.load !== 'loading';
     /** @type {[string, boolean][]} */
-    const gate = [['bPlay', !!sup.ar && ready], ['bScan', !!sup.ar && ready], ['bSpot', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
+    const gate = [['bPlay', !!sup.ar && ready], ['bScan', !!sup.ar && ready], ['bClear', !!sup.ar && ready], ['bDefend', !!sup.ar && ready], ['bSpot', !!sup.ar && ready], ['bProbe', !!sup.ar && idle], ['bBounds', !!sup.ar && idle], ['bVR', !!sup.vr && idle], ['bRetry', !!sup.ar && ready]];
     for (const [id, ok] of gate) { const b = /** @type {HTMLButtonElement|null} */ (document.getElementById(id)); if (b) b.disabled = !on || !ok; }
   }
 

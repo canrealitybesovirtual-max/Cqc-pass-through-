@@ -244,6 +244,15 @@ export class PathPlanner { /* pure, time-sliced A*: */ request(id, sx,sz, gx,gz)
     - **Haptics** (`hapticActuators[0].pulse`): shot 1.0 / 45 ms; slide home 0.75; magazine catch 0.28; rack 0.55.
     - **Ammo** for the watch: `weaponSystem.ammo()` returns `{ weapon, mag, chambered, mode }`.
 
+**v0.6 changes** (details in DECISIONS.md and ARCHITECTURE "v0.6"):
+- **Game modes:** `MODE`, `MODE_NAME`, `SPAWN_KIND`, `modeFrom(v)` in `src/game/Rules.js`; `SurvivalRules({ mode })`, `setMode(m)`, `roundS`, `cleared`, `clearS`, `wavesHeld`. The rules host's `spawn(kind, door)` (old hosts ignore the arguments), and the optional `hides()`, `breachDoors()`, `cleared(seconds, kills)`. `MSG.HOUSE_CLEAR`. `game.setGameMode(m)`, `game.gameModeName`, `game.modeReport()` → `rec.play.gameMode`. `PlayKit.begin({ …, gameMode })`; `app.gameMode` (the page's buttons), `?mode=`.
+- **Cover:** `src/world/Cover.js`: `CoverIndex` (`build(world)`, `begin(world)` / `step(n)`, `ready`, `count`, `x z dx dz px pz h room kind taken`, `version` = the nav version it was built for), `planHides(world, cover, px, pz, max, rand)`, `breachDoors(world)`, `breachSpawn(world, k, px, pz, out, r)`.
+- **Enemies:** `brain.cover`, `brain.setAmbush(i, room, coverI)`, `brain.hit(i, k, dx, dz)` (stagger); agents carry `coverI`, `peekOut`, `ambush`, `home`. `EnemyManager.setAmbush`, `aliveInRoom(r)`, `cover`; `stats.coverPoints`, `coverGoals`, `peeks`, `deferred`, `staggers`, `pathSearches`. `PATH_H_WEIGHT` (Brain.js).
+- **PathPlanner** `{ hWeight }`; landmarks from `nav.pathSource` (the Roam index's door fields) when baked.
+- **Warm-up:** `warmXR(renderer, scene, camera, objects, { part, parts })`; PlayKit's `WARM_PARTS`.
+- **PerfMonitor:** `settle(ms)`, `tag` / `alive` (set once a frame by PlayKit; `PERF_TAGS`), `phaseReport()`; hitch entries add `calls`, `prevCalls`, `phase`, `alive`, `cls`.
+- **Physics:** `beginStatic` keeps the old colliders until the new ones exist; `buildSlice` then removes them in slices. `weapons.physOpenView` (PlayKit) picks the 1.5 ms slice.
+
 ## Enemies (builder E): `src/enemies/`
 
 ```js

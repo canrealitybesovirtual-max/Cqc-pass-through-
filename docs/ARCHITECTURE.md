@@ -189,3 +189,32 @@ session coordinates through its inverse.
 pieces (paper windows, icons, pill caps), the panels' fonts. A GlyphBoard is an InstancedBufferGeometry of quads
 (atlas rectangle, place, tint) over the shared board material; a layout rewrites its instanced arrays
 (`needsUpdate`, the whole preallocated buffer, a few KB). Layout code passes integers only.
+
+## v0.6: game modes, cover, the hitch fixes
+
+**Game modes.** `src/game/Rules.js` (pure) runs three modes (`MODE`, `modeFrom`): survival (the waves), room clearing
+(`SPAWN_KIND.HIDE`: every defender placed at the wave start, `host.cleared(seconds)` when all are down) and home defense
+(`SPAWN_KIND.BREACH`: stacks of 2–3 through one exterior door each). The page's **Enter MR** / **Clear the house** /
+**Defend the house** set `app.gameMode` (`?mode=` overrides it for tests) → `PlayKit.begin({ gameMode })` →
+`game.setGameMode`. GameSession is the rules' host: `_planHides` (room clearing, at the wave start: `planHides`),
+`_planBreach` (home defense: `breachDoors` with room behind them), `_spawn(kind, door)` (`breachSpawn`, or the Roam
+search), `_houseCleared` (the round-over panel shows the time), `modeReport()` → `rec.play.gameMode`.
+
+**Cover** (`src/world/Cover.js`, pure). `CoverIndex` holds points beside the real furniture and door frames (each with
+the direction it covers from, a peek point, the cover's height and its nav room), built from the world's layout and nav
+in slices (`begin` / `step`, 6 pieces a frame) by the Brain whenever the nav grid's version changes. The Brain uses it
+when it picks an engagement point (`pickCover`: up to 6 points, two sight lines each), runs the peek cycle at a cover
+point (`peekStep`, 10 Hz), and holds room clearing's defenders there (`setAmbush`: still until they see or hear the
+player, then tethered to their nav room). Bounding: an engaged man with a point waits while a mate is moving.
+
+**Path finding.** PathPlanner is weighted A* (`hWeight`, the Brain's `PATH_H_WEIGHT` 1.75) with the Roam index's door
+fields as landmarks (`nav.pathSource`, up to 12; only when they are baked).
+
+**Hitch fixes.** The XR warm draw runs in `WARM_PARTS` (4) frames; the scan starts in its own frame (SCANGO).
+PhysicsWorld removes a previous build's static colliders in slices after the new ones exist; WeaponSystem's slice
+budget is 1.5 ms while the view is open (`physOpenView`, set by PlayKit). PerfMonitor: `settle(ms)` after the rate
+switch (gaps), per-hitch phase / enemies alive / draw calls / cause class, `byPhase` in `rec.perf`.
+
+**Record.** `rec.play.learn.overlay` (the learned planes, volumes and walked points, thinned to 600) makes a session's
+learned house replayable; `tests/fixtures/house-v05-device.json` was rebuilt from the v0.5 world report and is swept
+by `tests/e2e/replay-house.mjs` (both houses) and `tests/unit/world.house-v05.test.js`.

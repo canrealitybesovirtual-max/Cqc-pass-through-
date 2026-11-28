@@ -30,6 +30,8 @@ export const PATH_FAILED = -2;
 const IDLE = 0, QUEUED = 1, ACTIVE = 2, DONE = 3, FAILED = 4;
 /** Expansions between clock reads in a timed step. */
 export const TIME_CHECK = 64;
+/** v0.6: door fields used as landmarks at most. */
+export const LM_MAX = 12;
 const defaultClock = typeof performance !== 'undefined' && typeof performance.now === 'function' ? () => performance.now() : () => Date.now();
 const SQRT2 = Math.SQRT2;
 const NDX = new Int8Array([1, -1, 0, 0, 1, 1, -1, -1]);
@@ -42,7 +44,9 @@ export class PathPlanner {
    * @param {{ maxRequests?: number, maxPoints?: number, wallCost?: number, wallBand?: number, snapRadius?: number,
    *   clock?: () => number }} [o] clock: milliseconds (default performance.now; inject a fake in tests)
    */
-  constructor(nav, { maxRequests = 16, maxPoints = 64, wallCost = 1.5, wallBand = 0.3, snapRadius = 1.0, clock = defaultClock } = {}) {
+  constructor(nav, { maxRequests = 16, maxPoints = 64, wallCost = 1.5, wallBand = 0.3, snapRadius = 1.0, hWeight = 1, clock = defaultClock } = {}) {
+    /** v0.6: heuristic weight (> 1: weighted A*, far fewer expansions; paths at most hWeight× the best cost). */
+    this.hWeight = hWeight;
     this.nav = nav;
     /** @type {() => number} */
     this.clock = clock;
@@ -80,6 +84,13 @@ export class PathPlanner {
     this.bx = 0;
     this.bz = 0;
     this.navVersion = nav.version;
+    // v0.6: landmarks (ALT): the Roam index's door distance fields (nav.pathSource), when baked. For any two cells
+    // |F_k(a) − F_k(b)| ≤ the walkable path between them, so max over the doors is an admissible heuristic that
+    // sees walls and doorways (octile does not: the v0.5 house's searches through doors expanded ~3k cells).
+    this.lmSlot = new Int32Array(LM_MAX);
+    this.lmG = new Float64Array(LM_MAX);
+    this.lmN = 0;
+    /** @type {Uint16Array|null} */ this.lmF = null;
     this.stats = { searches: 0, direct: 0, failures: 0, expansions: 0, lastExpansions: 0, truncated: 0, timeouts: 0, maxStepMs: 0 };
   }
 
@@ -210,6 +221,7 @@ export class PathPlanner {
   /** @param {number} id */
   begin(id) {
     const nav = this.nav, o = id * 4;
+    this.expanded = 0; // (a region failure used to report the previous search's expansions)
     const sx = this.req[o], sz = this.req[o + 1], gx = this.req[o + 2], gz = this.req[o + 3];
     this.stats.searches++;
     const s0 = nav.index(sx, sz), g0 = nav.index(gx, gz);
@@ -239,6 +251,22 @@ export class PathPlanner {
     this.seen[s] = this.gen;
     this.g[s] = 0;
     this.parent[s] = -1;
+    this.lmN = 0;
+    this.lmF = null;
+    const R = /** @type {any} */ (nav).pathSource, n = nav.count;
+    if (R && R.fieldsReady && R.fieldSlots > 0 && R.fields && R.fields.length >= R.fieldSlots * n) {
+      const F = /** @type {Uint16Array} */ (R.fields), slots = R.fieldSlots;
+      // the landmarks spread over the doors (every one when there are few)
+      const stepK = slots > LM_MAX ? slots / LM_MAX : 1;
+      for (let q = 0; q < LM_MAX && q * stepK < slots; q++) {
+        const k = Math.floor(q * stepK), v = F[k * n + g];
+        if (v === 65535 || F[k * n + s] === 65535) continue;
+        this.lmSlot[this.lmN] = k * n;
+        this.lmG[this.lmN] = v;
+        this.lmN++;
+      }
+      if (this.lmN) this.lmF = F;
+    }
     this.heap.push(s, this.h(s));
     this.active = id;
     this.status[id] = ACTIVE;
@@ -261,7 +289,8 @@ export class PathPlanner {
   expand(quota) {
     const nav = this.nav, w = nav.w, hgt = nav.h, fl = nav.flags, clr = nav.clr, cell = nav.cell;
     const gen = this.gen, seen = this.seen, closed = this.closed, G = this.g, parent = this.parent, heap = this.heap;
-    const minC = nav.agentClear, band = this.wallBand, wc = this.wallCost, gxi = this.gx, gzi = this.gz, K = SQRT2 - 1;
+    const minC = nav.agentClear, band = this.wallBand, wc = this.wallCost, gxi = this.gx, gzi = this.gz, K = SQRT2 - 1, hW = this.hWeight;
+    const LF = this.lmF, lmN = this.lmN, lmS = this.lmSlot, lmG = this.lmG;
     let n = 0;
     while (n < quota) {
       const c = heap.pop();
@@ -287,7 +316,16 @@ export class PathPlanner {
           parent[j] = c;
           // Octile heuristic, inlined (a non-inlined call returning a double boxes it).
           const hx = jx > gxi ? jx - gxi : gxi - jx, hz = jz > gzi ? jz - gzi : gzi - jz;
-          heap.push(j, ng + (hx > hz ? hx + K * hz : hz + K * hx) * cell);
+          let hh = (hx > hz ? hx + K * hz : hz + K * hx) * cell;
+          if (LF !== null) {
+            for (let q = 0; q < lmN; q++) {
+              const fj = LF[lmS[q] + j];
+              if (fj === 65535) continue;
+              const d = (fj > lmG[q] ? fj - lmG[q] : lmG[q] - fj) * 0.01;
+              if (d > hh) hh = d;
+            }
+          }
+          heap.push(j, ng + hh * hW);
         }
       }
     }

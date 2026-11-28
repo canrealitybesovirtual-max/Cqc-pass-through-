@@ -123,6 +123,7 @@ export const SYSTEM = Object.freeze({
   assistDepth: 0.08,        // m
   dropRest: 0.04,           // m a dropped gun's root rests above the floor while it waits to return
   physSliceMs: 4,           // ms a frame for the static collider build (behind the panel or a pause)
+  physSliceOpenMs: 1.5,     // v0.6: ms a frame when nothing covers the view (a learned rebuild in a wave break)
   magTumble: 1.5,           // rad/s a magazine dropped from the well tumbles (design)
 });
 
@@ -241,6 +242,10 @@ export class WeaponSystem {
    *   physics?: import('../physics/PhysicsWorld.js').PhysicsWorld | null }} [opts] physics: attach at once (else attachPhysics / initPhysics)
    */
   constructor(ctx, opts = {}) {
+    /** v0.6: set by PlayKit while the view is open (no card): collider slices stay short. */
+    this.physOpenView = false;
+    /** v0.6: set by PlayKit in play: a rebuild there is the same house (a learned rebuild), items keep the old colliders meanwhile. */
+    this.physKeepOld = false;
     /** Left glove on the AKM handguard: off until it is re-posed to wrap the handguard (v0.3). */
     this.supportGlove = false;
     const models = ctx.assets.models;
@@ -406,7 +411,7 @@ export class WeaponSystem {
   }
 
   /** Physics is attached, working and its static colliders are built. */
-  get physOn() { return !!this.phys && !this.phys.failed && this.phys.ready; }
+  get physOn() { return !!this.phys && !this.phys.failed && this.phys.usable; } // v0.6: or the previous set stands (a learned rebuild)
 
   /** @param {Weapon} w the gun's physics kind (with or without its magazine) */
   _gunKind(w) { return w.id === 'glock' ? (w.inst.magSeated ? K_GLOCK : K_GLOCK_NOMAG) : (w.inst.magSeated ? K_AKM : K_AKM_NOMAG); }
@@ -426,9 +431,9 @@ export class WeaponSystem {
     const key = g || (W && W.built !== false ? W.layout : null);
     if (key && key !== this._physLayout) {
       this._physLayout = key;
-      P.beginStatic(staticFromWorld(W));   // allocates: only when the world was rebuilt (behind the panel / a pause)
+      P.beginStatic(staticFromWorld(W), this.physKeepOld);   // allocates: only when the world was rebuilt (behind the panel / a pause)
     }
-    if (!P.ready && P.geo) P.buildSlice(SYSTEM.physSliceMs);
+    if (!P.ready && P.geo) P.buildSlice(this.physOpenView ? SYSTEM.physSliceOpenMs : SYSTEM.physSliceMs);
     P.step(dt);
     if (P.failed) { this._physFailed(); return; }
     for (let i = 0; i < this.weapons.length; i++) {

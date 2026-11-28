@@ -186,6 +186,7 @@ export class PauseManager {
     this.logKind = new Uint8Array(LOG_N);
     this.logT = new Float64Array(LOG_N);
     this.logN = 0;
+    this._lastViolT = -1e9;
   }
 
   // ── inputs (call before update) ─────────────────────────────────────────
@@ -281,6 +282,12 @@ export class PauseManager {
   violation(kind, t = this.time) {
     if (kind < 0 || kind >= this.violationCounts.length) return;
     this.violationCounts[kind]++;
+    // v0.6: a run of frames of the same kind is one log entry (the v0.5 record logged 32 frames of one 0.5 s stay)
+    if (this.logN > 0) {
+      const j = (this.logN - 1) % LOG_N;
+      if (this.logKind[j] === kind && t - this._lastViolT < 1) { this._lastViolT = t; return; }
+    }
+    this._lastViolT = t;
     const i = this.logN % LOG_N;
     this.logKind[i] = kind;
     this.logT[i] = t;

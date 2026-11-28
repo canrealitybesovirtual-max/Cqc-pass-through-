@@ -47,8 +47,11 @@ export async function runHouseReplay(browser, port, o = {}) {
   const out = [];
   try {
     await page.goto(`http://localhost:${port}/__replay-house.html`);
-    const res = await page.evaluate(replayInPage, { shots: !!o.shots });
+    const res = await page.evaluate(replayInPage, { shots: !!o.shots, ...HOUSES[0] });
     for (const c of res.checks) out.push(c);
+    // v0.6: the v0.5 headset session's house (with its learned overlay): the same sweep
+    const r5 = await page.evaluate(replayInPage, { shots: false, ...HOUSES[1] });
+    for (const c of r5.checks) out.push({ ...c, name: c.name.replace(/^replay: /, 'replay v0.5: ') });
     if (o.shots && res.shots) {
       mkdirSync(o.shots, { recursive: true });
       for (const s of res.shots) writeFileSync(`${o.shots}/${s.name}.png`, Buffer.from(s.png.split(',')[1], 'base64'));
@@ -63,6 +66,13 @@ export async function runHouseReplay(browser, port, o = {}) {
   return out;
 }
 
+/** The recorded houses: v0.4 (the soldier checks and shots run on it) and v0.5 (the learned overlay, v0.6). */
+const HOUSES = [
+  { fixture: '/tests/fixtures/house-v04-device.json', start: { x: -0.2256, z: 0.0093 }, walls: 20, full: true,
+    spawns: [[4.58, 10.9], [0.38, 6.5], [6.38, 1.5], [-1.22, 3], [-1.22, 4.5], [-1.22, 6.5]], anchors: [[-0.2256, 0.0093], [1.19, 1.73], [3.44, 7.96]] },
+  { fixture: '/tests/fixtures/house-v05-device.json', fromFixture: true, full: false },
+];
+
 // ---------------------------------------------------------------------------
 // Runs inside the page.
 async function replayInPage(opts) {
@@ -73,16 +83,18 @@ async function replayInPage(opts) {
   const checks = [];
   const check = (name, pass, info = '') => checks.push({ name: `replay: ${name}`, pass: !!pass, info: String(info) });
 
-  const json = await (await fetch('/tests/fixtures/house-v04-device.json')).json();
+  const json = await (await fetch(opts.fixture)).json();
   const snap = await hydrateSnapshot(normalizeSnapshot(json));
   // the recorded session: Roam, unbounded, start in the bedroom (play.world.zone), spawns (play.world.report.spawn.recent)
-  const START = { x: -0.2256, z: 0.0093 };
-  const SPAWNS = [[4.58, 10.9], [0.38, 6.5], [6.38, 1.5], [-1.22, 3], [-1.22, 4.5], [-1.22, 6.5]];
+  const X = json._session || null;
+  const START = opts.fromFixture ? X.start : opts.start;
+  const SPAWNS = opts.fromFixture ? X.spawns : opts.spawns;
+  const WALLS = opts.fromFixture ? X.expect.walls : opts.walls;
   const world = new World({ roam: true });
   world.build(snap, START, { roam: true, mesh: true });
   world.finishBake();
   const L = world.layout, nav = world.nav;
-  check('the house builds from the recorded snapshot with its global mesh', world.built && world.meshTrisDrawn > 20000 && L.walls.length === 20,
+  check('the house builds from the recorded snapshot with its global mesh', world.built && world.meshTrisDrawn > 20000 && L.walls.length === WALLS,
     `walls ${L.walls.length}, mesh tris ${world.meshTrisDrawn}`);
 
   // ── ground truth (Space Setup wall planes, not the game's slabs) ──
@@ -163,8 +175,8 @@ async function replayInPage(opts) {
   for (const p of P) { p.fy = world.floorY(p.x, p.z); p.unscanned = unscanned(p.x, p.z) && !nearDoor(p.x, p.z); }
 
   // ── the player's viewpoints: the recorded start, and a grid over the rooms walked (bedroom, hall, living room) ──
-  const anchors = [[START.x, START.z], [1.19, 1.73], [3.44, 7.96]];
-  const rooms = new Set(anchors.map(([x, z]) => world.roomAt(x, z)).filter((r) => r > 0));
+  const rooms = opts.fromFixture ? new Set(X.roomsVisited)
+    : new Set(opts.anchors.map(([x, z]) => world.roomAt(x, z)).filter((r) => r > 0));
   /** @type {{ x: number, z: number, y: number }[]} */
   const views = [{ x: START.x, z: START.z, y: world.floorY(START.x, START.z) + 1.55 }];
   const vs = Math.round(1.4 / nav.cell);
@@ -258,7 +270,36 @@ async function replayInPage(opts) {
       }
     }
   }
+  // v0.6: every leak is drawn again alone (one capsule, the same view): the batch's additive bits can carry into a
+  // neighbour's bit where a capsule's own triangles meet on a pixel (the v0.5 house: one 1-px "leak" that drew
+  // nothing alone)
   for (const m of proxies) m.visible = false;
+  let carried = 0;
+  for (let k = leaks.length - 1; k >= 0; k--) {
+    const l = leaks[k], V = { x: l.view[0], z: l.view[1] };
+    const vv = views.find((q) => Math.abs(q.x - V.x) < 0.006 && Math.abs(q.z - V.z) < 0.006);
+    const pp = P.find((q) => Math.abs(q.x - l.at[0]) < 0.006 && Math.abs(q.z - l.at[1]) < 0.006);
+    if (!vv || !pp) continue;
+    proxies[0].visible = true;
+    proxies[0].position.set(pp.x, pp.fy + 0.9, pp.z);
+    let n = 0;
+    for (let f = 0; f < 4; f++) {
+      cam.position.set(vv.x, vv.y, vv.z);
+      cam.rotation.set(0, f * Math.PI / 2, 0);
+      cam.updateMatrixWorld();
+      renderer.setRenderTarget(rt);
+      renderer.clear();
+      renderer.render(scene, cam);
+      renderer.readRenderTargetPixels(rt, 0, 0, S, S, px);
+      for (let i = 0; i < S * S; i++) {
+        const ix = i % S, iy = (i - ix) / S;
+        if (ix < EDGE || iy < EDGE || ix >= S - EDGE || iy >= S - EDGE) continue;
+        if (px[i * 4] & 1) n++;
+      }
+    }
+    proxies[0].visible = false;
+    if (n === 0) { leaks.splice(k, 1); carried++; }
+  }
   const wallLeaks = leaks.filter((l) => l.why === 'wall'), unscannedLeaks = leaks.filter((l) => l.why === 'unscanned');
   const sum = (a) => a.reduce((s, l) => s + l.px, 0);
   const worst = (a) => a.slice().sort((x, y) => y.px - x.px).slice(0, 4).map((l) => `${l.kind} (${l.at}) from (${l.view}) ${l.px} px`).join('; ');
@@ -273,13 +314,14 @@ async function replayInPage(opts) {
   for (let k = 0; k < world.spawner.count; k++) if (unscanned(world.spawner.x[k], world.spawner.z[k]) && !world.spawner.pocket[k]) badCand++;
   check('no spawn candidate in unscanned space (pockets behind doors excepted)', badCand === 0 && world.spawner.count > 0, `${badCand} of ${world.spawner.count}`);
   const sweep = { views: views.length, places: P.length, hiddenPairs, unscannedPairs, wallLeaks: wallLeaks.length, wallLeakPx: sum(wallLeaks),
-    unscannedLeaks: unscannedLeaks.length, unscannedLeakPx: sum(unscannedLeaks), visiblePairs, visibleDrawn,
+    unscannedLeaks: unscannedLeaks.length, unscannedLeakPx: sum(unscannedLeaks), visiblePairs, visibleDrawn, carried,
     leaks: wallLeaks.concat(unscannedLeaks.slice().sort((x, y) => y.px - x.px).slice(0, 200)),
     recordedSpawns: SPAWNS.map(([x, z]) => ({ x, z, room: world.roomAt(x, z), unscanned: unscanned(x, z) })), notes: L.notes };
 
   // ── the real soldier: height and feet on the floor (always), screenshots (--shots) ──
   /** @type {{ name: string, png: string }[]} */
   const shots = [];
+  if (!opts.full) { renderer.dispose(); return { checks, sweep, shots }; }
   const { Assets } = await import('/src/core/Assets.js');
   const { EnemyManager, ENEMY } = await import('/src/enemies/EnemyManager.js');
   const vr = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });

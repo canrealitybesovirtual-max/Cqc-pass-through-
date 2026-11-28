@@ -750,6 +750,10 @@ try {
     return !!(await waitFor((n) => { const w = window.__app.play.weapons; return w.held === w.glock && w.physStats.pickedUp > n && w.glock.physId < 0; }, n0, 5000));
   };
   await page.evaluate(async () => { window.__CARRY_FREE = (await import('/src/player/Slots.js')).CARRY_FREE; });
+  // v0.6: a learned rebuild after the round-over builds the static colliders in 1.5 ms slices while the view is open
+  // (SwiftShader runs ~4 frames a second, so it takes a while here); the lying-gun checks need the new set
+  const physWait = await waitFor(() => { const P = window.__app.play.weapons.phys; return P.ready && { frames: P.buildStats.frames, maxSliceMs: P.buildStats.maxSliceMs }; }, null, 90000, 250);
+  ok('physics: the static colliders are in place before the drops (a rebuild in open view uses short slices)', !!physWait, JSON.stringify(physWait));
   if (furn.table && furn.bed) {
     // the table: laid down 12 cm above its top with a still hand
     const T = furn.table;
@@ -758,9 +762,24 @@ try {
     await sleep(2000);
     const t2 = await lying(T);
     const moved = Math.hypot(t2.x - t1.x, t2.y - t1.y, t2.z - t1.z);
+    // v0.6: the gun's lowest hull point (a still hand can set it down upright on its frame, root ~8 cm up: a real rest)
+    const low = await page.evaluate(() => {
+      const k = window.__app.play, P = k.weapons.phys, w = k.weapons.glock, b = P.bodies.find((x) => x);
+      if (!b) return null;
+      const K = P.kinds[P.kindOf[P.bodies.indexOf(b)]], t = b.translation(), q = b.rotation();
+      let min = Infinity;
+      for (const h of K.hulls) for (let i = 0; i < h.length; i += 3) {
+        const x = h[i], y = h[i + 1], z = h[i + 2];
+        // the y of q v q*: v + w t + q × t with t = 2 q × v
+        const tx = 2 * (q.y * z - q.z * y), ty = 2 * (q.z * x - q.x * z), tz = 2 * (q.x * y - q.y * x);
+        const ry = y + q.w * ty + (q.z * tx - q.x * tz);
+        if (t.y + ry < min) min = t.y + ry;
+      }
+      return min;
+    });
     ok('physics: the Glock laid on the fixture table settles on top (resting on the table, inside its top) and stays there',
-      tl.drew && tl.free && tl.rest && t1.surface === 'table' && t1.above > -0.005 && t1.above < 0.06 && t1.inside && moved < 0.002,
-      `${JSON.stringify(tl)}; ${(t1.above * 100).toFixed(1)} cm above the ${t1.surface} at (${t1.x.toFixed(2)}, ${t1.y.toFixed(3)}, ${t1.z.toFixed(2)}); moved ${(moved * 1000).toFixed(1)} mm in 2 s`);
+      tl.drew && tl.free && tl.rest && t1.surface === 'table' && t1.above > -0.005 && t1.above < 0.12 && low !== null && Math.abs(low - (t1.y - t1.above)) < 0.02 && t1.inside && moved < 0.002,
+      `${JSON.stringify(tl)}; root ${(t1.above * 100).toFixed(1)} cm above the ${t1.surface}, lowest point ${low === null ? '?' : ((low - (t1.y - t1.above)) * 100).toFixed(1)} cm, at (${t1.x.toFixed(2)}, ${t1.y.toFixed(3)}, ${t1.z.toFixed(2)}); moved ${(moved * 1000).toFixed(1)} mm in 2 s`);
     ok('physics: at rest nothing steps (step() is skipped, no Rapier call) and the lying gun casts a contact shadow',
       t2.steps === t1.steps && t2.skipped > t1.skipped && t2.shadows > tl.sh0, `steps ${t1.steps} → ${t2.steps}, skipped frames ${t1.skipped} → ${t2.skipped}; item shadows ${tl.sh0} → ${t2.shadows}`);
     ok('physics: the Glock is picked up again from the table (right grip at its grip, squeeze)', await pickUp());
@@ -1160,6 +1179,54 @@ try {
   const toRoam = await waitFor(() => { const k = window.__app.play; return k.stepName === 'start' && k.game.roam && k.world.roamOn && !k.watch.menuOpen && { switches: k.modeSwitches.slice(), rooms: k.world.stats.rooms }; }, null, 8000);
   ok('spot: the watch\'s MODE row switches to the whole house (world rebuilt in Roam, back to the card)', !!toRoam && toRoam.switches.length === 1 && toRoam.switches[0].to === 'roam' && toRoam.rooms >= 2,
     JSON.stringify(toRoam));
+  await page.evaluate(() => window.__app.session.end());
+  await waitState('menu');
+  await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
+
+  // ---- v0.6 room clearing (Clear the house, the whole house): every defender placed at once in the rooms the player is
+  // not in, hidden and still at real cover; the record carries the mode
+  const clBefore = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
+  await page.click('#bClear');
+  ok('clear: entered xr', await waitState('xr'));
+  await skipCard();
+  let cl = null;
+  for (let i = 0; i < 6 && !cl; i++) {
+    await resumeIfPaused(8000);
+    cl = await waitFor(() => {
+      const k = window.__app.play, g = k.game, ag = k.enemies.brain.agents.filter((x) => x.alive);
+      if (k.stepName !== 'play' || g.phaseName !== 'wave' || !ag.length || ag.length < g.rules.total) return false;
+      const W = k.world, pr = W.roomAt(k.player.head.x, k.player.head.z);
+      return { mode: g.gameModeName, n: ag.length, total: g.rules.total, ambush: ag.every((x) => x.ambush), cover: ag.filter((x) => x.coverI >= 0).length,
+        rooms: ag.map((x) => x.home), roomsAt: ag.map((x) => W.roomAt(x.x, x.z)), playerRoom: pr, aware: ag.filter((x) => x.aware).length };
+    }, null, 6000);
+  }
+  ok('clear: every defender is placed at the wave start, hidden in a room the player is not in, at cover, waiting', !!cl && cl.mode === 'clear' && cl.n === cl.total && cl.n >= 1
+    && cl.ambush && cl.rooms.every((r, i) => r > 0 && r !== cl.playerRoom && cl.roomsAt[i] === r) && cl.cover === cl.n, JSON.stringify(cl));
+  const clGrow = await page.evaluate(() => { const r = window.__app.gfx.renderer; return { programs: r.info.programs.length, textures: r.info.memory.textures, geometries: r.info.memory.geometries }; });
+  ok('clear: nothing compiled or created', clGrow.programs === clBefore.programs && clGrow.textures === clBefore.textures && clGrow.geometries === clBefore.geometries,
+    `${JSON.stringify(clGrow)} vs ${JSON.stringify(clBefore)}`);
+  await page.evaluate(() => window.__app.session.end());
+  await waitState('menu');
+  const clRec = await page.evaluate(() => { const ss = window.__app.diag.data.sessions; const r = ss[ss.length - 1]; return r && r.play ? { gm: r.play.gameMode, ov: r.play.learn ? 'overlay' in r.play.learn : null, en: r.play.enemies } : null; });
+  ok('clear: the record has the mode, its rooms and defenders, and the learned overlay as used', !!clRec && clRec.gm && clRec.gm.mode === 'clear' && clRec.gm.defenders >= 1
+    && Array.isArray(clRec.gm.rooms) && clRec.ov === true && typeof clRec.en.coverPoints === 'number' && clRec.en.coverPoints > 0, JSON.stringify(clRec && clRec.gm));
+  await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));
+
+  // ---- v0.6 home defense (Defend the house): the waves come through the doors that lead out of the mapped house
+  await page.click('#bDefend');
+  ok('defend: entered xr', await waitState('xr'));
+  await skipCard();
+  let df = null;
+  for (let i = 0; i < 6 && !df; i++) {
+    await resumeIfPaused(8000);
+    df = await waitFor(() => {
+      const k = window.__app.play, g = k.game;
+      if (k.stepName !== 'play' || g.phaseName !== 'wave' || g.rules.spawned < 1) return false;
+      return { mode: g.gameModeName, total: g.rules.total, spawned: g.rules.spawned, doors: g._breach.slice(), stats: { ...g.modeStats } };
+    }, null, 6000);
+  }
+  ok('defend: a wave of 3 + n; the first men breach through an exterior door (or come as in survival where the house has none)', !!df && df.mode === 'defend' && df.total === 4
+    && (df.doors.length ? df.stats.breaches >= 1 : df.stats.breachFallbacks >= 0), JSON.stringify(df));
   await page.evaluate(() => window.__app.session.end());
   await waitState('menu');
   await page.evaluate(() => window.__iwer.position.set(0, 1.6, 0));

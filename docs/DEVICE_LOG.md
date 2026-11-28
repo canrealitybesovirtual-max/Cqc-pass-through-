@@ -74,7 +74,44 @@ v0.5 adds the walkthrough scan (the house is learned and kept on the headset), a
 
 Records to read: `sessions[0].play.learn` (house id, loaded / saved chunks and bytes, the depth tap: `issued`, `packets`, `drops`, `issueMs`, `getMs`, `framesToSignal`, `depth.width/height/textureType/nIdentity/ownGeometry`; `core.depth` = which way the depth rows run, `calibResidualCm`; `hitTest`: `created`, `entityTypes`, `hitRate`; `result`: openings, walked openings, floors, rooms, coverage), `sessions[0].play.scanResult`, `sessions[0].view` (`depthSensing`, `depthToThree` must be false, `near` 0.02), `sessions[0].perf` (whole-session interval histogram, per-system peaks, callback lateness), `sessions[0].hitches.entries[]` (now with `late`, `prev`, `prevCpu`, `next`, `markerAgeMs`) and `.gaps`, `sessions[0].heap` (GC drops with times), `sessions[0].probes.longAnimationFrames.entries` (which script made a long frame), `sessions[0].growth` (programs / textures / geometries growing in play), `play.capture.ms` / `.frames`.
 
+## v0.6: tests to run
+
+v0.6 fixes the two stutters our code caused in your v0.5 record, makes the enemies use your real furniture and door frames, and adds two games: **Clear the house** and **Defend the house** (new buttons next to Enter MR). Play in your house as before.
+
+1. **Clear the house.** Start in the bedroom. Are men waiting hidden in the other rooms (behind the bed, the couch, beside door frames)? Do they stay still until they see or hear you? Does the end show "House clear" and your time?
+2. **Defend the house.** Do the men come in through the outer doors, two or three close together through the same door?
+3. **Enter MR** (survival): do enemies duck behind furniture or a door frame, step out to fire and duck back? Does one move while the others hold? Do they stagger when hit?
+4. **Stutter:** the start of the scan, the card after it, and the wave breaks should be smooth now. Any stutter anywhere?
+5. Exit. The upload goes by itself.
+
+Records to read: `sessions[0].play.gameMode` (mode; clear: defenders, rooms with the time each was cleared, `clearS`; defend: `breachDoors`, `breaches`, `breachFallbacks`, `wavesHeld`), `play.enemies` (`coverPoints`, `coverGoals`, `peeks`, `deferred`, `staggers`, `pathSearches`, `pathTimeouts`), `perf.byPhase` (frames / missed / missedCpu per phase), `hitches.entries[]` (now with `phase`, `alive`, `calls`, `prevCalls`, `cls`: `cpu` = ours, `outside` = the frame missed with our CPU low), `hitches.gaps` (the 72 Hz switch: logged as gaps), `warmXR` (`parts`, `maxMs`), `physics.build.maxSliceMs`, `heap.quantized`, `play.learn.overlay` (the learned house as the world used it: replayable).
+
 ## Entries
+
+### v0.5 · 2026-11-28 · Quest 3, Scan house + survival in the user's house (240 s, realistic, died in wave 2, 7 kills)
+
+The user: "No stutter and it was fun, just keep advancing the same gameplay and checks and any bugs". Replayed on desktop: `tests/fixtures/house-v05-device.json` (the Space Setup snapshot with its mesh, plus the learned overlay rebuilt from the world report: 9 learned walls, 2 walked openings, 4 boxes).
+
+**The 43 missed frames (of 14,398; 72 Hz)**
+
+| Frames | What the record shows | Cause | v0.6 |
+|---|---|---|---|
+| 5 | 90, 40, 48, 30, 22 ms right after `rate 72` resolved (marker age 2–169 ms), behind the card, CPU 2–6 ms | The compositor switching to 72 Hz | Logged as gaps (`perf.settle`, 400 ms); not ours to fix |
+| 1 | marker `scan start`; previous frame `world` 12.5 ms (CPU 14.8 ms) | **Ours:** the XR warm draw (9.8 ms, 142 calls) and the scan's start in one frame | The warm draw is spread over 4 frames; the scan starts in its own frame |
+| 1 | 186.7 s, previous frame `physics` 10.4 ms, in the wave break after the learned rebuild | **Ours:** the old static colliders removed and the first new ones created in one frame | The old set stays until the new one is built, then goes in slices; 1.5 ms slices while the view is open |
+| 36 | CPU 1.4–4.4 ms, callback lateness 0.9–2.2 ms, intervals 21–28 ms (one frame late, never more than 2 in a row), no marker | Outside our callback (GPU or compositor; the Quest Browser gives no GPU timer). 3 in the 82 s scan, 33 in the 111 s fight / break / death | Cannot be attributed further from this record. Each hitch now carries the phase, enemies alive and draw calls, and `perf.byPhase` gives the rate per phase |
+
+**Other findings**
+
+- **18 "path timeouts"** were frames whose 0.35 ms budget cut a long A* search (it resumed the next frame). On this house the searches through the doors expanded up to ~3,000 cells (p95 2,708; 49 % needed more than one frame's quota). v0.6: weighted A* with the door distance fields as landmarks: p95 ~550, 4 % more than one frame, paths no longer.
+- The learner's `analyzeMaxMs` 11.4 is the **worker's** time (LearnCore runs in `learn.worker.js`); `workerMaxMs` 56.2 too. The main thread's depth readback cost 0.33 ms (issue) / 0.71 ms (read) on average.
+- `heap`: 73.05 MB in all 202 samples: the browser buckets `performance.memory`, so the GC log saw nothing. Now flagged `quantized`.
+- `safety.log`: 32 entries of one 0.5 s stay inside a mapped box (one per frame). Now one entry per stay.
+- `play.kills` 3 vs `enemies.killed` 7: kills after the round was over (you had died) are not counted by the round. Not a bug.
+- `learn.depth.enabled` false: the report was read after the session detached the tap. It now says whether depth was read.
+- Every door but two was flagged `exterior` (they lead into unscanned space behind the living room's walls). Home defense breaches only through exterior doors with room for a man behind them.
+- The learned overlay was not in the record (only its counts). It now is (`play.learn.overlay`).
+
 
 ### p1.0 · 2026-11-27 · Quest 3, OculusBrowser 157.0.0.22.15 (Chrome 157)
 

@@ -33,6 +33,38 @@ import { PAUSE, PauseManager, RESUME, SAFETY, VIOLATION, pauseIndex } from '../s
  */
 
 export const PHASE = Object.freeze({ IDLE: 0, READY: 1, WAVE: 2, BREAK: 3, OVER: 4 });
+
+/**
+ * v0.6 game modes (the page's Enter MR buttons, `?mode=`):
+ * - SURVIVAL: the waves above;
+ * - CLEAR (room clearing): one round; the host places every defender at once (`host.spawn(SPAWN_KIND.HIDE)`, one a
+ *   call, `host.hides()` of them) in the rooms behind real cover; the house is clear when they are all down
+ *   (`host.cleared(seconds)`; the round's time is the score); dying ends it as in survival;
+ * - DEFEND (home defense): waves of 3 + n enemies that breach through the house's exterior doors in stacks of 2–3
+ *   (`host.spawn(SPAWN_KIND.BREACH, door)`, door = 0 … host.breachDoors() − 1, one door per stack, 0.6–1.1 s
+ *   apart inside a stack, 5–9 s between stacks), at most 5 alive.
+ */
+export const MODE = Object.freeze({ SURVIVAL: 0, CLEAR: 1, DEFEND: 2 });
+export const MODE_NAME = Object.freeze(['survival', 'clear', 'defend']);
+/** What `host.spawn(kind, door)` is asked for. */
+export const SPAWN_KIND = Object.freeze({ ROAM: 0, HIDE: 1, BREACH: 2 });
+
+/**
+ * A mode from a name ('survival' | 'clear' | 'defend', any case; also 'waves', 'rooms', 'defense') or a URL query
+ * (`?mode=clear`); anything else is SURVIVAL. Pure.
+ * @param {string|null|undefined} v
+ * @returns {number} MODE
+ */
+export function modeFrom(v) {
+  if (typeof v !== 'string') return MODE.SURVIVAL;
+  let k = v.trim().toLowerCase();
+  const m = /(?:^|[?&])mode=([^&#]*)/.exec(k);
+  if (m) k = m[1];
+  else if (k.includes('=')) return MODE.SURVIVAL;
+  if (k === 'clear' || k === 'rooms' || k === 'clearing') return MODE.CLEAR;
+  if (k === 'defend' || k === 'defense' || k === 'defence' || k === 'home') return MODE.DEFEND;
+  return MODE.SURVIVAL;
+}
 export const PHASE_NAME = Object.freeze(['idle', 'ready', 'wave', 'break', 'over']);
 
 /** Pause reason bits (re-exported from the PauseManager). */
@@ -55,6 +87,7 @@ export const MSG = Object.freeze({
   TRACKING: 12, // tracking lost
   CONTROLLER: 13, // no controller
   RESET: 14, // view recentred, waiting for the world to be realigned
+  HOUSE_CLEAR: 15, // v0.6 room clearing: n = seconds
 });
 
 export const RULES = Object.freeze({
@@ -79,6 +112,10 @@ export const RULES = Object.freeze({
   exitHintS: 0.4,
   waveMsgS: 2,
   clearMsgS: 2.5,
+  // v0.6 modes
+  clearMax: 6, // defenders at most (the soldier pool)
+  defendBase: 3, defendMaxAlive: 5,
+  stack: Object.freeze([2, 3]), stackGapS: Object.freeze([0.6, 1.1]), stackPauseS: Object.freeze([5, 9]),
 });
 
 /**
@@ -93,6 +130,9 @@ export const RULES = Object.freeze({
  * @property {(health: number, delta: number) => void} health
  * @property {() => void} restart                  reset enemies / weapons for a fresh round
  * @property {(reason: string) => void} exit
+ * @property {() => number} [hides]               room clearing: defenders the host can place (≤ RULES.clearMax)
+ * @property {() => number} [breachDoors]         home defense: exterior doors (0: enemies come as in survival)
+ * @property {(seconds: number, kills: number) => void} [cleared]  room clearing: every defender is down
  */
 
 export class SurvivalRules {
@@ -101,8 +141,22 @@ export class SurvivalRules {
    * @param {{ seed?: number, zoneR?: number, requirePress?: boolean, runPause?: boolean }} [o] requirePress: false skips
    *   the Resume press (tools only); runPause: false = running is a warning, not a pause (Roam)
    */
-  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR, requirePress = true, runPause = true } = {}) {
+  constructor(host, { seed = 0x9e3779b9, zoneR = RULES.zoneR, requirePress = true, runPause = true, mode = MODE.SURVIVAL } = {}) {
     this.host = host;
+    /** @type {number} MODE (change between rounds: setMode) */ this.mode = mode;
+    /** Seconds of play this round (not paused): room clearing's score. */
+    this.roundS = 0;
+    /** Room clearing: the house was cleared (the round is over, nobody died); its time. */
+    this.cleared = false;
+    this.clearS = 0;
+    // home defense: the stack being sent
+    this.stackLeft = 0;
+    this.stackDoor = 0;
+    /** Waves held off (home defense) / survived. */
+    this.wavesHeld = 0;
+    this.breachCount = 0;
+    /** The mode this wave actually runs (room clearing falls back to survival where there is nothing to clear). */
+    this.roundMode = mode;
     this.seed = seed >>> 0 || 1;
     this.rng = this.seed;
     /** Every pause decision: PauseManager (feed its inputs before update). */
@@ -136,6 +190,9 @@ export class SurvivalRules {
     this.msgN = 0;
   }
 
+  /** @param {number} m MODE (takes effect at the next start) */
+  setMode(m) { this.mode = m === MODE.CLEAR || m === MODE.DEFEND ? m : MODE.SURVIVAL; }
+
   get zoneR() { return this.pm.zoneR; }
   set zoneR(r) { this.pm.zoneR = r; }
   get paused() { return this.pm.paused; }
@@ -157,6 +214,7 @@ export class SurvivalRules {
     this.health = RULES.maxHealth;
     this.wave = this.kills = this.headshots = 0;
     this.total = this.spawned = this.killedWave = 0;
+    this.roundS = 0; this.cleared = false; this.clearS = 0; this.stackLeft = 0; this.wavesHeld = 0;
     this.spawnFails = 0;
     this.exitDone = false;
     this.yHeldS = 0;
@@ -287,7 +345,7 @@ export class SurvivalRules {
   phaseStep(dt) {
     if (this.timedT > 0) {
       this.timedT -= dt;
-      if (this.timedT <= 0 && this.timedMsg !== MSG.OVER) this.timedMsg = MSG.NONE;
+      if (this.timedT <= 0 && this.timedMsg !== MSG.OVER && this.timedMsg !== MSG.HOUSE_CLEAR) this.timedMsg = MSG.NONE;
     }
     switch (this.phase) {
       case PHASE.READY:
@@ -296,25 +354,39 @@ export class SurvivalRules {
         if (this.phaseT <= 0) this.startWave();
         break;
       case PHASE.WAVE: {
+        this.roundS += dt;
+        const M = this.roundMode, maxAlive = M === MODE.CLEAR ? RULES.clearMax : M === MODE.DEFEND ? RULES.defendMaxAlive : RULES.maxAlive;
         // frozen (beyond 0.9 r, or an obstacle near): no new enemies
-        if (this.spawned < this.total && this.living() < RULES.maxAlive && !this.pm.freeze) {
+        if (this.spawned < this.total && this.living() < maxAlive && !this.pm.freeze) {
           this.spawnT -= dt;
           if (this.spawnT <= 0) {
             if (this.pm.paused) this.pm.violation(VIOLATION.SPAWN);
-            const got = this.host.spawn();
+            if (M === MODE.DEFEND && this.stackLeft <= 0) this.newStack();
+            const got = M === MODE.CLEAR ? this.host.spawn(SPAWN_KIND.HIDE, 0)
+              : M === MODE.DEFEND && this.breachCount > 0 ? this.host.spawn(SPAWN_KIND.BREACH, this.stackDoor) : this.host.spawn(SPAWN_KIND.ROAM, 0);
             if (got === 2) {
               this.spawnPendingFrames++;
               this.spawnT = 0; // still searching: ask again next frame
             } else if (got === true || got === 1) {
               this.spawned++;
-              this.spawnT = RULES.spawnGapMinS + (RULES.spawnGapMaxS - RULES.spawnGapMinS) * this.rand();
+              if (M === MODE.CLEAR) this.spawnT = 0; // the whole house at once
+              else if (M === MODE.DEFEND) {
+                this.stackLeft--;
+                const g = this.stackLeft > 0 ? RULES.stackGapS : RULES.stackPauseS;
+                this.spawnT = g[0] + (g[1] - g[0]) * this.rand();
+              } else this.spawnT = RULES.spawnGapMinS + (RULES.spawnGapMaxS - RULES.spawnGapMinS) * this.rand();
             } else {
               this.spawnFails++;
               this.spawnT = RULES.spawnRetryS;
+              // room clearing: a hide that cannot be placed is dropped (the house has fewer defenders)
+              if (M === MODE.CLEAR && this.spawnFails > 3 * RULES.clearMax) this.total = this.spawned;
             }
           }
         }
-        if (this.spawned >= this.total && this.living() === 0) this.clearWave();
+        if (this.spawned >= this.total && this.living() === 0) {
+          if (M === MODE.CLEAR) this.houseCleared();
+          else this.clearWave();
+        }
         break;
       }
       default:
@@ -324,16 +396,43 @@ export class SurvivalRules {
 
   startWave() {
     this.wave++;
-    this.total = RULES.baseEnemies + this.wave;
+    let M = this.mode;
+    this.total = M === MODE.CLEAR ? Math.max(0, Math.min(RULES.clearMax, this.host.hides ? this.host.hides() | 0 : 0))
+      : M === MODE.DEFEND ? RULES.defendBase + this.wave : RULES.baseEnemies + this.wave;
+    // a house with no room to clear (one room, the spot mode): survival waves instead
+    if (M === MODE.CLEAR && this.total === 0) { M = MODE.SURVIVAL; this.total = RULES.baseEnemies + this.wave; }
+    this.roundMode = M;
+    this.breachCount = M === MODE.DEFEND && this.host.breachDoors ? this.host.breachDoors() | 0 : 0;
+    this.stackLeft = 0;
     this.spawned = 0;
     this.killedWave = 0;
-    this.spawnT = RULES.firstSpawnS;
+    this.spawnT = M === MODE.CLEAR ? 0 : RULES.firstSpawnS;
     this.phase = PHASE.WAVE;
     this.show(MSG.WAVE, this.wave, RULES.waveMsgS);
     this.host.waveStart(this.wave, this.total);
   }
 
+  /** Home defense: the next stack (2–3, or what is left) and its door. */
+  newStack() {
+    const S = RULES.stack, left = this.total - this.spawned;
+    const n = S[0] + Math.floor(this.rand() * (S[1] - S[0] + 1));
+    this.stackLeft = n < left ? n : left;
+    this.stackDoor = this.breachCount > 0 ? Math.floor(this.rand() * this.breachCount) % this.breachCount : 0;
+  }
+
+  /** Room clearing: every defender is down. */
+  houseCleared() {
+    this.cleared = true;
+    this.clearS = this.roundS;
+    this.phase = PHASE.OVER;
+    this.clearPause();
+    this.show(MSG.HOUSE_CLEAR, Math.round(this.clearS), Infinity);
+    this.refreshMsg();
+    if (this.host.cleared) this.host.cleared(this.clearS, this.kills);
+  }
+
   clearWave() {
+    this.wavesHeld = this.wave;
     this.phase = PHASE.BREAK;
     this.phaseT = RULES.breakS;
     this.host.waveClear(this.wave);

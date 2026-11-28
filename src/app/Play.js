@@ -23,6 +23,19 @@ import { DepthTap } from '../xr/DepthTap.js';
 import { ScanTint } from '../ui/ScanTint.js';
 
 /**
+ * v0.6: the learned overlay as the world used it, for the record (the v0.5 record had only its counts, so the
+ * desktop replay of the user's house had to rebuild it from the world report). Session end only (allocates).
+ * @param {any} ov
+ */
+function compactOverlay(ov) {
+  if (!ov) return null;
+  const w = ov.walked || [], step = Math.max(1, Math.ceil(w.length / 600));
+  /** @type {number[][]} */ const walked = [];
+  for (let i = 0; i < w.length; i += step) walked.push(w[i]);
+  return { planes: ov.planes, meshes: ov.meshes, walked, walkedN: w.length, counts: ov.counts };
+}
+
+/**
  * The play mode's game (CONTRACTS.md "Integration"): every system is built
  * ONCE at load (before the warm-up), and each play session only starts and
  * stops it. App owns the XR session, the Loop and the PerfMonitor; this owns
@@ -98,8 +111,10 @@ export const PLAY_SYSTEMS = Object.freeze(['input', 'world', 'player', 'weapons'
  * Roam, BUILD with the worker build in v0.4: the capture's or the MODE row's build in flight).
  */
 export const STEP = Object.freeze({ IDLE: 0, CAPTURE: 1, WARM: 2, START: 3, PLAY: 4, SPOT: 5, REBUILD: 6, GO: 7, REALIGN: 8, REWARM: 9, BUILD: 10,
-  COPY: 11, HOUSE: 12, SCAN: 13, POST: 14 });
-const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm', 'build', 'copy', 'house', 'scan', 'post'];
+  COPY: 11, HOUSE: 12, SCAN: 13, POST: 14, SCANGO: 15 });
+const STEP_NAME = ['idle', 'capture', 'warm', 'start', 'play', 'spot', 'rebuild', 'go', 'realign', 'rewarm', 'build', 'copy', 'house', 'scan', 'post', 'scan'];
+/** v0.6: the XR warm draw is spread over this many frames (≈ 2.5 ms each on the device). */
+export const WARM_PARTS = 4;
 /**
  * The card (or the round start, or the end of a realign) waits for the static colliders, at most this long (ms):
  * a dropped gun must land on the new world. Past it the physics is used as soon as it is ready.
@@ -313,6 +328,8 @@ export class PlayKit {
     /** @type {any[]} */ this.learnBuilds = [];
     /** The post-build frames (card, look, light snap, card layout): one each. */
     this.post = { stage: 0, next: STEP.WARM, kind: '', /** @type {readonly string[]|null} */ lines: null };
+    this._warmPart = 0;
+    this._warmAcc = { ms: 0, maxMs: 0, calls: 0 };
     /**
      * The world build in flight (worker): its kind, whether its promise resolved, and the main thread's cost while it ran
      * (the world step's longest frame and the longest frame of all systems but render, from the PerfMonitor).
@@ -445,8 +462,10 @@ export class PlayKit {
    *   scan (v0.5): 'explicit' (the page's Scan house), 'auto' (scan when nothing is learned in this house yet) or 'off';
    *   liveDepth: App's LiveDepth (the learner's depth tap reads through its binding)
    */
-  begin({ session, space, rec, perf, warmed, roam = true, spaceName = '', spaceNote = null, scan = 'auto', liveDepth = null }) {
+  begin({ session, space, rec, perf, warmed, roam = true, spaceName = '', spaceNote = null, scan = 'auto', liveDepth = null, gameMode = 'survival' }) {
     const c = this.ctx;
+    // v0.6: the game mode (the page's Enter MR / Clear the house / Defend the house, or ?mode=)
+    this.game.setGameMode(gameMode);
     c.session = session;
     c.space = space;
     this.rec = rec;
@@ -500,6 +519,7 @@ export class PlayKit {
     this.learnWindow = false;
     this.learnBuilds = [];
     this.capJob.active = false;
+    this._warmPart = 0;
     this.learner.begin({ session, space, liveDepth });
   }
 
@@ -511,14 +531,18 @@ export class PlayKit {
   worldUpdate(dt, t, frame, ctx) {
     if (this.t0 < 0) this.t0 = t;
     // the MODE row waits while a realign holds the round (its build must land first)
-    if (this.modeWanted >= 0 && this.step !== STEP.REALIGN && this.step !== STEP.REWARM) this.switchMode(t);
+    if (this.modeWanted >= 0 && this.step !== STEP.REALIGN && this.step !== STEP.REWARM && this.step !== STEP.WARM) this.switchMode(t);
+    // v0.6: nothing covers the view in play or a realign hold: the collider slices stay short
+    this.weapons.physOpenView = this.step === STEP.PLAY || this.step === STEP.REALIGN || this.step === STEP.REWARM;
+    this.weapons.physKeepOld = this.step === STEP.PLAY; // a realign moves the house: its items wait for the new colliders
     switch (this.step) {
       case STEP.CAPTURE: this.capture(t, frame); break;
       case STEP.COPY: this.copyStep(t, frame); break;
       case STEP.HOUSE: this.houseStep(t); break;
       case STEP.BUILD: this.buildWait(t); break;
       case STEP.POST: this.postStep(); break;
-      case STEP.WARM: this.warmInXR(); if (this.scanWanted && !this.scanDone) this.scanBegin(t); else this.step = STEP.START; break;
+      case STEP.WARM: if (this.warmInXR()) this.step = this.scanWanted && !this.scanDone ? STEP.SCANGO : STEP.START; break;
+      case STEP.SCANGO: this.scanBegin(t); break; // v0.6: its own frame, after the last warm part
       case STEP.SCAN: this.scanStep(dt, t); break;
       case STEP.START: this.waitCard(t); break;
       case STEP.REBUILD: this.rebuildForSpot(t); break;
@@ -527,6 +551,12 @@ export class PlayKit {
       case STEP.REALIGN: this.realignStep(t, frame); break;
       case STEP.REWARM: this.rewarm(t); break;
       default: break;
+    }
+    // v0.6: the hitch log's phase tag (PERF_TAGS) and enemies alive
+    if (this.perf) {
+      const ph = this.game.phase, st = this.step;
+      this.perf.tag = st === STEP.SCAN ? 1 : st !== STEP.PLAY ? 5 : ph === PHASE.WAVE || ph === PHASE.READY ? 2 : ph === PHASE.BREAK ? 3 : ph === PHASE.OVER ? 4 : 0;
+      this.perf.alive = this.enemies.alive();
     }
     // the learner: the depth readback, a hit-test ray, the head path (each skipped on a frame near budget)
     if (this.step !== STEP.IDLE && this.step !== STEP.CAPTURE && this.step !== STEP.COPY) {
@@ -778,17 +808,26 @@ export class PlayKit {
    * clears and draws over it).
    */
   warmInXR() {
+    // v0.6: in WARM_PARTS frames (the v0.5 device record: the one-frame draw took 9.8 ms; 12.5 ms with the scan's start)
+    const k = this._warmPart;
     this.setWarm(true);
     let rep = null;
     try {
-      rep = warmXR(this.ctx.renderer, this.ctx.scene, this.sceneCamera, this.warmed);
+      rep = warmXR(this.ctx.renderer, this.ctx.scene, this.sceneCamera, this.warmed, { part: k, parts: WARM_PARTS });
     } finally {
       this.setWarm(false);
     }
+    const W = this._warmAcc;
+    if (k === 0) { W.ms = 0; W.maxMs = 0; W.calls = 0; }
+    if (rep) { W.ms += rep.ms; if (rep.ms > W.maxMs) W.maxMs = rep.ms; W.calls += rep.calls; }
+    const last = !rep || !!rep.skipped || k >= WARM_PARTS - 1;
+    this._warmPart = last ? 0 : k + 1;
+    if (!last) return false;
     this.warmReport = rep;
-    if (this.rec) this.rec.warmXR = rep ? { skipped: rep.skipped || undefined, ms: Math.round(rep.ms * 10) / 10, drawables: rep.drawables, calls: rep.calls, grew: rep.grew, programs: rep.programs } : null;
+    if (this.rec) this.rec.warmXR = rep ? { skipped: rep.skipped || undefined, ms: Math.round(W.ms * 10) / 10, maxMs: Math.round(W.maxMs * 10) / 10, parts: WARM_PARTS,
+      drawables: rep.drawables, calls: W.calls, grew: rep.grew, programs: rep.programs } : null;
     if (this.perf) this.perf.mark('warmXR');
-    return rep;
+    return true;
   }
 
   /**
@@ -1005,7 +1044,7 @@ export class PlayKit {
     }
     switch (this.step) {
       case STEP.IDLE: return;
-      case STEP.CAPTURE: case STEP.COPY: case STEP.HOUSE: case STEP.BUILD: case STEP.POST: case STEP.WARM: case STEP.SCAN: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
+      case STEP.CAPTURE: case STEP.COPY: case STEP.HOUSE: case STEP.BUILD: case STEP.POST: case STEP.WARM: case STEP.SCANGO: case STEP.SCAN: case STEP.START: case STEP.SPOT: case STEP.REBUILD: case STEP.GO:
         // before the round: read the room again in the new space (the card goes back up; a build in flight is
         // superseded by the next one and its result ignored)
         if (this.game.spotting || this.game.phase !== PHASE.IDLE) this.game.stop();
@@ -1013,6 +1052,7 @@ export class PlayKit {
         this._buildSeq++;
         this.gate.reset();
         this.capJob.active = false;
+        this._warmPart = 0;
         if (this.scanS.on) { this.scanS.on = false; this.scanTint.show(false); this.learner.setScanning(false); this.watch.setStatus({ scanning: false }); }
         this.snapshot = null;
         this.cardAt = -1;
@@ -1125,7 +1165,7 @@ export class PlayKit {
 
   /** One warm draw for the rewritten occluder, then the hold is released. @param {number} t */
   rewarm(t) {
-    this.warmInXR();
+    if (!this.warmInXR()) return;
     const g = this.game;
     /** @type {{ x: number, z: number }|undefined} */ let zone;
     const has = this._totHasM && this._rq.started;
@@ -1331,12 +1371,14 @@ export class PlayKit {
         settings: { ...this.settings, gloves: this.gloves }, storageErrors: this.storageErrors.length ? this.storageErrors.slice() : undefined,
         lighting: this.lighting ? { ...this.lighting, envMap: !!this.envTexture } : null,
       };
+      try { rec.play.gameMode = g.modeReport(); } catch (err) { rec.play.gameMode = { error: String(err) }; }
       try { rec.play.look = this.look ? { ...this.look.report(), prep: this.lookPrep } : null; } catch (err) { rec.play.look = { error: String(err) }; }
       rec.play.enemyWarmMs = this.enemyWarmMs;
       // v0.5: the learner (the house, the scan, the depth readbacks, hit-test, the worker, saves)
       try {
         rec.play.learn = { ...(rec.play.learn || {}), ...this.learner.end(), builds: this.learnBuilds.slice(), appliedKey: this.appliedKey || undefined,
-          scan: this.scanS.ms ? { ms: Math.round(this.scanS.ms), done: this.scanDone } : (this.scanWanted ? { done: this.scanDone } : undefined), tapError: this.tapError };
+          scan: this.scanS.ms ? { ms: Math.round(this.scanS.ms), done: this.scanDone } : (this.scanWanted ? { done: this.scanDone } : undefined), tapError: this.tapError,
+          overlay: compactOverlay(this.learner.overlay()) };
       } catch (err) { rec.play.learn = { error: String(err) }; }
       try { rec.physics = this.weapons.physicsReport(); } catch (err) { rec.physics = { error: String(err) }; }
     }
@@ -1382,6 +1424,7 @@ export class PlayKit {
       case STEP.CAPTURE: case STEP.COPY: case STEP.HOUSE: return CAPTURE_LINES;
       case STEP.BUILD: return this._bq.kind === 'scan' ? SCAN_BUILD_LINES : this._bq.kind === 'learn' ? null : CAPTURE_LINES;
       case STEP.POST: return this.post.kind === 'learn' || this.post.kind === 'realign' ? null : this.post.lines;
+      case STEP.SCANGO: return SCAN_LINES;
       case STEP.SCAN: return this.scanS.cardUp ? SCAN_LINES : null;
       case STEP.WARM: case STEP.START: case STEP.REBUILD: return this.builtLines;
       case STEP.GO: return this.rebuilt ? this.builtLines : null;

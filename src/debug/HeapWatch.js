@@ -67,7 +67,10 @@ export class HeapWatch {
   /** JSON-safe summary for the session record. */
   report() {
     if (!this.available) return { available: false };
-    return { available: true, samples: this.samples, minMB: mb(this.min), maxMB: mb(this.max), lastMB: mb(this.last),
+    // v0.6: the v0.5 device record read 73.05 MB in all 202 samples: the browser buckets the value (no precise
+    // memory info), so the GC log is blind there; say so instead of reporting "0 GCs"
+    const frozen = this.samples >= 30 && this.max === this.min;
+    return { available: true, quantized: frozen, samples: this.samples, minMB: mb(this.min), maxMB: mb(this.max), lastMB: mb(this.last),
       gcDrops: this.drops, droppedMB: mb(this.droppedBytes), maxGrowthMBps: mb(this.maxGrowth), log: this.log.slice() };
   }
 }

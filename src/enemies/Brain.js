@@ -47,6 +47,7 @@
 
 import { Rng, clamp, wrapAngle } from './math.js';
 import { NAV_HIDDEN } from '../world/NavGrid.js';
+import { CoverIndex } from '../world/Cover.js';
 
 export const AI = Object.freeze({
   thinkHz: 10,
@@ -74,6 +75,17 @@ export const AI = Object.freeze({
   separation: 0.8, // m between enemies
   pathQuota: 600, // A* expansions per frame (PLAN §9: measure on Quest)
   pathBudgetMs: 0.35, // … and at most this much of the frame (PLAN cap 0.4 ms)
+  // v0.6: real cover, peeking, taking turns, stagger
+  coverEvals: 6, // cover points weighed per goal choice (2 sight lines each)
+  coverSlice: 6, // furniture pieces / doorways a frame while the cover is rebuilt
+  coverBonus: 3, // a point the player cannot hit at chest height
+  coverCrouch: 1.0, // m above his floor: what the cover must hide (a crouched chest)
+  peekOut: [1.6, 3.0], // s stepped out at the peek point (or until a burst is fired)
+  peekIn: [1.0, 2.6], // s back in cover before the next peek
+  peekMisses: 2, // peeks without sight of the player → a new point
+  deferMax: 3.0, // s an engaged man waits for a mate to finish his move before he moves (bounding)
+  stagger: 0.9, // m/s of push from a hit of strength 1
+  staggerTau: 0.18, // s the push decays over
 });
 
 /**
@@ -126,6 +138,14 @@ export function difficultyFromSearch(search) {
   try { v = decodeURIComponent(v.replace(/\+/g, ' ')); } catch { /* keep it raw */ }
   return /** @type {'test'|'realistic'} */ (resolveDifficulty(v).name);
 }
+
+/**
+ * v0.6: the planner's heuristic weight (weighted A* with the door-field landmarks, PathPlanner). The v0.5 house
+ * replay: p95 expansions per search 2,708 → ~550 (quota 600 a frame: 49 % → ~4 % of searches took more than one
+ * frame), paths no longer. The v0.5 record's 18 "path timeouts" were frames whose 0.35 ms budget cut a long
+ * search (it resumed the next frame).
+ */
+export const PATH_H_WEIGHT = 1.75;
 
 export const ST = Object.freeze({ IDLE: 0, MOVE: 1, HOLD: 2, DEAD: 3 });
 
@@ -191,6 +211,11 @@ export class Agent {
     this.flinchT = 0; this.suppressT = 0;
     /** Walking speed factor (0.6 once a leg is hit). */
     this.speedK = 1;
+    // v0.6: cover (index into the brain's CoverIndex, −1 none), the peek cycle, room clearing's ambush, stagger
+    this.coverI = -1; this.peekOut = false; this.peekT = 0; this.peekShots = 0; this.peekSaw = false; this.peekMiss = 0;
+    /** Waits hidden (room clearing) until he sees or hears the player; `home` = the nav room he holds (0 = none). */
+    this.ambush = false; this.home = 0;
+    this.stagX = 0; this.stagZ = 0; this.deferT = 0;
     /** Outputs for this frame. */
     this.fire = false;
     this.reloadStart = false;
@@ -232,7 +257,12 @@ export class Brain {
     this.px = 0; this.py = 1.6; this.pz = 0; // head
     this.cx = 0; this.cy = 1.2; this.cz = 0; // chest
     this.palive = true;
-    this.stats = { thinks: 0, goals: 0, goalFails: 0, repaths: 0, shots: 0, blocked: 0 };
+    this.stats = { thinks: 0, goals: 0, goalFails: 0, repaths: 0, shots: 0, blocked: 0, coverGoals: 0, peeks: 0, deferred: 0, staggers: 0 };
+    /** v0.6: cover from the real furniture and door frames (rebuilt when the world's nav changes). */
+    this.cover = new CoverIndex();
+    /** Engaged men walking to a new point this frame (bounding: one moves while the others hold). */
+    this.movers = 0;
+    this._coverScore = 0;
     /** Scratch for world queries (see clearLine) and random numbers. */
     this.Q = new Float64Array(6);
     this.S = new Float64Array(6);
@@ -287,6 +317,31 @@ export class Brain {
     a.slot = false; a.slotT = 0; a.slotCool = 0;
     a.burstLeft = 0; a.shotT = 0; a.gapT = 0; a.mag = AI.mag; a.reloadT = 0; a.blockedT = 0;
     a.flinchT = 0; a.suppressT = 0; a.speedK = 1; a.fire = false; a.reloadStart = false; a.shots = 0; a.deadT = 0;
+    a.coverI = -1; a.peekOut = false; a.peekT = 0; a.peekShots = 0; a.peekSaw = false; a.peekMiss = 0;
+    a.ambush = false; a.home = 0; a.stagX = 0; a.stagZ = 0; a.deferT = 0;
+  }
+
+  /**
+   * v0.6 room clearing: agent i (just spawned at a hide) waits there, hidden, holding nav room `home`, until he
+   * sees the player or hears a shot; then he fights from his room's cover (never leaves it).
+   * @param {number} i @param {number} home nav room @param {number} coverI cover point he stands at (−1 none)
+   */
+  setAmbush(i, home, coverI) {
+    const a = this.agents[i];
+    if (!a || !a.alive) return;
+    a.ambush = true; a.home = home | 0;
+    a.state = ST.HOLD; a.hasGoal = true; a.goalX = a.x; a.goalZ = a.z; a.holdT = 0; a.holdFor = Infinity;
+    this.takeCover(a, coverI >= 0 && coverI < this.cover.count ? coverI : -1);
+    a.peekT = 0.5;
+  }
+
+  /** @param {Agent} a @param {number} k cover point or −1 */
+  takeCover(a, k) {
+    const C = this.cover;
+    if (a.coverI >= 0 && a.coverI < C.count && C.taken[a.coverI] === a.i + 1) C.taken[a.coverI] = 0;
+    a.coverI = k;
+    if (k >= 0) C.taken[k] = a.i + 1;
+    a.peekOut = false; a.peekMiss = 0; a.peekSaw = false;
   }
 
   /** @param {Agent} a @param {boolean} [deactivate] */
@@ -296,17 +351,23 @@ export class Brain {
     a.pathWait = false;
     a.burstLeft = 0;
     a.fire = false;
+    if (a.coverI >= 0) this.takeCover(a, -1);
     if (deactivate) { a.active = false; a.alive = false; a.state = ST.IDLE; }
   }
 
   /**
    * Damage taken (health already applied by the owner).
    * @param {number} i @param {number} k strength (≈ damage / 40)
+   * @param {number} [dx] @param {number} [dz] v0.6: the round's horizontal direction (he staggers along it)
    */
-  hit(i, k) {
+  hit(i, k, dx = 0, dz = 0) {
     const a = this.agents[i];
     if (!a.alive) return;
     a.flinchT = AI.flinch * clamp(0.6 + 0.4 * k, 0.6, 1.5);
+    // v0.6: a stagger along the round, and back into cover from a peek
+    const dl = Math.sqrt(dx * dx + dz * dz);
+    if (dl > 1e-6) { const sp = AI.stagger * clamp(k, 0.4, 1.6) / dl; a.stagX += dx * sp; a.stagZ += dz * sp; this.stats.staggers++; }
+    if (a.peekOut) { a.peekOut = false; a.peekT = AI.peekIn[1]; }
     a.burstLeft = 0;
     a.gapT = Math.max(a.gapT, 0.35);
     a.aimErr += 0.05 * clamp(k, 0.3, 1.5);
@@ -367,10 +428,20 @@ export class Brain {
     this.cx = tb.x + (tt.x - tb.x) * 0.6; this.cy = tb.y + (tt.y - tb.y) * 0.6; this.cz = tb.z + (tt.z - tb.z) * 0.6;
     this.palive = player.alive !== false;
     if (this.planner) this.planner.step(AI.pathQuota, AI.pathBudgetMs);
-    // waiting shooters (for slot fairness)
-    let w = 0;
-    for (let i = 0; i < this.n; i++) { const a = this.agents[i]; if (a.alive && a.los && !a.slot && a.reactT <= 0) w++; }
+    // v0.6: the world's cover, once per world build (its nav version)
+    const W = this.world;
+    if (W && W.nav && /** @type {any} */ (W).layout && W.nav.version !== this.cover.version) this.rebuildCover();
+    else if (!this.cover.ready) this.cover.step(AI.coverSlice);
+    // waiting shooters (for slot fairness); engaged men on the move (bounding)
+    let w = 0, mv = 0;
+    for (let i = 0; i < this.n; i++) {
+      const a = this.agents[i];
+      if (!a.alive) continue;
+      if (a.los && !a.slot && a.reactT <= 0) w++;
+      if (a.aware && a.state === ST.MOVE && (a.pathN > 1 || a.pathWait)) mv++;
+    }
     this.waiting = w;
+    this.movers = mv;
     for (let i = 0; i < this.n; i++) {
       const a = this.agents[i];
       a.fire = false;
@@ -382,6 +453,12 @@ export class Brain {
       this.move(a, dt);
       this.shoot(a, dt);
     }
+  }
+
+  /** The world was rebuilt: new cover; every hold on the old points is dropped. */
+  rebuildCover() {
+    this.cover.begin(/** @type {any} */ (this.world)); // stepped AI.coverSlice pieces a frame (a wave-break rebuild stays cheap)
+    for (let i = 0; i < this.n; i++) { const a = this.agents[i]; a.coverI = -1; a.peekOut = false; }
   }
 
   // ─────────────────────────────────────────────────────────── decisions (10 Hz)
@@ -439,19 +516,56 @@ export class Brain {
         this.stats.goalFails++;
       }
     }
+    // v0.6 room clearing: hidden and still until he sees or hears you
+    if (a.ambush && !a.aware) { a.state = ST.HOLD; return; }
+    // v0.6: at a cover point, the peek cycle (step out, fire a burst, back in)
+    if (a.state === ST.HOLD && a.coverI >= 0) this.peekStep(a);
     // goal management
     const atGoal = a.hasGoal && Math.sqrt((a.goalX - a.x) * (a.goalX - a.x) + (a.goalZ - a.z) * (a.goalZ - a.z)) < 0.35;
     let need = !a.hasGoal && a.pathFails < 4;
     if (a.hasGoal && a.state === ST.HOLD) {
-      if (!a.los && this.time - a.lostAt > AI.repositionNoSight) need = true;
+      if (a.coverI >= 0) { if (a.peekMiss >= AI.peekMisses) need = true; } // in cover he sees nothing between peeks
+      else if (!a.los && this.time - a.lostAt > AI.repositionNoSight) need = true;
       if (a.holdT > a.holdFor && !a.slot) need = true;
       if (a.blockedT > 1.0) need = true;
     }
     if (a.repaths > AI.maxRepaths) { need = true; a.repaths = 0; }
-    if (need) this.chooseGoal(a);
+    // v0.6 bounding: an engaged man with a point waits while a mate is moving (one moves, the others cover him)
+    const selfMoving = a.aware && a.state === ST.MOVE && (a.pathN > 1 || a.pathWait) ? 1 : 0;
+    if (need && a.hasGoal && a.aware && !selfMoving && this.movers > 0 && a.deferT < AI.deferMax) { a.deferT += 1 / AI.thinkHz; need = false; this.stats.deferred++; }
+    else if (!need) a.deferT = 0;
+    if (need) { a.deferT = 0; this.chooseGoal(a); }
     else if (atGoal && a.state === ST.MOVE) { a.state = ST.HOLD; a.holdT = 0; a.pathN = 0; }
     // no goal and planning keeps failing: hold here and fight from where he stands
     if (!a.hasGoal && a.pathFails >= 4) a.state = ST.HOLD;
+  }
+
+  /**
+   * The peek cycle at a cover point (10 Hz): in cover he waits; when it is his turn (a shooter slot is free or
+   * his) he steps out to the peek point, fires a burst if he sees you and steps back; a hit, a reload or the
+   * timer sends him back in. Two peeks without seeing you and he picks a new point.
+   * @param {Agent} a
+   */
+  peekStep(a) {
+    const R = this.R;
+    a.peekT -= 1 / AI.thinkHz;
+    if (!a.peekOut) {
+      if (a.peekT > 0 || a.reloadT > 0 || a.flinchT > 0) return;
+      if (!a.slot && this.shooters >= this.diff.maxShooters) { a.peekT = 0.3; return; }
+      rand(this.rng, R, 0);
+      a.peekOut = true; a.peekT = AI.peekOut[0] + (AI.peekOut[1] - AI.peekOut[0]) * R[0];
+      a.peekShots = a.shots; a.peekSaw = false;
+      this.stats.peeks++;
+      return;
+    }
+    if (a.los) a.peekSaw = true;
+    const fired = a.shots > a.peekShots && a.burstLeft === 0;
+    if (a.peekT <= 0 || fired || a.reloadT > 0 || a.flinchT > 0) {
+      a.peekOut = false;
+      rand(this.rng, R, 0);
+      a.peekT = AI.peekIn[0] + (AI.peekIn[1] - AI.peekIn[0]) * R[0];
+      a.peekMiss = a.peekSaw ? 0 : a.peekMiss + 1;
+    }
   }
 
   /**
@@ -477,6 +591,7 @@ export class Brain {
       snapWalkable(nav, S);
       if (S[3] < 0 || (region && S[4] !== region)) continue;
       if (/** @type {any} */ (w).curtainsOn === true && (nav.flags[S[3]] & NAV_HIDDEN) !== 0) continue; // never fight from unscanned space
+      if (a.home && nav.room[S[3]] !== a.home) continue; // room clearing: he holds his room
       const x = S[0], z = S[1];
       const dp = Math.sqrt((x - this.px) * (x - this.px) + (z - this.pz) * (z - this.pz));
       if (dp < AI.ringMin || dp > AI.ringMax + 0.5) continue;
@@ -499,12 +614,26 @@ export class Brain {
       }
       if (sc > best) { best = sc; bx = x; bz = z; bestLos = los; }
     }
+    // v0.6: the real cover nearby (furniture, door frames): hidden at chest height, a clear line from its peek
+    const bestCover = this.pickCover(a, region, best);
+    if (bestCover >= 0) {
+      const C = this.cover;
+      bx = C.x[bestCover]; bz = C.z[bestCover]; bestLos = true;
+      best = this._coverScore;
+    }
+    if (best === -Infinity && a.home) {
+      // room clearing: nothing in his room reaches you: he stays where he is (his room's cover)
+      a.hasGoal = true; a.goalX = a.x; a.goalZ = a.z; a.state = ST.HOLD; a.holdT = 0; a.holdFor = 4; a.pathN = 0;
+      return;
+    }
     if (best === -Infinity) {
       // nothing on the ring: walk toward the player as far as the nav allows
       const c = nav.nearestWalkable(this.px + (a.x - this.px) * 0.3, this.pz + (a.z - this.pz) * 0.3, 3.0);
       if (c < 0 || (region && nav.region[c] !== region)) { a.hasGoal = false; a.pathFails++; this.stats.goalFails++; return; }
       bx = nav.centerX(c); bz = nav.centerZ(c); bestLos = false;
     }
+    this.takeCover(a, bestCover);
+    if (bestCover >= 0) this.stats.coverGoals++;
     a.hasGoal = true;
     a.goalX = bx; a.goalZ = bz; a.goalLos = bestLos;
     a.holdT = 0;
@@ -517,6 +646,60 @@ export class Brain {
     this.stats.goals++;
     if (this.planner) { this.planner.request(a.i, a.x, a.z, bx, bz); a.pathWait = true; }
     else { a.path[0] = a.x; a.path[1] = a.z; a.path[2] = bx; a.path[3] = bz; a.pathN = 2; a.pathI = 1; }
+  }
+
+  /**
+   * The best cover point for agent a that beats `best` (the ring's best score), or −1. Up to AI.coverEvals points
+   * in reach (3–7.5 m from the player, his region, his room when he holds one, free, the cover between the point and
+   * the player), each with two sight lines: the crouched chest must be hidden, the peek must see the head or chest.
+   * Writes this._coverScore.
+   * @param {Agent} a @param {number} region @param {number} best
+   * @returns {number}
+   */
+  pickCover(a, region, best) {
+    const C = this.cover, w = this.world, n = C.count;
+    this._coverScore = best;
+    if (!w || n === 0 || !C.ready) return -1;
+    const nav = w.nav, Q = this.Q, S = this.S, R = this.R;
+    rand(this.rng, R, 0);
+    let j = Math.floor(R[0] * n), evals = 0, pick = -1;
+    for (let k = 0; k < n && evals < AI.coverEvals; k++, j = j + 1 >= n ? 0 : j + 1) {
+      const t = C.taken[j];
+      if (t !== 0 && t !== a.i + 1) continue;
+      if (a.home && C.room[j] !== a.home) continue;
+      const x = C.x[j], z = C.z[j];
+      const tx = this.px - x, tz = this.pz - z, dp = Math.sqrt(tx * tx + tz * tz);
+      if (dp < AI.ringMin || dp > AI.ringMax + 0.5) continue;
+      // the cover must stand between the point and the player
+      if ((C.dx[j] * tx + C.dz[j] * tz) < 0.35 * dp) continue;
+      S[0] = x; S[1] = z;
+      snapWalkable(nav, S);
+      if (S[3] < 0 || (region && S[4] !== region)) continue;
+      evals++;
+      Q[0] = x; Q[1] = z;
+      floorAt(w, Q);
+      const fy = Q[2];
+      // hidden: a crouched chest at the point
+      Q[0] = x; Q[1] = fy + AI.coverCrouch; Q[2] = z; Q[3] = this.cx; Q[4] = this.cy; Q[5] = this.cz;
+      const hidden = !clearLine(w, Q);
+      // the peek sees the head or the chest
+      Q[0] = C.px[j]; Q[1] = fy + AI.eye - 0.05; Q[2] = C.pz[j]; Q[3] = this.px; Q[4] = this.py; Q[5] = this.pz;
+      let peek = clearLine(w, Q);
+      if (!peek) { Q[3] = this.cx; Q[4] = this.cy; Q[5] = this.cz; peek = clearLine(w, Q); }
+      if (!peek) continue;
+      const da = Math.sqrt((x - a.x) * (x - a.x) + (z - a.z) * (z - a.z)), off = dp - 4.5;
+      rand(this.rng, R, 1);
+      let sc = 10 + (hidden ? AI.coverBonus : 0) - da * 0.5 - (off < 0 ? -off : off) * 0.3 + R[1] * 0.6;
+      for (let m = 0; m < this.n; m++) {
+        const o = this.agents[m];
+        if (m === a.i || !o.alive) continue;
+        const gx = o.hasGoal ? o.goalX : o.x, gz = o.hasGoal ? o.goalZ : o.z;
+        const dd = Math.sqrt((x - gx) * (x - gx) + (z - gz) * (z - gz));
+        if (dd < AI.spread) sc -= (AI.spread - dd) * 6;
+      }
+      if (sc > this._coverScore) { this._coverScore = sc; pick = j; }
+    }
+    return pick;
   }
 
   // ─────────────────────────────────────────────────────────── movement (per frame)
@@ -544,7 +727,23 @@ export class Brain {
         tvx = (tx - a.x) / d * sp; tvz = (tz - a.z) / d * sp;
       }
     }
-    if (a.state === ST.HOLD) a.holdT += dt;
+    if (a.state === ST.HOLD) {
+      a.holdT += dt;
+      // v0.6: at a cover point: into its shadow, or out to the peek point
+      if (a.coverI >= 0 && a.flinchT <= 0) {
+        const C = this.cover, k = a.coverI;
+        const gx = a.peekOut ? C.px[k] : C.x[k], gz = a.peekOut ? C.pz[k] : C.z[k];
+        const d = Math.sqrt((gx - a.x) * (gx - a.x) + (gz - a.z) * (gz - a.z));
+        if (d > 0.06) { const sp = Math.min(AI.walkAim * a.speedK, d * 3); tvx = (gx - a.x) / d * sp; tvz = (gz - a.z) / d * sp; }
+      }
+    }
+    // v0.6: a hit's stagger (pushes him along the round, decays fast; walls still stop him)
+    const sgx = a.stagX, sgz = a.stagZ;
+    if (a.stagX !== 0 || a.stagZ !== 0) {
+      const kk = 1 - dt / AI.staggerTau, f = kk > 0 ? kk : 0;
+      a.stagX *= f; a.stagZ *= f;
+      if (a.stagX * a.stagX + a.stagZ * a.stagZ < 1e-4) { a.stagX = 0; a.stagZ = 0; }
+    }
     // mates: keep apart
     for (let j = 0; j < this.n; j++) {
       const o = this.agents[j];
@@ -564,8 +763,8 @@ export class Brain {
     const dvx = tvx - a.vx, dvz = tvz - a.vz, dv = Math.sqrt(dvx * dvx + dvz * dvz), mx = AI.accel * dt;
     if (dv > mx) { a.vx += dvx / dv * mx; a.vz += dvz / dv * mx; } else { a.vx = tvx; a.vz = tvz; }
     // move, never off walkable cells, never within keepAway (x and z first, then each alone)
-    if (a.vx !== 0 || a.vz !== 0) {
-      const nx = a.x + a.vx * dt, nz = a.z + a.vz * dt;
+    if (a.vx !== 0 || a.vz !== 0 || sgx !== 0 || sgz !== 0) {
+      const nx = a.x + (a.vx + sgx) * dt, nz = a.z + (a.vz + sgz) * dt;
       const nav = w ? w.nav : null, Q = this.Q, keep = AI.keepAway;
       const ex0 = a.x - this.px, ez0 = a.z - this.pz, d0 = ex0 * ex0 + ez0 * ez0;
       let moved = false;
@@ -590,7 +789,11 @@ export class Brain {
     if (a.state === ST.MOVE && a.pathN > 1) {
       a.progT += dt;
       if (a.progT >= AI.stuckWindow) {
-        if (Math.sqrt((a.x - a.progX) * (a.x - a.progX) + (a.z - a.progZ) * (a.z - a.progZ)) < AI.stuckDist && a.flinchT <= 0) {
+        if (Math.sqrt((a.x - a.progX) * (a.x - a.progX) + (a.z - a.progZ) * (a.z - a.progZ)) < AI.stuckDist && a.flinchT <= 0 && pd < AI.keepAway + 0.6 && a.los) {
+          // v0.6: held up by the keep-away ring with you in sight (his path runs past you): he fights from here
+          // (v0.5 and before: he pressed on in MOVE for the rest of the wave, re-planning every 0.7 s)
+          a.state = ST.HOLD; a.holdT = 0; a.pathN = 0; a.goalX = a.x; a.goalZ = a.z;
+        } else if (Math.sqrt((a.x - a.progX) * (a.x - a.progX) + (a.z - a.progZ) * (a.z - a.progZ)) < AI.stuckDist && a.flinchT <= 0) {
           a.repaths++;
           this.stats.repaths++;
           if (this.planner && a.hasGoal) { this.planner.request(a.i, a.x, a.z, a.goalX, a.goalZ); a.pathWait = true; a.pathN = 0; }

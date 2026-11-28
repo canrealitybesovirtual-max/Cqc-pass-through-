@@ -3,6 +3,7 @@ import { VERSION } from '../version.js';
 import { Game, S } from './Game.js';
 import { Loop } from './Loop.js';
 import { PLAY_SYSTEMS } from './Play.js';
+import { MODE_NAME, modeFrom } from '../game/Rules.js';
 import { MODES, attachSession, errText, featuresFor, frameRates, playStyle, requestXR, spaceNote } from '../xr/XRSession.js';
 import { Input } from '../xr/Input.js';
 import { Lifecycle } from '../xr/Lifecycle.js';
@@ -30,6 +31,8 @@ const GAME_MODES = new Set(['play', 'spot', 'reduced']);
 /** The probe panel sits this far left of straight ahead, so it never hides the test cube. */
 const PROBE_PANEL_YAW = 0.6;
 /** Play asks for this refresh rate (the Quest's AR default is 90 Hz, DEVICE_LOG p1.0). */
+/** v0.6: the compositor's refresh-rate switch settles within this (ms; logged as gaps). */
+const RATE_SETTLE_MS = 400;
 const PLAY_HZ = 72;
 /** XR input events that count as user activation: the audio context may resume from them. */
 const GESTURE_EVENTS = ['selectstart', 'select', 'squeeze'];
@@ -77,6 +80,10 @@ export class App {
     this.cfg = { depth: false, bodyTracking: false, space: 'auto', scale: 1.0, foveation: 0.5, learn: true };
     /** v0.5: the next play session starts with the walkthrough scan (the page's Scan house button). */
     this.scanNext = false;
+    /** v0.6: the game mode of the next play session ('survival' | 'clear' | 'defend'): the page's buttons set it. */
+    this.gameMode = 'survival';
+    /** `?mode=` (desktop tests): the mode of every play session, whichever button. */
+    this.urlMode = typeof location !== 'undefined' && /[?&]mode=/.test(location.search) ? MODE_NAME[modeFrom(location.search)] : '';
     /** v0.5: the first play in a house with nothing learned starts with the scan (`?scan=0`: never on its own). */
     this.autoScan = true;
     /** @type {XRSession|null} */ this.session = null;
@@ -252,14 +259,16 @@ export class App {
       F.target = PLAY_HZ;
       F.request = 'pending';
       try {
-        s.updateTargetFrameRate(PLAY_HZ).then(() => { F.request = 'ok'; F.attrAfter = s.frameRate ?? null; perf.mark(`rate ${PLAY_HZ}`); },
+        s.updateTargetFrameRate(PLAY_HZ).then(() => { F.request = 'ok'; F.attrAfter = s.frameRate ?? null; perf.mark(`rate ${PLAY_HZ}`); perf.settle(RATE_SETTLE_MS); },
           (/** @type {unknown} */ e) => { F.request = `failed: ${errText(e)}`; });
       } catch (e) { F.request = `threw: ${errText(e)}`; }
     } else F.request = rates.length ? `${PLAY_HZ} Hz not offered (${rates.join('/')})` : 'no frame-rate API';
     this.watchAudio(kit, session, rec);
     const scan = this.scanNext ? 'explicit' : this.autoScan ? 'auto' : 'off';
     this.scanNext = false;
-    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [], ...how, scan, liveDepth: this.liveDepth });
+    const gameMode = this.urlMode || this.gameMode;
+    this.gameMode = 'survival';
+    kit.begin({ session, space, rec, perf, warmed: this.preload ? this.preload.warmed : [], ...how, scan, liveDepth: this.liveDepth, gameMode });
     for (const s of kit.systems()) loop.add(s);
     loop.add({
       name: 'ui',

@@ -299,6 +299,36 @@ Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g)
 
 See DEVICE_LOG "v0.5: tests to run": Scan house and walk bedroom → hall → living room; is the floor glow the only thing you see; does the watch count rooms; do soldiers now come through the hall; reload: no scan, hall still open; any new permission prompt; any stutter.
 
+## v0.6: room clearing, home defense, smarter enemies, the v0.5 record's bugs (desktop only)
+
+Desktop = headless Chromium with SwiftShader and IWER (`NODE_PATH=$(npm root -g) node tests/e2e/emulate.mjs`, 176 checks, incl. both house replays) plus `npm test` (677 tests). **Nothing in this section has run on the Quest yet.** The user's v0.5 house is replayed from `tests/fixtures/house-v05-device.json` (Space Setup + the learned overlay rebuilt from the world report).
+
+### Bugs from the v0.5 device record
+
+| Item | Status | Notes |
+|---|---|---|
+| XR warm draw in 4 frames; the scan starts in its own frame | desktop-tested | The record: 9.8 ms warm draw + scan start = 12.5 ms in one frame. Node: every drawable drawn in one of the parts, baseline after the last; e2e: warm and scan as before |
+| Static colliders: the old set stays until the new one exists, then goes in slices; 1.5 ms slices while the view is open; items keep stepping on the old set during a learned rebuild | desktop-tested | The record: 10.4 ms in one wave-break frame. Node (Rapier): both sets stand at once, removal in its own slices, no collider leaked; a gun dropped mid-rebuild lands on the old table; a realign still freezes items |
+| The 72 Hz switch's intervals logged as gaps; hitches carry phase / enemies alive / draw calls / cause class; misses per phase | desktop-tested | Node tests. The record's 36 low-CPU misses (outside our callback) need the next device run's `perf.byPhase` |
+| Path finding: weighted A* with the door fields as landmarks | desktop-tested | Replay of the v0.5 house: p95 expansions 2,708 → ~550, searches over one frame's quota 49 % → ~4 %, total path length not longer |
+| Safety log one entry per stay; heap `quantized`; depth tap report after detach; the learned overlay in the record | desktop-tested | Node / e2e |
+| v0.5 house replay: no enemy pixels through real walls or in unscanned space; spawn candidates; build matches the headset | desktop-tested | `replay-house.mjs` (both houses; leaks confirmed by a solo draw) and `world.house-v05.test.js` |
+
+### Gameplay
+
+| Item | Status | Notes |
+|---|---|---|
+| Page buttons **Clear the house** / **Defend the house** (Enter MR = survival); `?mode=` | desktop-tested | e2e: both sessions start in their mode |
+| Room clearing: defenders hidden at real cover in the rooms you are not in, still until they see or hear you, tethered to their room; rooms cleared; "House clear" + time | desktop-tested | Node on the v0.5 house: ≥ 2 rooms held, nobody moves while you are away, the defender sees you come in and fires, nobody leaves his room; Rules: the time, the cap of 6, the survival fallback. e2e (fixture house): all placed at the wave start in the other room, at cover, nothing compiled |
+| Home defense: stacks of 2–3 through one exterior door each, hidden behind it, ≥ 3.5 m from you | desktop-tested | Rules Node test (stacks, gaps, one door per stack, ≤ 5 alive, waves grow); breach spawns on the v0.5 house; e2e: the wave starts in the mode |
+| Enemies: real cover (furniture, door frames), peek and duck, bounding, stagger, hold at the keep-away ring | desktop-tested | Node: cover points walkable with walkable peeks; survival run on the v0.5 house uses cover and defers; the stagger pushes along the round and never off the nav; brain suite unchanged (slots, keep-away, reaction) |
+| Voice callouts | not built | The sound bank has no voice lines (grunts only) |
+| FSB operator model | not built | Not in `/home/user/ref/realism-cqc-realism/cqc/models` |
+
+### Ask in the headset (keep it short)
+
+See DEVICE_LOG "v0.6: tests to run": Clear the house; Defend the house; do enemies use your furniture and door frames; any stutter.
+
 ## Later phases
 
 These items are planned, as in PLAN §12.

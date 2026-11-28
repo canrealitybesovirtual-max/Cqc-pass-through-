@@ -1,7 +1,8 @@
 // @ts-check
 import * as THREE from 'three';
 import { GlyphPanel } from '../ui/GlyphPanel.js';
-import { MSG, PAUSE, PHASE, PHASE_NAME, RULES, SurvivalRules } from './Rules.js';
+import { MODE, MODE_NAME, MSG, PAUSE, PHASE, PHASE_NAME, RULES, SPAWN_KIND, SurvivalRules } from './Rules.js';
+import { breachDoors, breachSpawn, planHides } from '../world/Cover.js';
 import { claimUpload } from './UploadGate.js';
 import { PAUSE_NAMES, SAFETY, VIOLATION, VIOLATION_NAMES, pauseName } from '../safety/PauseManager.js';
 import { OBSTACLE, ObstacleWarnings, POINT } from '../safety/ObstacleWarnings.js';
@@ -220,7 +221,10 @@ export class GameSession {
     };
 
     const host = {
-      spawn: () => this._spawn(),
+      spawn: (/** @type {number} */ kind, /** @type {number} */ door) => this._spawn(kind, door),
+      hides: () => this._planHides(),
+      breachDoors: () => this._planBreach(),
+      cleared: (/** @type {number} */ sec, /** @type {number} */ k) => this._houseCleared(sec, k),
       alive: () => (this.enemies ? this.enemies.alive() : 0),
       waveStart: (/** @type {number} */ w, /** @type {number} */ n) => this._waveStart(w, n),
       waveClear: (/** @type {number} */ w) => this._waveClear(w),
@@ -231,6 +235,17 @@ export class GameSession {
       exit: (/** @type {string} */ r) => this.requestExit(r),
     };
     this.rules = new SurvivalRules(host, { seed, runPause: !this.roam });
+    /** v0.6: the game mode (MODE: survival, room clearing, home defense); setGameMode between rounds. */
+    this.gameMode = MODE.SURVIVAL;
+    /** @type {{ x: number, z: number, yaw: number, room: number, cover: number }[]} room clearing's defenders */
+    this._hides = [];
+    this._hideI = 0;
+    /** @type {number[]} home defense: the Roam index's exterior doors */
+    this._breach = [];
+    /** Room clearing: rooms with defenders, and when each was cleared (s into the round). */
+    /** @type {{ room: number, defenders: number, clearedS: number|null }[]} */ this._rooms = [];
+    this.modeStats = { breaches: 0, breachFallbacks: 0, hidesPlaced: 0, hideFails: 0, best: null };
+    this._rng = (seed || 0x51ed) >>> 0 || 1;
 
     // event payloads (reused)
     this._pWave = { wave: 0, enemies: 0 };
@@ -1032,7 +1047,7 @@ export class GameSession {
       case MSG.GET_READY: return LINES.ready;
       case MSG.WAVE: return n < WAVE_LINES.length ? WAVE_LINES[n] : [`Wave ${n}`];
       case MSG.CLEARED: return n < CLEAR_LINES.length ? CLEAR_LINES[n] : [`Wave ${n} cleared`];
-      case MSG.OVER: return this._overLines;
+      case MSG.OVER: case MSG.HOUSE_CLEAR: return this._overLines;
       case MSG.ZONE: return LINES.zone;
       case MSG.PAUSED: return LINES.paused;
       case MSG.HOLD: return LINES.hold;
@@ -1049,12 +1064,110 @@ export class GameSession {
 
   // ── rules host ───────────────────────────────────────────────────────────
 
-  /** @returns {boolean|number} true / 1 placed, 2 still searching (Roam), false failed */
-  _spawn() {
+  /**
+   * v0.6: the game mode (MODE or its name); takes effect at the next start (Play restarts the round).
+   * @param {number|string} m
+   */
+  setGameMode(m) {
+    const v = typeof m === 'string' ? MODE_NAME.indexOf(m) : m;
+    this.gameMode = v === MODE.CLEAR || v === MODE.DEFEND ? v : MODE.SURVIVAL;
+    this.rules.setMode(this.gameMode);
+  }
+
+  get gameModeName() { return MODE_NAME[this.gameMode]; }
+
+  /** xorshift32 in [0, 1) (round-start planning only). */
+  _rand() {
+    let x = this._rng;
+    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    this._rng = x || 1;
+    return x / 4294967296;
+  }
+
+  /** Room clearing, at the wave start: where the defenders wait (allocates: once a round). */
+  _planHides() {
+    const w = /** @type {any} */ (this.ctx.world), e = /** @type {any} */ (this.enemies), p = this.ctx.player;
+    this._hides = [];
+    this._hideI = 0;
+    this._rooms = [];
+    if (!w || !e || !p || !e.cover) return 0;
+    if (e.cover.version !== (w.nav ? w.nav.version : -1) || !e.cover.ready) e.cover.build(w); // normally built in slices long before
+    this._hides = planHides(w, e.cover, p.head.x, p.head.z, RULES.clearMax, () => this._rand());
+    for (const h of this._hides) {
+      const r = this._rooms.find((q) => q.room === h.room);
+      if (r) r.defenders++; else this._rooms.push({ room: h.room, defenders: 1, clearedS: null });
+    }
+    return this._hides.length;
+  }
+
+  /** Home defense, at each wave start: the exterior doors. */
+  _planBreach() {
+    const w = this.ctx.world, o = this._spawnAt;
+    // only doors with room behind them for a man (a probe from far away: the player's distance does not count)
+    this._breach = breachDoors(w).filter((k) => breachSpawn(w, k, 1e6, 1e6, o, 0.5));
+    return this._breach.length;
+  }
+
+  /**
+   * Room clearing: every defender is down (the rules' round is over). The time is the score.
+   * @param {number} sec @param {number} k
+   */
+  _houseCleared(sec, k) {
+    const m = Math.floor(sec / 60), ss = Math.floor(sec % 60);
+    const best = this.modeStats.best;
+    if (best === null || sec < best) this.modeStats.best = Math.round(sec * 10) / 10;
+    this._overLines = ['House clear — Y to restart', `${m}:${ss < 10 ? '0' : ''}${ss} · ${k} ${k === 1 ? 'kill' : 'kills'}`];
+    this._msgKey = -1;
+    this._pOver.wave = 1;
+    this._pOver.kills = k;
+    this.ctx.events.emit('roundOver', this._pOver);
+  }
+
+  /**
+   * The session record's view of the mode (allocates).
+   */
+  modeReport() {
+    const R = this.rules;
+    return {
+      mode: MODE_NAME[this.gameMode], roundS: Math.round(R.roundS * 10) / 10,
+      ...(this.gameMode === MODE.CLEAR ? { defenders: this._hides.length, rooms: this._rooms.map((r) => ({ ...r })), cleared: R.cleared,
+        clearS: R.cleared ? Math.round(R.clearS * 10) / 10 : null, bestS: this.modeStats.best,
+        hidesPlaced: this.modeStats.hidesPlaced, hideFails: this.modeStats.hideFails } : {}),
+      ...(this.gameMode === MODE.DEFEND ? { breachDoors: this._breach.slice(), wavesHeld: R.wavesHeld, breaches: this.modeStats.breaches,
+        breachFallbacks: this.modeStats.breachFallbacks } : {}),
+    };
+  }
+
+  /**
+   * @param {number} [kind] SPAWN_KIND (survival: ROAM)
+   * @param {number} [door] home defense: index into the breach doors
+   * @returns {boolean|number} true / 1 placed, 2 still searching (Roam), false failed
+   */
+  _spawn(kind = SPAWN_KIND.ROAM, door = 0) {
     const w = this.ctx.world, e = this.enemies, p = this.ctx.player;
     if (!w || !e || !p || typeof w.findSpawn !== 'function') return false;
-    const f = p.flatForward || p.forward;
     const o = this._spawnAt;
+    if (kind === SPAWN_KIND.HIDE) {
+      // room clearing: the next planned hide, hidden and waiting in his room
+      const h = this._hides[this._hideI++];
+      if (!h) { this.modeStats.hideFails++; return false; }
+      const i = e.spawn(h.x, h.z, h.yaw);
+      if (i < 0) { this.modeStats.hideFails++; return false; }
+      const ea = /** @type {any} */ (e);
+      if (typeof ea.setAmbush === 'function') ea.setAmbush(i, h.room, h.cover);
+      this.modeStats.hidesPlaced++;
+      return true;
+    }
+    if (kind === SPAWN_KIND.BREACH && this._breach.length) {
+      // home defense: right behind the stack's exterior door (unscanned space: hidden until he steps through)
+      const k = this._breach[door % this._breach.length];
+      if (breachSpawn(w, k, p.head.x, p.head.z, o, this._rand())) {
+        this.modeStats.breaches++;
+        return e.spawn(o.x, o.z, Math.atan2(p.head.x - o.x, p.head.z - o.z)) >= 0;
+      }
+      this.modeStats.breachFallbacks++; // no room behind that door: as in survival
+    }
+    const f = p.flatForward || p.forward;
     if (this.roam && typeof w.spawnRoamFor === 'function') {
       const r = w.spawnRoamFor(p, o);
       if (r === 2) return 2;
@@ -1111,6 +1224,10 @@ export class GameSession {
   }
 
   _restart() {
+    this._hides = [];
+    this._hideI = 0;
+    const M = this.modeStats;
+    M.breaches = M.breachFallbacks = M.hidesPlaced = M.hideFails = 0; // per round (the best time stays for the page session)
     if (this.enemies) this.enemies.reset();
     if (this.weapons && typeof this.weapons.reset === 'function') this.weapons.reset();
     this._tintT = 0;
@@ -1150,7 +1267,17 @@ export class GameSession {
   }
 
   /** @param {{ headshot: boolean }} e */
-  _onEnemyKilled(e) { this.rules.kill(!!(e && e.headshot)); }
+  _onEnemyKilled(e) {
+    this.rules.kill(!!(e && e.headshot));
+    // room clearing: a room counts clear when its last defender is down
+    if (this.gameMode === MODE.CLEAR && e && this._rooms.length) {
+      const en = /** @type {any} */ (this.enemies), a = en && en.brain ? en.brain.agents[e.enemy] : null;
+      if (a && a.home) {
+        const r = this._rooms.find((q) => q.room === a.home);
+        if (r && r.clearedS === null && en.aliveInRoom(a.home) === 0) r.clearedS = Math.round(this.rules.roundS * 10) / 10;
+      }
+    }
+  }
 
   /** An enemy shot while paused is a safety violation (PLAN §6.2). */
   _onEnemyShot() { if (this.rules.paused) this.rules.pm.violation(VIOLATION.SHOT); }

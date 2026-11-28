@@ -449,3 +449,42 @@ test('zero allocation while everything rests: 20,000 frames of step() and readPo
   }
   assert.equal(best, 0, JSON.stringify(by));
 });
+
+test('v0.6 rebuild: the old static colliders stay until the new ones exist, then go in slices; a rested gun stays put', () => {
+  const P = world();
+  const n0 = P.staticCols.length, total0 = P.world.colliders.len();
+  // a rebuild of the same house: old and new stand together until the new build is complete
+  let calls = 0;
+  P.beginStatic(houseStatics());
+  assert.equal(P.ready, false);
+  assert.ok(P._oldCols.length === n0 && P.staticCols.length === 0);
+  let both = false;
+  while (!P.buildSlice(0.05)) { calls++; if (P._oldCols.length && P.staticCols.length === n0) both = true; assert.ok(calls < 10000); }
+  assert.ok(both, 'there was a frame with the new set complete and the old one not yet removed');
+  assert.ok(calls > 1, 'the removal took its own slices');
+  assert.equal(P._oldCols.length, 0);
+  assert.equal(P.staticCols.length, n0);
+  assert.equal(P.world.colliders.len(), total0, 'no collider leaked');
+  assert.equal(P.staticInfo.size, n0, 'the surface table holds the new set only');
+});
+
+test('v0.6 learned rebuild (keepOld): items keep stepping on the previous set while the new one is built', () => {
+  const P = world();
+  const out = new Float64Array(7);
+  P.beginStatic(houseStatics(), true);
+  assert.equal(P.ready, false);
+  assert.equal(P.usable, true);
+  // a gun dropped onto the table mid-rebuild lands on it (the old table still stands)
+  const T = HOUSE.planes.find((p) => p.label === 'table');
+  const ty = T.pose[13];
+  const id = P.spawn(K_GLOCK, pose(T.pose[12], ty + 0.3, T.pose[14], 0, 0, 1, Math.PI / 2), 0, 0, 0, 0, 0, 0);
+  assert.ok(id >= 0);
+  for (let t = 0; t < 4 && P.state(id) !== ST_RESTING; t += DT) { P.step(DT); P.buildSlice(0.02); }
+  P.pose(id, out, 0);
+  assert.ok(out[1] > ty - 0.01 && out[1] < ty + 0.06, `on the table at ${out[1].toFixed(3)} (top ${ty})`);
+  // without keepOld (a realign) nothing steps until the new set exists
+  const Q = world();
+  Q.beginStatic(houseStatics());
+  assert.equal(Q.usable, false);
+  assert.equal(Q.step(DT), 0);
+});

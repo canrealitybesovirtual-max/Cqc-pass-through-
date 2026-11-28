@@ -289,14 +289,18 @@ function detach(set) {
  * empty instanced pools drawn with one instance, LOD auto-switching off (every
  * level is a drawable child and is forced visible itself).
  * @param {WarmSet} set
+ * @param {number} [from] first drawable (v0.6: the XR warm draw in parts)
+ * @param {number} [to] one past the last
  * @returns {Forced}
  */
-function force(set) {
+function force(set, from = 0, to = Infinity) {
   /** @type {Forced} */
   const f = { objs: [], vis: [], culled: [], cull: [], inst: [], count: [], lods: [], auto: [] };
   /** @type {Set<THREE.Object3D>} */
   const saved = new Set();
-  for (const d of set.drawables) {
+  const D = set.drawables, end = Math.min(D.length, to);
+  for (let k = Math.max(0, from); k < end; k++) {
+    const d = D[k];
     /** @type {THREE.Object3D|null} */
     let o = d;
     while (o && !saved.has(o)) {
@@ -449,10 +453,13 @@ export async function warmUp(renderer, scenes, objects, onProgress, opt = {}) {
  * @param {THREE.Scene} scene  hosts objects that are not in a scene
  * @param {THREE.Camera} camera  the scene camera (three substitutes the XR camera)
  * @param {readonly (THREE.Object3D|null|undefined)[]} [objects]
- * @param {{ now?: () => number }} [opt]
+ * @param {{ now?: () => number, part?: number, parts?: number }} [opt]
  * @returns {WarmXRReport}
  */
 export function warmXR(renderer, scene, camera, objects = [], opt = {}) {
+  // v0.6: `part` of `parts` draws only that share of the drawables (the device record: the whole draw was 9.8 ms
+  // in one frame); the baseline moves after the last part.
+  const parts = opt.parts && opt.parts > 1 ? opt.parts | 0 : 1, part = parts > 1 ? Math.min(parts - 1, Math.max(0, opt.part | 0)) : 0;
   const r = /** @type {any} */ (renderer);
   const now = opt.now || clock;
   const t0 = now();
@@ -468,7 +475,8 @@ export function warmXR(renderer, scene, camera, objects = [], opt = {}) {
   const attached = set.roots.length;
   const callsBefore = r.info.render.calls;
   try {
-    const forced = force(set);
+    const n = set.drawables.length, per = Math.ceil(n / parts);
+    const forced = force(set, part * per, (part + 1) * per);
     try {
       for (const s of sceneList) r.render(s, camera);
     } finally {
@@ -479,8 +487,13 @@ export function warmXR(renderer, scene, camera, objects = [], opt = {}) {
   }
   const calls = r.info.render.calls - callsBefore;
   const ref = prev || before;
+  if (part < parts - 1) {
+    const c = countsOf(r);
+    return { skipped: '', part, parts, ms: now() - t0, drawables: set.drawables.length, calls, attached, primed: set.primed,
+      grew: { programs: c.programs - ref.programs, textures: c.textures - ref.textures, geometries: c.geometries - ref.geometries }, ...c };
+  }
   const b = recordBaseline(r, 'warmXR');
-  return {
+  return { part, parts,
     skipped: '', ms: now() - t0, drawables: set.drawables.length, calls, attached, primed: set.primed,
     grew: { programs: b.programs - ref.programs, textures: b.textures - ref.textures, geometries: b.geometries - ref.geometries },
     programs: b.programs, textures: b.textures, geometries: b.geometries,

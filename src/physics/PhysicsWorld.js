@@ -145,6 +145,11 @@ export class PhysicsWorld {
     // ── statics
     /** @type {import('./StaticGeometry.js').StaticGeometry|null} */ this.geo = null;
     /** @type {any[]} */ this.staticCols = [];
+    /** v0.6: the previous build's colliders, removed in slices once the new ones exist (the device record:
+     * removing ~170 colliders and creating new ones in one frame took 10.4 ms in a wave break). */
+    /** @type {any[]} */ this._oldCols = [];
+    /** v0.6: the previous complete set still stands and items may step on it while the new one is built. */
+    this._oldUsable = false;
     /** handle → surf | role << 4 */ this.staticInfo = new Map();
     this._ready = false;
     this._job = 0;
@@ -235,6 +240,8 @@ export class PhysicsWorld {
 
   /** The static colliders are complete (items step only then). */
   get ready() { return this._ready && !this.guard.failed; }
+  /** Items can step: the statics are built, or the previous complete set stands (v0.6). */
+  get usable() { return (this._ready || this._oldUsable) && !this.guard.failed; }
   /** Physics threw: off for the session. */
   get failed() { return this.guard.failed; }
 
@@ -290,16 +297,18 @@ export class PhysicsWorld {
 
   /**
    * Start (re)building the static colliders: the old ones go now, the new ones in `buildSlice`.
-   * Items freeze (no steps) until it is done, then wake.
+   * Items freeze (no steps) until it is done, then wake; v0.6: with `keepOld` (a rebuild of the same house in
+   * the same coordinates: a learned rebuild in a wave break) they keep stepping on the previous complete set,
+   * which stands until the new one exists.
    * @param {import('./StaticGeometry.js').StaticGeometry|null} geo
+   * @param {boolean} [keepOld]
    */
-  beginStatic(geo) {
+  beginStatic(geo, keepOld = false) {
     if (this.guard.failed) return;
-    try {
-      for (const c of this.staticCols) this.world.removeCollider(c, false);
-    } catch (e) { this.guard.fail(e, 'beginStatic'); return; }
+    // the old colliders stay until the new ones exist (no steps meanwhile), then go in slices (removeSlice)
+    this._oldUsable = !!keepOld && (this._ready || this._oldUsable) && !!geo;
+    for (let i = 0; i < this.staticCols.length; i++) this._oldCols.push(this.staticCols[i]);
     this.staticCols.length = 0;
-    this.staticInfo.clear();
     this.geo = geo;
     this._ready = false;
     this._job = 0;
@@ -309,7 +318,12 @@ export class PhysicsWorld {
     B.slabs = B.prisms = B.chunks = B.tris = B.frames = 0;
     B.maxSliceMs = 0; B.ms = 0; B.oneSided = false; B.source = geo ? geo.source || 'world' : 'none';
     this._buildT0 = 0;
-    if (!geo) { this._jobs = 0; return; }
+    if (!geo) {
+      this._jobs = 0;
+      try { for (const c of this._oldCols) { this.staticInfo.delete(c.handle); this.world.removeCollider(c, false); } } catch (e) { this.guard.fail(e, 'beginStatic'); }
+      this._oldCols.length = 0;
+      return;
+    }
     const m = geo.mesh;
     this._tiles = false;
     if (m && m.vertices && m.indices && m.indices.length >= 3) {
@@ -349,10 +363,22 @@ export class PhysicsWorld {
       const ms = this.clock() - t0;
       if (ms > B.maxSliceMs) B.maxSliceMs = ms;
       if (this._job < this._jobs) return false;
+      // v0.6: then the previous build's colliders, in slices of the same budget
+      if (this._oldCols.length) {
+        do {
+          const c = this._oldCols.pop();
+          this.staticInfo.delete(c.handle);
+          W.removeCollider(c, false);
+        } while (this._oldCols.length && this.clock() - t0 < budgetMs);
+        const ms2 = this.clock() - t0;
+        if (ms2 > B.maxSliceMs) B.maxSliceMs = ms2;
+        if (this._oldCols.length) return false;
+      }
       // the scene queries see new colliders only after a step: one step now (items wake below)
       W.step();
       this.stats.steps++;
       this._ready = true;
+      this._oldUsable = false;
       B.ms = this.clock() - this._buildT0;
       this._wakeAll();
       return true;
@@ -570,7 +596,7 @@ export class PhysicsWorld {
     this.timeS += dt;
     this.stats.frames++;
     if (this._landAny) { this.land.fill(0); this._landAny = false; }
-    if (!this._ready) return 0;
+    if (!this._ready && !this._oldUsable) return 0;
     try { this._flush(); } catch (e) { this.guard.fail(e, 'flush'); return 0; }
     this._lostClock += dt;
     if (this._lostClock >= PHYS.lostCheckS) { this._checkLost(this._lostClock); this._lostClock = 0; }
@@ -799,7 +825,7 @@ export class PhysicsWorld {
    */
   release(kind, p7, hist, out, rounds = -1) {
     out.mode = PLACE_STUCK; out.setDown = true; out.lin = 0; out.ang = 0;
-    if (this.guard.failed || !this._ready) return -1;
+    if (this.guard.failed || (!this._ready && !this._oldUsable)) return -1;
     const K = this.kinds[kind];
     if (!K) return -1;
     const V = this._vel;
@@ -833,7 +859,7 @@ export class PhysicsWorld {
    * @returns {number} PLACE_*
    */
   placeAt(kind, p7) {
-    if (this.guard.failed || !this._ready) return PLACE_STUCK;
+    if (this.guard.failed || (!this._ready && !this._oldUsable)) return PLACE_STUCK;
     const K = this.kinds[kind];
     if (!K || !okVec(p7[0], p7[1], p7[2], 1e4) || !okQuat(p7[3], p7[4], p7[5], p7[6])) return PLACE_STUCK;
     try {
@@ -927,7 +953,7 @@ export class PhysicsWorld {
    * @param {number} kind @param {ArrayLike<number>} p7
    */
   gapBelow(kind, p7) {
-    if (this.guard.failed || !this._ready) return Infinity;
+    if (this.guard.failed || (!this._ready && !this._oldUsable)) return Infinity;
     const K = this.kinds[kind];
     if (!K || !okVec(p7[0], p7[1], p7[2], 1e4) || !okQuat(p7[3], p7[4], p7[5], p7[6])) return Infinity;
     try {
@@ -1191,6 +1217,7 @@ export class PhysicsWorld {
     this.world = null;
     this.fixed = null;
     this.staticCols.length = 0;
+    this._oldCols.length = 0;
     this.bodies.fill(null);
     this._ready = false;
   }

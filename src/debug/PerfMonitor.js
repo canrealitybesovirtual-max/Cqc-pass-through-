@@ -89,6 +89,13 @@ export class PerfMonitor {
     this.prevCpu = 0;
     this.prevInterval = 0;
     this.prevSys = new Float32Array(this.nSys);
+    this.prevCalls = 0;
+    /** v0.6: the game's phase (index into PERF_TAGS) and enemies alive, set once a frame: hitches by phase. */
+    this.tag = 0;
+    this.alive = 0;
+    this.tagFrames = new Uint32Array(8);
+    this.tagMissed = new Uint32Array(8);
+    this.tagMissedCpu = new Uint32Array(8);
     this.late = 0;
     /** CPU time of the last finished frame (ms): the learner skips its work after a frame near budget. */
     this.lastCpu = 0;
@@ -97,6 +104,7 @@ export class PerfMonitor {
     this.gaps = new Float32Array(this.gapCapacity * 2);
     this.gapMarker = new Uint16Array(this.gapCapacity);
     this.gapCount = 0;
+    this.settleUntil = -1;
     // Whole session: interval and CPU histograms, per-system sums and peaks, late peak
     this.sessHistInterval = new Uint32Array(BINS);
     this.sessHistCpu = new Uint32Array(BINS);
@@ -187,6 +195,14 @@ export class PerfMonitor {
     this.markAt = this.now();
   }
 
+  /**
+   * v0.6: the compositor is switching (a refresh-rate change behind the opaque card): missed intervals in the
+   * next `ms` are logged as gaps (with the marker), not hitches. The v0.5 record: 90, 40, 48, 30, 22 ms right
+   * after the 72 Hz switch resolved, at 2–4 ms CPU.
+   * @param {number} ms
+   */
+  settle(ms) { this.settleUntil = this.now() + ms; }
+
   /** Call when frames stop (pause, session end) so the gap isn't counted. */
   resetTiming() { this.skipNext = true; this.lastT = -1; }
 
@@ -220,6 +236,11 @@ export class PerfMonitor {
       this._keepPrev(cpu, 0);
       return;
     }
+    if (this.frameStart < this.settleUntil && iv > 1.5 * this.periodMs) {
+      this._gap(iv);
+      this._keepPrev(cpu, iv);
+      return;
+    }
     this._measure(iv);
     const h = this.head;
     this.ringInterval[h] = iv;
@@ -243,8 +264,12 @@ export class PerfMonitor {
     if (late > this.sessLateMax) this.sessLateMax = late;
 
     const missed = iv > 1.5 * this.periodMs;
+    const tg = this.tag & 7;
+    this.tagFrames[tg]++;
     if (missed) {
       this.sessMissed++;
+      this.tagMissed[tg]++;
+      if (cpu > 0.6 * this.periodMs || this.prevCpu > 0.8 * this.periodMs || this.late > 4) this.tagMissedCpu[tg]++;
       if (this.hitchCount < this.hitchCapacity) {
         const k = this.hitchCount, o = k * this.hitchStride, H = this.hitches, n = this.nSys;
         H[o] = this.lastT;
@@ -254,6 +279,10 @@ export class PerfMonitor {
         H[o + 4] = this.prevCpu;
         H[o + 5] = this.prevInterval;
         H[o + 6] = -1; // the next interval: the following frame fills it in
+        H[o + 8] = drawCalls;
+        H[o + 9] = this.prevCalls;
+        H[o + 10] = tg;
+        H[o + 11] = this.alive;
         const age = this.frameStart - this.markAt;
         if (this.markCode && age <= MARKER_MS) {
           this.hitchMarker[k] = this.markCode;
@@ -286,6 +315,7 @@ export class PerfMonitor {
       if (this.lastT - this.runStart >= this.runDuration) this._finishRun();
     }
     this._keepPrev(cpu, iv);
+    this.prevCalls = drawCalls;
   }
 
   /** This frame becomes the "previous frame" of the next hitch entry. @param {number} cpu @param {number} iv */
@@ -423,6 +453,9 @@ export class PerfMonitor {
       e.prev = prev;
       e.marker = this.markerNames[this.hitchMarker[k]];
       e.markerAgeMs = H[o + 7] >= 0 ? Math.round(H[o + 7]) : null;
+      e.calls = H[o + 8]; e.prevCalls = H[o + 9]; e.phase = PERF_TAGS[H[o + 10]] || 'other'; e.alive = H[o + 11];
+      // v0.6: 'cpu' = our callback (or the one before) ran long or late; 'outside' = the frame missed with our CPU low
+      e.cls = H[o + 2] > 0.6 * this.periodMs || H[o + 4] > 0.8 * this.periodMs || H[o + 3] > 4 ? 'cpu' : 'outside';
       out.push(e);
     }
     const gaps = [];
@@ -447,13 +480,26 @@ export class PerfMonitor {
       interval: { p50: pct(H, n, 0.5), p95: pct(H, n, 0.95), p99: pct(H, n, 0.99), p999: pct(H, n, 0.999), hist: bins(H) },
       cpu: { p50: pct(C, n, 0.5), p95: pct(C, n, 0.95), p99: pct(C, n, 0.99), p999: pct(C, n, 0.999), hist: bins(C) },
       lateMs: { avg: n ? round2(this.sessLateSum / n) : 0, max: round2(this.sessLateMax) },
-      systems, gaps: this.gapCount, markers: this.markerNames.length - 1,
+      systems, gaps: this.gapCount, markers: this.markerNames.length - 1, byPhase: this.phaseReport(),
     };
+  }
+
+  /** v0.6: frames and missed frames per game phase (missedCpu: those our callback caused). */
+  phaseReport() {
+    /** @type {Record<string, { frames: number, missed: number, missedCpu: number, perMin: number }>} */ const o = {};
+    for (let i = 0; i < PERF_TAGS.length; i++) {
+      const f = this.tagFrames[i];
+      if (!f) continue;
+      o[PERF_TAGS[i]] = { frames: f, missed: this.tagMissed[i], missedCpu: this.tagMissedCpu[i], perMin: round2((this.tagMissed[i] * 60 * this.hz) / f) };
+    }
+    return o;
   }
 }
 
 /** Fixed values at the start of each hitch entry (see the constructor). */
-const HITCH_FIELDS = 8;
+const HITCH_FIELDS = 12; // v0.6: + draw calls, the previous frame's, the phase tag, enemies alive
+/** v0.6: phase tags (`perf.tag`), set by the game once a frame. */
+export const PERF_TAGS = Object.freeze(['other', 'scan', 'fight', 'break', 'over', 'card']);
 /** A marker names hitches this long after it was set (ms). */
 export const MARKER_MS = 500;
 

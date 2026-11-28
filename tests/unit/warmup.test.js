@@ -233,3 +233,25 @@ test('warmXR: skipped outside the XR frame; inside it draws once, reports growth
   assert.equal(baselineOf(r).at, 'warmXR');
   assert.equal(assertStable(/** @type {any} */ (r), () => assert.fail('flat after warmXR')).ok, true);
 });
+
+test('v0.6 warmXR in parts: each part draws its share of the drawables; the baseline moves after the last', async () => {
+  const r = fakeRenderer();
+  const w = world();
+  await warmUp(/** @type {any} */ (r), [w.scene], [w.lod], undefined, frames(r));
+  r.xr.isPresenting = true;
+  r.xr.frame = {};
+  const camera = new THREE.PerspectiveCamera();
+  const seen = new Set();
+  for (let k = 0; k < 3; k++) {
+    const rep = warmXR(/** @type {any} */ (r), w.scene, camera, [w.pool], { part: k, parts: 3 });
+    assert.equal(rep.skipped, '');
+    assert.equal(rep.part, k);
+    const d = r.log.filter((e) => e.op === 'render').at(-1);
+    for (const o of d.drawn) seen.add(o);
+    if (k < 2) assert.notEqual(baselineOf(r).at, 'warmXR', 'no new baseline before the last part');
+  }
+  assert.equal(baselineOf(r).at, 'warmXR');
+  for (const o of [w.inst, w.culled, w.hiddenInScene]) assert.ok(seen.has(o), 'every drawable was drawn in one of the parts');
+  assert.equal(w.pool.parent, null);
+  assert.equal(w.pool.visible, false);
+});

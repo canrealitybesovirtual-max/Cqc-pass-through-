@@ -329,7 +329,8 @@ export class DepthTap {
     const sf = {};
     for (let i = 0; i < this.signalFrames.length; i++) if (this.signalFrames[i]) /** @type {any} */ (sf)[i] = this.signalFrames[i];
     return {
-      enabled: this.enabled, why: this.why || undefined, warmed: this.warmed, issued: this.issued, packets: this.packets, drops: this.drops,
+      enabled: this.enabled || this.issued > 0, // v0.6: the report is read after detach(); a session that read depth says so
+      why: this.why || undefined, warmed: this.warmed, issued: this.issued, packets: this.packets, drops: this.drops,
       noDepth: this.noDepth, skippedGate: this.skippedGate, intervalMs: this.intervalMs,
       issueMs: { avg: this.issued ? r2(this.issueSumMs / this.issued) : 0, max: r2(this.issueMaxMs) }, readMaxMs: r2(this.readMaxMs),
       getMs: { avg: this.packets ? r2(this.getSumMs / this.packets) : 0, max: r2(this.getMaxMs) }, pollMaxMs: r2(this.pollMaxMs),

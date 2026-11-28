@@ -379,7 +379,10 @@ test('violations: game time with the head inside a mapped box, an enemy shot whi
   pm.violation(VIOLATION.SHOT);
   assert.equal(pm.violationCounts[VIOLATION.SHOT], 1);
   for (let i = 0; i < 100; i++) pm.violation(VIOLATION.SPAWN, i);
-  assert.equal(pm.logN, before + 1 + 100);
+  // v0.6: a run of frames of one kind is one entry (the obstacle stay, then the shot, then 100 spawns 1 s apart)
+  assert.equal(pm.logN, 1 + 1 + 100);
+  for (let i = 0; i < 10; i++) pm.violation(VIOLATION.SPAWN, 99.5 + i * 0.01);
+  assert.equal(pm.logN, 102, 'frames of the same stay are not logged again');
   assert.equal(pm.logKind.length, 32, 'the log ring is fixed');
   // the head beyond r with game time running cannot happen: it pauses in the same update
   const b = running();
